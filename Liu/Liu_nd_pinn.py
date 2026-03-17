@@ -83,7 +83,6 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
     print(f"  ridge delta_asset    : {params.diag['delta_asset']:.2e}")
 
     # ---- "Merton-style" quantities at a reference state ----
-    # KO/다요인에서는 mu_excess가 상태에 따라 변하므로, Y_ref에서 myopic을 찍는 게 자연스러움
     if k == 0 or params.alpha is None:
         print("\n[Myopic (reference-state) quantities] skipped (k==0 or alpha not sampled).")
         print("  - If you want Merton-style mu_excess+pi*, either:")
@@ -92,14 +91,13 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
         return
 
     if Y_ref is None:
-        Y_ref = params.theta  # 기본: 장기평균 상태에서 진단
+        Y_ref = params.theta 
 
     Y_ref = np.asarray(Y_ref, dtype=float).reshape(k,)
     risk = params.alpha @ Y_ref              # (n,)
-    mu_excess = params.sigma * risk          # (n,)  (너 코드의 mu-r 구조와 동일)
+    mu_excess = params.sigma * risk          # (n,)
     Sigma = params.Sigma_RR_safe
 
-    # Σ^{-1} mu는 inverse 만들지 말고 cholesky_solve로
     Sigma_inv_mu = cholesky_solve(params.chol_Sigma_RR_safe, mu_excess)
     Theta = float(mu_excess @ Sigma_inv_mu)  # mu^T Σ^{-1} mu
 
@@ -151,8 +149,8 @@ params = generate_joint_market_params(
     seed=SEED,
     sample_alpha=True,
     alpha_dist="dirichlet",
-    dirichlet_concentration=1.0,  # 보통 1.0이 무난 (균등한 Dirichlet)
-    alpha_scale=0.25,              # row-sum이 1이 되도록
+    dirichlet_concentration=1.0, 
+    alpha_scale=0.25,            
 )
 
 # Extract parameters
@@ -177,23 +175,11 @@ X_max = xbar + X_RANGE_SCALE * eta
 
 # Print configuration
 print_joint_market_report(params)
-# print(f"\n{'='*60}")
-# print("Multi-dimensional Kim-Omberg PINN")
-# print(f"{'='*60}")
-# print(f"Dimensions: N={N_ASSETS} assets, M={M_STATES} states")
-# print(f"Parameters: γ={gamma}, r={r}, T={tau_max}")
 print(f"Minimum State domain: X ∈ {X_min}")
 print(f"Maxmimum State domain: X ∈ {X_max}")
 print(f"Minimum Wealth domain: W ∈ [{W_min}, {W_max}]")
 print(f"\nK (mean reversion):\n{np.diag(K)}")
 print(f"x̄ (long-run mean): {xbar}")
-# print(f"Σ_X (state diffusion):\n{SigmaX}")
-# print(f"ρ (correlation):\n{rho}")
-# print(f"Λ (loading):\n{Lam}")
-# print(f"λ_0 (baseline): {lam0}")
-# print(f"Γ = ρΣ_X^⊤:\n{Gamma}")
-# print(f"Q = Σ_X Σ_X^⊤:\n{Q}")
-
 
 # =============================================================================
 # 2) Closed-form Solution (ODE system)
