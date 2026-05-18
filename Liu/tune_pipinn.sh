@@ -1,229 +1,193 @@
 #!/usr/bin/env bash
-# PI-PINN 하이퍼파라미터 sweep
-# 사용법: bash tune_pipinn.sh <BASE_RESOLVED_CONFIG.yaml> [TUNE_ROOT] [SAMPLE_MODE]
-#   SAMPLE_MODE: oos(기본) | insample
-
 set -euo pipefail
 
-BASE_CFG="${1:-experiments/cov_test/ff25_pls_tau3_fixed/rank_001/outputs/ff49_stage17_rank_sweep_cv2000_curve_core_pls_fixed_pls_ret_ff5_curve_macro7_H1_k2_rolling240m_annual_const_v2_apt_pipinn_rolling240m_annual/resolved_config.yaml}"
-TUNE_ROOT="${2:-$(pwd)/pinn_tune/insample/$(date +%Y%m%d)}"
-# TUNE_ROOT="${2:-$(pwd)/pinn_tune/insample}"
-RUN_SAMPLE="${3:-${TUNE_SAMPLE:-oos}}"
-MAX_PARALLEL="${MAX_PARALLEL:-1}"   # ← 이 줄 추가 (환경변수로 제어 가능)
-GPUS="${GPUS:-cuda:0,cuda:1,cuda:2,cuda:3}"     # ← 추가: 쉼표로 구분된 GPU 목록
-mkdir -p "$TUNE_ROOT"
+# Usage:
+#   bash Liu/tune_pipinn.sh [OUT_ROOT] [MAX_PARALLEL]
+#   DEVICE_LIST="cuda:0,cuda:1,cuda:2,cuda:3" bash Liu/tune_pipinn.sh /workspace/pinn_pi_finite_horizon/outputs/my_run 4
+OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
+MAX_PARALLEL="${2:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+mkdir -p "$OUT_ROOT"
+LOG_DIR="$OUT_ROOT/logs"
+mkdir -p "$LOG_DIR"
 
-if [[ "$RUN_SAMPLE" != "oos" && "$RUN_SAMPLE" != "insample" ]]; then
-  echo "[error] SAMPLE_MODE must be one of: oos, insample (got: $RUN_SAMPLE)"
-  exit 1
+# Device can be fixed or round-robin from DEVICE_LIST.
+# examples:
+#   DEVICE=cuda:0 bash Liu/tune_pipinn.sh
+#   DEVICE_LIST="cuda:0,cuda:1" bash Liu/tune_pipinn.sh
+DEVICE="${DEVICE:-cuda}"
+DEVICE_LIST="${DEVICE_LIST:-}"
+if [[ -n "$DEVICE_LIST" ]]; then
+  IFS=',' read -ra DEVICES <<< "$DEVICE_LIST"
+else
+  DEVICES=("$DEVICE")
 fi
-
-# GPU 리스트를 배열로
-IFS=',' read -ra GPU_LIST <<< "$GPUS"
-GPU_COUNT=${#GPU_LIST[@]}
-GPU_CURSOR=0                       # round-robin 카운터
-
-echo "[tune] base config : $BASE_CFG"
-echo "[tune] output root : $TUNE_ROOT"
-echo "[tune] sample mode : $RUN_SAMPLE"
-
-MANIFEST="$TUNE_ROOT/_manifest.tsv"
-
-# PI-PINN이 받는 모든 하이퍼파라미터 20개를 positional로 받는다.
-# 순서를 고정하기 위해 상수로 정의.
-FIELDS=(outer_iters eval_epochs n_train_int n_train_bc n_val_int n_val_bc \
-        p_uniform p_emp p_tau_head p_tau_near0 tau_head_window \
-        lr grad_clip w_bc w_bc_dx \
-        scheduler_factor scheduler_patience min_lr \
-        width depth)
-
+GPU_CURSOR=0
 
 
 # manifest 헤더 (한 번만)
+MANIFEST="$OUT_ROOT/_manifest.tsv"
 if [[ ! -f "$MANIFEST" ]]; then
-  { printf "tag"; for f in "${FIELDS[@]}"; do printf "\t%s" "$f"; done; printf "\tdevice\toutput_dir\n"; } > "$MANIFEST"
+  printf "tag\tmodel\tdevice\toverrides\tlog_path\n" > "$MANIFEST"
 fi
 
-run_variant () {
-  local tag=$1; shift
-  if [[ $# -ne ${#FIELDS[@]} ]]; then
-    echo "[error] $tag: expected ${#FIELDS[@]} args, got $#"
-    return 1
+sanitize() { echo "$1" | tr ' /:=,' '_____'; }
+auto_tag() {
+  local model="$1"; shift
+  if [[ $# -eq 0 ]]; then
+    echo "${model}_baseline"
+    return
   fi
-
-  local vals=("$@")
-  local out="$TUNE_ROOT/$tag"
-  mkdir -p "$out"
-
-  # 이미 완료됐으면 skip
-  if [[ -f "$out/outputs/comparison_cross_modes_all_costs_summary.csv" ]] || \
-     ls "$out/outputs"/*/comparison_cross_modes_all_costs_summary.csv > /dev/null 2>&1; then
-    echo "[skip] $tag"
-    return 0
-  fi
-
-  # 재시도 시 과거 실패 플래그 제거
-  rm -f "$out/_FAILED"
-
-  # Round-robin GPU 할당
-  local device="${GPU_LIST[$((GPU_CURSOR % GPU_COUNT))]}"
-  GPU_CURSOR=$((GPU_CURSOR + 1))
-
-  # python으로 base YAML 복사 + PI-PINN 필드 override + snapshot 기록
-  local cfg_path="$out/config.yaml"
-  python3 - "$BASE_CFG" "$cfg_path" "$out" "$tag" "$device" "$RUN_SAMPLE" "${vals[@]}" <<'PY'
-import sys, json, pathlib, datetime, yaml
-
-base_path, cfg_path, out_dir, tag, device, sample_mode, *vals = sys.argv[1:]  # ← device/sample_mode 받기
-fields = ['outer_iters','eval_epochs','n_train_int','n_train_bc','n_val_int','n_val_bc',
-          'p_uniform','p_emp','p_tau_head','p_tau_near0','tau_head_window',
-          'lr','grad_clip','w_bc','w_bc_dx',
-          'scheduler_factor','scheduler_patience','min_lr',
-          'width','depth']
-int_fields = {'outer_iters','eval_epochs','n_train_int','n_train_bc','n_val_int','n_val_bc',
-              'tau_head_window','scheduler_patience','width','depth'}
-
-cfg = yaml.safe_load(pathlib.Path(base_path).read_text())
-cfg['project']['output_dir'] = f"{out_dir}/outputs"
-cfg['project']['name']       = f"tune_{tag}"
-
-split = cfg.setdefault('split', {})
-if str(sample_mode).strip().lower() == 'insample':
-    # In-sample 평가: rolling 240m 구조 그대로 유지, 단 평가 기간을 OOS 이전으로 옮김.
-    # train pool = [train_start, test_start_original) (즉 OOS를 침범하지 않음)
-    import datetime
-    
-    original_test_start = split.get('test_start')
-    if original_test_start is None:
-        raise ValueError("split.test_start is required for insample mode")
-    
-    # 문자열/date 호환
-    def _to_date(x):
-        if isinstance(x, str):
-            return datetime.date.fromisoformat(x[:10])
-        return x
-    
-    train_start_d = _to_date(split['train_start'])
-    oos_start_d = _to_date(original_test_start)
-    
-    # In-sample 평가의 시작: train_start + rolling_train_months 만큼 뒤
-    # rolling240m에서는 첫 refit 시점에 학습 데이터 240개월이 있어야 함
-    rolling_months = int(split.get('rolling_train_months') or 240)
-    # 첫 평가 시작 = train_start + rolling_months (= 최초 full rolling window 확보 시점)
-    # 1964-01 + 240m = 1984-01
-    years = rolling_months // 12
-    months = rolling_months % 12
-    new_month = train_start_d.month + months
-    new_year = train_start_d.year + years
-    if new_month > 12:
-        new_year += 1
-        new_month -= 12
-    insample_test_start = datetime.date(new_year, new_month, train_start_d.day)
-    
-    # 평가 종료 = OOS 시작 (OOS를 절대 침범하지 않음)
-    split['test_start'] = insample_test_start.isoformat()
-    split['end_date'] = oos_start_d.isoformat()
-    # train_window_mode, rolling_train_months, refit_every, rebalance_every는
-    # 원래 config(rolling240m_annual)의 값을 그대로 유지
-    
-    base_label = split.get('protocol_label') or 'rolling240m_annual'
-    split['protocol_label'] = f"{base_label}_insample"
-
-p = cfg.setdefault('pipinn', {})
-p['auto_output_subdir'] = False
-p['device'] = device             # ← GPU 지정
-
-overrides = {}
-for k, v in zip(fields, vals):
-    p[k] = int(v) if k in int_fields else float(v)
-    overrides[k] = p[k]
-
-pathlib.Path(cfg_path).write_text(yaml.safe_dump(cfg, sort_keys=False))
-
-info = {
-    'tag': tag,
-    'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
-    'base_config': base_path,
-    'device': device,            # ← 메타데이터에도 기록
-    'sample_mode': sample_mode,
-    'pipinn': overrides,
+  local parts=()
+  for kv in "$@"; do
+    local k=${kv%%=*}
+    local v=${kv#*=}
+    parts+=("$(sanitize "${k}${v}")")
+  done
+  printf "%s_%s" "$model" "$(IFS=_; echo "${parts[*]}")"
 }
-pathlib.Path(f"{out_dir}/run_info.json").write_text(json.dumps(info, indent=2))
-PY
 
-  # manifest 한 줄 (device 포함)
-  { printf "%s" "$tag"; for v in "${vals[@]}"; do printf "\t%s" "$v"; done; printf "\t%s\t%s\n" "$device" "$out"; } >> "$MANIFEST"
+pick_device() {
+  PICKED_DEVICE="${DEVICES[$((GPU_CURSOR % ${#DEVICES[@]}))]}"
+  GPU_CURSOR=$((GPU_CURSOR + 1))
+}
 
-  # 실행
-  echo "[run ] $tag on $device"
-  (
-    if ! python3 -m dynalloc_v2.cli run --config "$cfg_path" \
-          > "$out/stdout.log" 2> "$out/stderr.log"; then
-      echo "[FAIL] $tag — check $out/stderr.log"
-      touch "$out/_FAILED"
-    else
-      echo "[ok  ] $tag"
+run_job() {
+  local tag="$1" model="$2" overrides="$3" out_dir="$4" weight_dir="$5"; shift 5
+  local log="$LOG_DIR/${tag}.log"
+  local done_flag="$out_dir/_DONE"
+  if [[ -f "$done_flag" ]]; then
+    echo "[skip] $tag (done flag exists: $done_flag)"
+    return
+  fi
+
+  # Backward-compatible skip rule using representative final figures in output dir.
+  # NOTE: intentionally do NOT use weight files for skip, since they are updated during training.
+  if [[ "$model" == "pinn" ]]; then
+    if find "$out_dir" -type f \( -name 'loss_history_*.png' -o -name 'portfolio_w*.png' \) 2>/dev/null | grep -q .; then
+      echo "[skip] $tag (final PINN figures exist in: $out_dir)"
+      return
     fi
-  ) &
+  elif [[ "$model" == "pipinn" ]]; then
+    if find "$out_dir" -type f \( -name 'pi_pinn_convergence.png' -o -name 'portfolio_tauX_w*.png' \) 2>/dev/null | grep -q .; then
+      echo "[skip] $tag (final PI-PINN figures exist in: $out_dir)"
+      return
+    fi
+  fi
 
+  local dev
+  pick_device
+  dev="$PICKED_DEVICE"
+  echo "[run ] $tag on $dev"
+  {
+    printf "%s\t%s\t%s\t%s\t%s\n" "$tag" "$model" "$dev" "$overrides" "$log" >> "$MANIFEST"
+  }
+
+  (
+  # Force unbuffered stdout/stderr so training prints are written to log in real time.
+    if PYTHONUNBUFFERED=1 "$@" --device "$dev" >"$log" 2>&1; then
+      touch "$done_flag"
+      echo "[ok  ] $tag"
+    else
+      echo "[fail] $tag"
+  fi
+  ) &
   while (( $(jobs -rp | wc -l) >= MAX_PARALLEL )); do
     wait -n
   done
 }
 
-# =============================================================================
-# 헬퍼: baseline 복제 + 주어진 key=value들만 덮어쓰는 방식
-# 이렇게 하면 축마다 20개 인자를 다 쓸 필요 없이 변화점만 명시하면 됨
-# =============================================================================
-declare -A BASE=(
-  [outer_iters]=10       [eval_epochs]=50
-  [n_train_int]=4096     [n_train_bc]=1024
-  [n_val_int]=2048       [n_val_bc]=512
-  [p_uniform]=0.5        [p_emp]=0.5
-  [p_tau_head]=0.5       [p_tau_near0]=0.2
-  [tau_head_window]=0
-  [lr]=0.0005            [grad_clip]=1.0
-  [w_bc]=10.0            [w_bc_dx]=3.0
-  [scheduler_factor]=0.5 [scheduler_patience]=3
-  [min_lr]=1.0e-05
-  [width]=128            [depth]=2
-  [pipinn-pde-form]=g
+# ==============================
+# Baselines (change here once)
+# ==============================
+declare -A BASE_PINN=(
+  [n_assets]=30
+  [m_states]=10
+  [seed]=12
+  [tau_max]=3.0
+  [w_min]=0.1
+  [w_max]=2.0
+  [gamma]=3.0
+  [r]=0.03
+  [x_range_scale]=1.0
+  [dirichlet_concentration]=1.0
+  [alpha_scale]=0.25
+  [value_hidden]=256
+  [value_depth]=3
+  [batch_size]=3000
+  [lr]=5e-4
+  [w_terminal]=20.0
+  [w_shape]=1.0
+  [eval_epochs]=200
+  [outer_iters]=500
 )
 
-run () {
-  # 사용: run <tag|auto> key1=val1 key2=val2 ...
-  # tag를 'auto'로 주면 override 키=값들로 태그를 자동 생성
-  local tag=$1; shift
+
+declare -A BASE_PIPINN=(
+  [n_assets]=30
+  [m_states]=10
+  [seed]=12
+  [tau_max]=3.0
+  [w_min]=0.1
+  [w_max]=2.0
+  [gamma]=3.0
+  [r]=0.03
+  [x_range_scale]=1.0
+  [dirichlet_concentration]=1.0
+  [alpha_scale]=0.25
+  [value_hidden]=256
+  [value_depth]=3
+  [eval_epochs]=200
+  [outer_iters]=500
+  [batch_size]=3000
+  [lr]=5e-4
+  [w_terminal]=20.0
+  [w_shape]=1.0
+  [theta_init_method]=zero
+  [theta_clip_abs]=3.0
+  [print_every_outer]=20
+  [print_every_eval]=200
+)
+
+# run_pinn <tag|auto> key=val ...
+run_pinn() {
+  local tag="$1"; shift
   declare -A OVR=()
-  for kv in "$@"; do
-    OVR[${kv%%=*}]=${kv#*=}
-  done
-  # 태그 자동 생성
-  if [[ "$tag" == "auto" ]]; then
-    if [[ ${#OVR[@]} -eq 0 ]]; then
-      tag="baseline"
-    else
-      # override 키를 정렬해서 재현성 확보 (같은 설정 → 같은 태그)
-      local parts=()
-      for k in $(printf '%s\n' "${!OVR[@]}" | sort); do
-        local v=${OVR[$k]}
-        # 소수점/마이너스/지수를 짧게 정리: 0.0005 → 5e-4, 1.0e-05 → 1e-5
-        v=$(python3 -c "v='$v'; f=float(v); print(f'{f:g}'.replace('+0','+').replace('-0','-'))" 2>/dev/null || echo "$v")
-        parts+=("${k}${v}")
-      done
-      tag=$(IFS=_; echo "${parts[*]}")
-    fi
-  fi
-  # FIELDS 순서대로 인자 조립
-  local args=()
-  for f in "${FIELDS[@]}"; do
-    if [[ -n "${OVR[$f]+x}" ]]; then
-      args+=("${OVR[$f]}")
-    else
-      args+=("${BASE[$f]}")
-    fi
-  done
-  run_variant "$tag" "${args[@]}"
+  for kv in "$@"; do OVR[${kv%%=*}]=${kv#*=}; done
+  if [[ "$tag" == "baseline" ]]; then tag="pinn_baseline"; fi
+  if [[ "$tag" == "auto" ]]; then tag="$(auto_tag pinn "$@")"; fi
+
+  local n_assets="${OVR[n_assets]:-${BASE_PINN[n_assets]}}"
+  local m_states="${OVR[m_states]:-${BASE_PINN[m_states]}}"
+  local seed="${OVR[seed]:-${BASE_PINN[seed]}}"
+  local tau_max="${OVR[tau_max]:-${BASE_PINN[tau_max]}}"
+  local w_min="${OVR[w_min]:-${BASE_PINN[w_min]}}"
+  local w_max="${OVR[w_max]:-${BASE_PINN[w_max]}}"
+  local gamma="${OVR[gamma]:-${BASE_PINN[gamma]}}"
+  local r="${OVR[r]:-${BASE_PINN[r]}}"
+  local x_range_scale="${OVR[x_range_scale]:-${BASE_PINN[x_range_scale]}}"
+  local dirc="${OVR[dirichlet_concentration]:-${BASE_PINN[dirichlet_concentration]}}"
+  local alpha_scale="${OVR[alpha_scale]:-${BASE_PINN[alpha_scale]}}"
+  local value_hidden="${OVR[value_hidden]:-${BASE_PINN[value_hidden]}}"
+  local value_depth="${OVR[value_depth]:-${BASE_PINN[value_depth]}}"
+  local batch_size="${OVR[batch_size]:-${BASE_PINN[batch_size]}}"
+  local lr="${OVR[lr]:-${BASE_PINN[lr]}}"
+  local w_terminal="${OVR[w_terminal]:-${BASE_PINN[w_terminal]}}"
+  local w_shape="${OVR[w_shape]:-${BASE_PINN[w_shape]}}"
+  local eval_epochs="${OVR[eval_epochs]:-${BASE_PINN[eval_epochs]}}"
+  local outer_iters="${OVR[outer_iters]:-${BASE_PINN[outer_iters]}}"
+
+  local run_output_root="$OUT_ROOT/pinn/$tag"
+  local run_weight_root="$OUT_ROOT/weights/pinn/$tag"
+
+  run_job "$tag" "pinn" "$*" "$run_output_root" "$run_weight_root" "$PYTHON_BIN" Liu_nd_pinn.py \
+    --n-assets "$n_assets" --m-states "$m_states" --seed "$seed" \
+    --tau-max "$tau_max" --w-min "$w_min" --w-max "$w_max" --gamma "$gamma" --r "$r" \
+    --x-range-scale "$x_range_scale" --dirichlet-concentration "$dirc" --alpha-scale "$alpha_scale" \
+    --value-hidden "$value_hidden" --value-depth "$value_depth" --batch-size "$batch_size" --lr "$lr" \
+    --w-terminal "$w_terminal" --w-shape "$w_shape" --eval-epochs "$eval_epochs" \
+    --outer-iters "$outer_iters" --stop-flag-path "$STOP_FLAG" \
+    --output-root "$run_output_root" --weight-root "$run_weight_root"
 }
 
 # =============================================================================
@@ -232,60 +196,84 @@ run () {
 # 명시하지 않은 필드는 위 BASE 값이 자동으로 쓰임
 # =============================================================================
 
-# (0) baseline 먼저 한 번
-run  baseline
+# run_pipinn <tag|auto> key=val ...
+run_pipinn() {
+  local tag="$1"; shift
+  declare -A OVR=()
+  for kv in "$@"; do OVR[${kv%%=*}]=${kv#*=}; done
+  if [[ "$tag" == "baseline" ]]; then tag="pipinn_baseline"; fi
+  if [[ "$tag" == "auto" ]]; then tag="$(auto_tag pipinn "$@")"; fi
 
-# # (A) outer × epochs — 시간 예산
-run  auto    outer_iters=10   eval_epochs=100  pipinn-pde-form=g
-run  auto   outer_iters=10   eval_epochs=200 pipinn-pde-form=g
-run  auto  outer_iters=15   eval_epochs=50 pipinn-pde-form=g
-run  auto  outer_iters=20   eval_epochs=50 pipinn-pde-form=g
-run  auto  outer_iters=15   eval_epochs=100 pipinn-pde-form=g
+  local n_assets="${OVR[n_assets]:-${BASE_PIPINN[n_assets]}}"
+  local m_states="${OVR[m_states]:-${BASE_PIPINN[m_states]}}"
+  local seed="${OVR[seed]:-${BASE_PIPINN[seed]}}"
+  local tau_max="${OVR[tau_max]:-${BASE_PIPINN[tau_max]}}"
+  local w_min="${OVR[w_min]:-${BASE_PIPINN[w_min]}}"
+  local w_max="${OVR[w_max]:-${BASE_PIPINN[w_max]}}"
+  local gamma="${OVR[gamma]:-${BASE_PIPINN[gamma]}}"
+  local r="${OVR[r]:-${BASE_PIPINN[r]}}"
+  local x_range_scale="${OVR[x_range_scale]:-${BASE_PIPINN[x_range_scale]}}"
+  local dirc="${OVR[dirichlet_concentration]:-${BASE_PIPINN[dirichlet_concentration]}}"
+  local alpha_scale="${OVR[alpha_scale]:-${BASE_PIPINN[alpha_scale]}}"
+  local value_hidden="${OVR[value_hidden]:-${BASE_PIPINN[value_hidden]}}"
+  local value_depth="${OVR[value_depth]:-${BASE_PIPINN[value_depth]}}"
+  local outer_iters="${OVR[outer_iters]:-${BASE_PIPINN[outer_iters]}}"
+  local eval_epochs="${OVR[eval_epochs]:-${BASE_PIPINN[eval_epochs]}}"
+  local batch_size="${OVR[batch_size]:-${BASE_PIPINN[batch_size]}}"
+  local lr="${OVR[lr]:-${BASE_PIPINN[lr]}}"
+  local w_terminal="${OVR[w_terminal]:-${BASE_PIPINN[w_terminal]}}"
+  local w_shape="${OVR[w_shape]:-${BASE_PIPINN[w_shape]}}"
+  local theta_init_method="${OVR[theta_init_method]:-${BASE_PIPINN[theta_init_method]}}"
+  local theta_clip_abs="${OVR[theta_clip_abs]:-${BASE_PIPINN[theta_clip_abs]}}"
+  local print_every_outer="${OVR[print_every_outer]:-${BASE_PIPINN[print_every_outer]}}"
+  local print_every_eval="${OVR[print_every_eval]:-${BASE_PIPINN[print_every_eval]}}"
 
-# # (B) 네트워크 크기 (width × depth)
-run  auto    width=64   depth=2 pipinn-pde-form=g
-run  auto   width=128  depth=1 pipinn-pde-form=g
-run  auto   width=128  depth=3 pipinn-pde-form=g
-# # run  net_w192_d4   width=192  depth=4
-run  auto   width=256  depth=2 pipinn-pde-form=g
+  local run_output_root="$OUT_ROOT/pi-pinn/$tag"
+  local run_weight_root="$OUT_ROOT/weights/pi-pinn/$tag"
 
-# # (C) 학습률 + 스케줄러
-run  auto       lr=1.0e-3 pipinn-pde-form=g
-run  auto       lr=7.0e-4 pipinn-pde-form=g
-# run  auto       lr=5.0e-2
-# run  sched_f03_p5  scheduler_factor=0.3  scheduler_patience=5
-# run  sched_f07_p2  scheduler_factor=0.7  scheduler_patience=2
+  run_job "$tag" "pipinn" "$*" "$run_output_root" "$run_weight_root" "$PYTHON_BIN" Liu_nd_pi_pinn.py \
+    --n-assets "$n_assets" --m-states "$m_states" --seed "$seed" \
+    --tau-max "$tau_max" --w-min "$w_min" --w-max "$w_max" --gamma "$gamma" --r "$r" \
+    --x-range-scale "$x_range_scale" --dirichlet-concentration "$dirc" --alpha-scale "$alpha_scale" \
+    --value-hidden "$value_hidden" --value-depth "$value_depth" --outer-iters "$outer_iters" \
+    --eval-epochs "$eval_epochs" --batch-size "$batch_size" --lr "$lr" \
+    --w-terminal "$w_terminal" --w-shape "$w_shape" --theta-init-method "$theta_init_method" \
+    --theta-clip-abs "$theta_clip_abs" --print-every-outer "$print_every_outer" \
+    --print-every-eval "$print_every_eval" --stop-flag-path "$STOP_FLAG" \
+    --output-root "$run_output_root" --weight-root "$run_weight_root"
+}
 
-# (D) BC 가중치
-# run  bc_10         w_bc=10.0  w_bc_dx=1.5
-run  auto   w_bc=20.0  w_bc_dx=3.0 pipinn-pde-form=g
-run  auto   w_bc=10.0  w_bc_dx=5.0 pipinn-pde-form=g
-run  auto   w_bc=10.0  w_bc_dx=1.0  pipinn-pde-form=g  # terminal-dominant
 
-# (E) 샘플링 mixture (uniform vs empirical)
-# run  auto  p_uniform=0.3  p_emp=0.7
-# run  auto  p_uniform=0.5  p_emp=0.5
-# run  auto  p_uniform=0.7  p_emp=0.3
+# ==============================
+# Example plans (edit freely)
+# ==============================
+# baseline
+run_pinn baseline
+run_pipinn baseline
 
-# (F) tau head/near0 샘플링
-# run  auto   p_tau_head=0.3  p_tau_near0=0.1
-# run  auto   p_tau_head=0.5  p_tau_near0=0.2
-# run  auto  p_tau_head=0.7  p_tau_near0=0.2
-# run  tauhead_win6  p_tau_head=0.5  p_tau_near0=0.2  tau_head_window=6
+# (A) outer × eval_epochs
+run_pipinn auto batch-size=1000
+run_pinn auto batch-size=1000
 
-# (G) 훈련/검증 콜로케이션 포인트 수
-# run  auto    n_train_int=2048  n_train_bc=512   n_val_int=1024  n_val_bc=256
-run  auto   n_train_int=4096  n_train_bc=1024  n_val_int=4096  n_val_bc=1024 pipinn-pde-form=g
-run  auto    n_train_int=8192  n_train_bc=2048  n_val_int=4096  n_val_bc=1024 pipinn-pde-form=g
+run_pipinn auto batch-size=2000
+run_pinn auto batch-size=2000
 
-# (H) gradient clipping
-# run  auto       pipinn-qp-solver-iters=500
-# run  auto       pipinn-qp-solver-iters=1000
-# run  auto       pipinn-qp-solver-iters=1000  pipinn-qp-solver-tol=1.0e-12
+run_pipinn auto batch-size=4000
+run_pinn auto batch-size=4000
+
+run_pipinn auto batch-size=5000
+run_pinn auto batch-size=5000
+
+# PINN example: only tweak what you need from baseline
+# run_pinn auto eval_epochs=100 outer_iters=500
+# run_pinn auto lr=1e-4 batch_size=3000
+
+wait
+echo "[done] all jobs finished. logs: $OUT_ROOT"
 
 wait   # ← 이 줄 추가: 백그라운드 job이 전부 끝날 때까지 대기
 echo ""
 echo "[done] manifest: $MANIFEST"
-echo "[done] 집계: python3 collect_results.py $TUNE_ROOT"
+# echo "[done] 집계: python3 collect_results.py $TUNE_ROOT"
 
-python3 "$(dirname "$0")/collect_results.py" "$TUNE_ROOT"
+# python3 "$(dirname "$0")/collect_results.py" "$TUNE_ROOT"

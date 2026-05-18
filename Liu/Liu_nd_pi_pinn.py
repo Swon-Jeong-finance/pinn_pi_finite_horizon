@@ -35,6 +35,8 @@ Reference: Kim & Omberg (1996), "Dynamic Nonmyopic Portfolio Behavior", RFS
 
 import os
 import sys
+import csv
+import argparse
 import math
 import numpy as np
 from datetime import datetime
@@ -49,16 +51,49 @@ from matplotlib.colors import TwoSlopeNorm
 sys.path.insert(0, '/mnt/user-data/uploads')
 from joint_market_setup_dirichlet import generate_joint_market_params, JointMarketParams, cholesky_solve
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run Liu ND PI-PINN with configurable hyperparameters")
+    parser.add_argument("--n-assets", type=int, default=10)
+    parser.add_argument("--m-states", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=12)
+    parser.add_argument("--tau-max", type=float, default=3.0)
+    parser.add_argument("--w-min", type=float, default=0.1)
+    parser.add_argument("--w-max", type=float, default=2.0)
+    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--r", type=float, default=0.03)
+    parser.add_argument("--x-range-scale", type=float, default=1.0)
+    parser.add_argument("--dirichlet-concentration", type=float, default=1.0)
+    parser.add_argument("--alpha-scale", type=float, default=0.25)
+    parser.add_argument("--value-hidden", type=int, default=256)
+    parser.add_argument("--value-depth", type=int, default=3)
+    parser.add_argument("--outer-iters", type=int, default=1000)
+    parser.add_argument("--eval-epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=3000)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--w-terminal", type=float, default=20.0)
+    parser.add_argument("--w-shape", type=float, default=1.0)
+    parser.add_argument("--theta-init-method", type=str, default="zero", choices=["myopic", "zero", "closed_form"])
+    parser.add_argument("--theta-clip-abs", type=float, default=3.0)
+    parser.add_argument("--print-every-outer", type=int, default=20)
+    parser.add_argument("--print-every-eval", type=int, default=200)
+    parser.add_argument("--output-root", type=str, default="outputs/pi-pinn")
+    parser.add_argument("--weight-root", type=str, default="weights/pi-pinn")
+    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--stop-flag-path", type=str, default="")
+    return parser.parse_args()
+
+ARGS = parse_args()
+
 
 # =============================================================================
 # 0) Reproducibility + Device
 # =============================================================================
-SEED = 12
+SEED = ARGS.seed
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(ARGS.device)
 print(f"Device: {device}")
 
 if torch.cuda.is_available():
@@ -123,27 +158,27 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
 # 1) Problem Parameters
 # =============================================================================
 # Dimensions
-N_ASSETS = 10    # Number of risky assets
-M_STATES = 2    # Number of state variables
+N_ASSETS = ARGS.n_assets    # Number of risky assets
+M_STATES = ARGS.m_states    # Number of state variables
 
-weight_dir = f"weights/pi-pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+weight_dir = os.path.join(ARGS.weight_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
 os.makedirs(weight_dir, exist_ok=True)
-output_dir = f"outputs/pi-pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+output_dir = os.path.join(ARGS.output_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
 os.makedirs(output_dir, exist_ok=True)
 
 # Time domain (τ = remaining horizon = T - t)
-tau_max = 3.0
+tau_max = ARGS.tau_max
 tau_min = 0.0
 
 # Wealth domain
-W_min, W_max = 0.1, 2.0
+W_min, W_max = ARGS.w_min, ARGS.w_max
 
 # State domain (will be set based on theta ± some range)
-X_RANGE_SCALE = 1.0  # x ∈ [θ - scale*η, θ + scale*η] roughly
+X_RANGE_SCALE = ARGS.x_range_scale  # x ∈ [θ - scale*η, θ + scale*η] roughly
 
 # Model parameters
-gamma = 2.0     # CRRA risk aversion
-r = 0.03        # risk-free rate
+gamma = ARGS.gamma     # CRRA risk aversion
+r = ARGS.r        # risk-free rate
 
 # Generate market parameters
 params = generate_joint_market_params(
@@ -838,7 +873,8 @@ class PIPINN_KimOmbergND:
             "theta_diff": [],
             "eval_loss": [],
             "lr": [],
-            'loss_history': []
+            'loss_history': [],
+            'stopped_early': False
         }
 
         best_eval_loss = float("inf")
@@ -853,6 +889,10 @@ class PIPINN_KimOmbergND:
         print(f"Initial θ stats: mean={theta_n.mean().item():.4f}, std={theta_n.std().item():.4f}")
 
         for it in range(1, outer_iters + 1):
+            if ARGS.stop_flag_path and os.path.exists(ARGS.stop_flag_path):
+                print(f"[stop-flag] detected: {ARGS.stop_flag_path}. Stop this run.")
+                results['stopped_early'] = True
+                break
             verbose = (it % print_every_outer == 0) or (it <= 3)
 
             # resample points
@@ -891,6 +931,14 @@ class PIPINN_KimOmbergND:
             self.scheduler.step(inner_best_eval_loss)
             lr_now = self.optimizer.param_groups[0]["lr"]
             results["lr"].append(lr_now)
+            results.setdefault("iter_history", []).append({
+                "outer_iter": it,
+                "eval_loss": inner_best_eval_loss,
+                "pde": eval_hist[-1]["pde"],
+                "terminal": eval_hist[-1]["terminal"],
+                "theta_diff": theta_diff,
+                "lr": lr_now,
+            })
 
             # === Track best model (lowest eval loss) ===
             if inner_best_eval_loss < best_eval_loss:
@@ -903,12 +951,23 @@ class PIPINN_KimOmbergND:
             elif it % 20 == 0:
                 print(f"[Iter {it:3d}] Loss={eval_hist[-1]['total']:.2e} | PDE Loss: {eval_hist[-1]['pde']:.4e} | Terminal Loss: {eval_hist[-1]['terminal']:.4e} | θ diff={theta_diff:.4e} | LR={lr_now:.2e}")
 
+            # Early stop rule: at outer_iter=50, if PDE loss is still too large, abort this run.
+            if it == 50 and eval_hist[-1]['pde'] > 1.0:
+                print(f"[early-stop] outer_iter=50 and PDE={eval_hist[-1]['pde']:.4e} (>1.0). Stop this run.")
+                if ARGS.stop_flag_path:
+                    os.makedirs(os.path.dirname(ARGS.stop_flag_path), exist_ok=True)
+                    open(ARGS.stop_flag_path, "a").close()
+                results['stopped_early'] = True
+                break
+
             # update θ for next iteration (functionally; actual eval uses policy_improvement anyway)
             theta_n = theta_new
 
         # restore best
-        self.value_net.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).pt"), map_location=self.device))
-        print(f"\n*** Restored best model from iter {best_iter} (eval_loss={best_eval_loss:.3e}) ***")
+        ckpt_path = os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).pt")
+        if os.path.exists(ckpt_path):
+            self.value_net.load_state_dict(torch.load(ckpt_path, map_location=self.device))
+            print(f"\n*** Restored best model from iter {best_iter} (eval_loss={best_eval_loss:.3e}) ***")
 
         print(f"\n{'='*70}")
         print(f"PI-PINN finished. Best iter: {best_iter} (eval_loss={best_eval_loss:.3e})")
@@ -916,6 +975,28 @@ class PIPINN_KimOmbergND:
 
         return results
 
+def save_metrics_csv(results, output_dir):
+    iter_hist = results.get("iter_history", [])
+    if iter_hist:
+        path = os.path.join(output_dir, "policy_iteration_metrics.csv")
+        fields = ["outer_iter", "eval_loss", "pde", "terminal", "theta_diff", "lr"]
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in iter_hist:
+                writer.writerow({k: row.get(k) for k in fields})
+        print(f"Saved: {path}")
+
+    loss_hist = results.get("loss_history", [])
+    if loss_hist:
+        path = os.path.join(output_dir, "evaluation_metrics.csv")
+        fields = sorted(loss_hist[0].keys())
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for row in loss_hist:
+                writer.writerow(row)
+        print(f"Saved: {path}")
 
 def plot_pi_convergence_nd(results, save_path=None, show=True):
     """Convergence summary for ND PI-PINN."""
@@ -1598,22 +1679,22 @@ def plot_slices(solver, tau_fixed, save_path=None, show=True):
 # -------------------------
 # PI-PINN hyperparameters
 # -------------------------
-value_hidden = 256
-value_depth  = 3
+value_hidden = ARGS.value_hidden
+value_depth  = ARGS.value_depth
 
-outer_iters      = 1000      # outer policy-iteration steps
-eval_epochs      = 200       # value-net epochs per outer step (linear PDE solve)
-batch_size       = 3000
+outer_iters      = ARGS.outer_iters      # outer policy-iteration steps
+eval_epochs      = ARGS.eval_epochs       # value-net epochs per outer step (linear PDE solve)
+batch_size       = ARGS.batch_size
 
-lr              = 5e-4
-w_terminal      = 20.0     # terminal condition weight
-w_shape         = 1.0      # monotonicity/concavity penalty weight
+lr              = ARGS.lr
+w_terminal      = ARGS.w_terminal     # terminal condition weight
+w_shape         = ARGS.w_shape      # monotonicity/concavity penalty weight
 
-theta_init_method = "zero"    # {"myopic", "zero", "closed_form"}
-theta_clip_abs    = 3.0       # None -> no clamp, else componentwise |θ_i| <= clip
+theta_init_method = ARGS.theta_init_method    # {"myopic", "zero", "closed_form"}
+theta_clip_abs    = ARGS.theta_clip_abs       # None -> no clamp, else componentwise |θ_i| <= clip
 
-print_every_outer = 20
-print_every_eval  = 200
+print_every_outer = ARGS.print_every_outer
+print_every_eval  = ARGS.print_every_eval
 verbose_detail    = False
 
 
@@ -1659,6 +1740,10 @@ if __name__ == "__main__":
         verbose_detail=verbose_detail
     )
 
+    save_metrics_csv(results, output_dir)
+    if results.get("stopped_early", False):
+        print("[early-stop] Skip evaluation and proceed to next experiment.")
+        raise SystemExit(0)
 
     print("\n" + "="*60)
     print("Evaluating PINN-PI vs Closed-form...")
@@ -1677,7 +1762,7 @@ if __name__ == "__main__":
     print(f"{'='*70}")
     
     model = solver.value_net
-    model.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"), map_location=device))
+    model.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).pt"), map_location=device))
 
     # Plot PI-PINN convergence
     plot_pi_convergence_nd(

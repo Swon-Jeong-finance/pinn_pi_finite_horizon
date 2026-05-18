@@ -32,6 +32,8 @@ Optimal portfolio:
 Reference: Kim & Omberg (1996), "Dynamic Nonmyopic Portfolio Behavior", RFS
 """
 import time
+import argparse
+import csv
 import os
 import sys
 import math
@@ -48,16 +50,44 @@ from matplotlib.colors import TwoSlopeNorm
 sys.path.insert(0, '/mnt/user-data/uploads')
 from joint_market_setup_dirichlet import generate_joint_market_params, JointMarketParams, cholesky_solve
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run Liu ND PINN with configurable hyperparameters")
+    parser.add_argument("--n-assets", type=int, default=10)
+    parser.add_argument("--m-states", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=12)
+    parser.add_argument("--tau-max", type=float, default=3.0)
+    parser.add_argument("--w-min", type=float, default=0.1)
+    parser.add_argument("--w-max", type=float, default=2.0)
+    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--r", type=float, default=0.03)
+    parser.add_argument("--x-range-scale", type=float, default=1.0)
+    parser.add_argument("--dirichlet-concentration", type=float, default=1.0)
+    parser.add_argument("--alpha-scale", type=float, default=0.25)
+    parser.add_argument("--value-hidden", type=int, default=256)
+    parser.add_argument("--value-depth", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=2000)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--w-terminal", type=float, default=20.0)
+    parser.add_argument("--w-shape", type=float, default=1.0)
+    parser.add_argument("--eval-epochs", type=int, default=200)
+    parser.add_argument("--outer-iters", type=int, default=1000)
+    parser.add_argument("--output-root", type=str, default="outputs/pinn")
+    parser.add_argument("--weight-root", type=str, default="weights/pinn")
+    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--stop-flag-path", type=str, default="")
+    return parser.parse_args()
+
+ARGS = parse_args()
 
 # =============================================================================
 # 0) Reproducibility + Device
 # =============================================================================
-SEED = 12
+SEED = ARGS.seed
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device(ARGS.device)
 print(f"Device: {device}")
 
 if torch.cuda.is_available():
@@ -121,27 +151,27 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
 # 1) Problem Parameters
 # =============================================================================
 # Dimensions
-N_ASSETS = 10    # Number of risky assets
-M_STATES = 1    # Number of state variables
+N_ASSETS = ARGS.n_assets    # Number of risky assets
+M_STATES = ARGS.m_states    # Number of state variables
 
-weight_dir = f"weights/pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+weight_dir = os.path.join(ARGS.weight_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
 os.makedirs(weight_dir, exist_ok=True)
-output_dir = f"outputs/pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+output_dir = os.path.join(ARGS.output_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
 os.makedirs(output_dir, exist_ok=True)
 
 # Time domain (τ = remaining horizon = T - t)
-tau_max = 3.0
+tau_max = ARGS.tau_max
 tau_min = 0.0
 
 # Wealth domain
-W_min, W_max = 0.1, 2.0
+W_min, W_max = ARGS.w_min, ARGS.w_max
 
 # State domain (will be set based on theta ± some range)
-X_RANGE_SCALE = 1.0  # x ∈ [θ - scale*η, θ + scale*η] roughly
+X_RANGE_SCALE = ARGS.x_range_scale  # x ∈ [θ - scale*η, θ + scale*η] roughly
 
 # Model parameters
-gamma = 2.0     # CRRA risk aversion
-r = 0.03        # risk-free rate
+gamma = ARGS.gamma     # CRRA risk aversion
+r = ARGS.r        # risk-free rate
 
 # Generate market parameters
 params = generate_joint_market_params(
@@ -149,8 +179,8 @@ params = generate_joint_market_params(
     seed=SEED,
     sample_alpha=True,
     alpha_dist="dirichlet",
-    dirichlet_concentration=1.0, 
-    alpha_scale=0.25,            
+    dirichlet_concentration=ARGS.dirichlet_concentration, 
+    alpha_scale=ARGS.alpha_scale,             
 )
 
 # Extract parameters
@@ -549,8 +579,8 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
 def train_pinn_nd(model, M, N, gamma, r, 
                   K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t,
                   X_min, X_max, W_min, W_max, tau_max,
-                  epochs=50000, batch_size=2000, lr=5e-4,
-                  resample_every=200, w_terminal=10.0, w_concavity=1.0,
+                  epochs=50000, batch_size=ARGS.batch_size, lr=ARGS.lr,
+                  resample_every=ARGS.eval_epochs, w_terminal=10.0, w_concavity=1.0,
                   print_every=2000):
     """Train PINN for multi-dimensional Kim-Omberg HJB."""
     
@@ -571,7 +601,12 @@ def train_pinn_nd(model, M, N, gamma, r,
     print(f"Training {M+2}D PINN (N={N} assets, M={M} states)")
     print(f"{'='*60}")
     
+    stopped_early = False
     for epoch in range(1, epochs + 1):
+        if ARGS.stop_flag_path and os.path.exists(ARGS.stop_flag_path):
+            print(f"[stop-flag] detected: {ARGS.stop_flag_path}. Stop this run.")
+            stopped_early = True
+            break
         if epoch % resample_every == 0:
             w_int, x_int, tau_int = sample_interior(batch_size, device, M, X_min, X_max, W_min, W_max, tau_max)
             w_term, x_term, tau_term = sample_terminal(batch_size, device, M, X_min, X_max, W_min, W_max)
@@ -614,10 +649,12 @@ def train_pinn_nd(model, M, N, gamma, r,
             torch.save(model.state_dict(), os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"))
         
         loss_history.append({
+            'epoch': epoch,
             'total': current_loss,
             'pde': pde_loss.item(),
             'terminal': terminal_loss.item(),
-            'concavity': concavity_loss.item()
+            'concavity': concavity_loss.item(),
+            'lr': optimizer.param_groups[0]['lr']
         })
         
         if epoch % print_every == 0:
@@ -625,12 +662,36 @@ def train_pinn_nd(model, M, N, gamma, r,
             print(f"[{epoch:6d}/{epochs}] Total: {current_loss:.3e} | "
                   f"PDE: {pde_loss.item():.3e} | Term: {terminal_loss.item():.3e} | "
                   f"Conc: {concavity_loss.item():.3e} | LR: {current_lr:.2e}")
+
+        # Early stop rule: check PDE loss at outer_iter=50 and abort current run if too large.
+        # In this script, outer_iter ~ epoch // resample_every.
+        outer_iter_now = epoch // resample_every
+        if outer_iter_now == 50 and pde_loss.item() > 1.0:
+            print(f"[early-stop] outer_iter=50 and PDE={pde_loss.item():.4e} (>1.0). Stop this run.")
+            if ARGS.stop_flag_path:
+                os.makedirs(os.path.dirname(ARGS.stop_flag_path), exist_ok=True)
+                open(ARGS.stop_flag_path, "a").close()
+            stopped_early = True
+            break
     
     # Restore best model
-    model.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"), map_location=device))
-    print(f"\nRestored best model (loss: {best_loss:.3e})")
-    
-    return loss_history, optimizer
+    ckpt_path = os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt")
+    if os.path.exists(ckpt_path):
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"\nRestored best model (loss: {best_loss:.3e})")
+        
+    return loss_history, optimizer, stopped_early
+
+def save_loss_history_csv(loss_history, save_path):
+    if not loss_history:
+        return
+    fields = ["epoch", "total", "pde", "terminal", "concavity", "lr"]
+    with open(save_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in loss_history:
+            writer.writerow({k: row.get(k) for k in fields})
+    print(f"Saved: {save_path}")
 
 
 # =============================================================================
@@ -1303,16 +1364,16 @@ def plot_slices(model, tau_fixed, save_path=None, show=True):
     else:
         plt.close()
 
+value_hidden=ARGS.value_hidden
+value_depth=ARGS.value_depth
 
-value_hidden=256
-value_depth=3
+batch_size=ARGS.batch_size
+lr=ARGS.lr
+w_terminal=ARGS.w_terminal
+resample_every=ARGS.eval_epochs
+epochs = resample_every * ARGS.outer_iters
+w_shape=ARGS.w_shape
 
-batch_size=2000
-lr=5e-4
-w_terminal=20.0
-resample_every=200
-epochs = resample_every * 1000
-w_shape=1.0
 
 # =============================================================================
 # 9) Main Execution
@@ -1332,7 +1393,7 @@ if __name__ == "__main__":
     model = ValueNetND(M=M_STATES, hidden=value_hidden, depth=value_depth).to(device)
     
     # Training
-    loss_history, optimizer = train_pinn_nd(
+    loss_history, optimizer, stopped_early = train_pinn_nd(
         model, M_STATES, N_ASSETS, gamma, r,
         K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t,
         X_min, X_max, W_min, W_max, tau_max,
@@ -1354,6 +1415,21 @@ if __name__ == "__main__":
     
     print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
 
+    # Plot loss history / csv are useful even for early-stopped runs.
+    plot_loss_history(
+        loss_history,
+        save_path=os.path.join(output_dir, f"loss_history_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).png"),
+        show=True
+    )
+    save_loss_history_csv(
+        loss_history,
+        save_path=os.path.join(output_dir, "training_metrics.csv")
+    )
+
+    if stopped_early:
+        print("[early-stop] Skip evaluation and proceed to next experiment.")
+        raise SystemExit(0)
+
     print(f"\n{'='*60}")
     print("Evaluating PINN vs Closed-form...")
     print(f"{'='*60}")
@@ -1371,13 +1447,7 @@ if __name__ == "__main__":
     model = ValueNetND(M=M_STATES, hidden=value_hidden, depth=value_depth).to(device)
     model.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"), map_location=device))
     
-    # Plot loss history
-    plot_loss_history(
-        loss_history,
-        save_path=os.path.join(output_dir, f"loss_history_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).png"),
-        show=True
-    )
-    
+   
     # Evaluation
     print(f"\n{'='*60}")
     print("Evaluating PINN vs Closed-form...")
