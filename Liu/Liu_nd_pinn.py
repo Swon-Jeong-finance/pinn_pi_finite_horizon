@@ -60,7 +60,7 @@ from joint_market_setup_dirichlet import generate_joint_market_params, JointMark
 from experiment_utils import (
     add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
-    parse_eval_margins, shrink_bounds, pres_from_mse,
+    parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
 )
 
 
@@ -614,11 +614,10 @@ def hjb_residual_nd(model, w, x, tau, M, N, gamma, r, K_t, k0_t, Q_t, Gamma_t, l
     combined = lam_x * V_w + Gamma_Vwx  # (batch, N)
     numerator = torch.sum(combined ** 2, dim=1, keepdim=True)  # (batch, 1)
     
-    # denominator = 2 V_ww (should be negative for concave V)
-    denominator = 2.0 * V_ww
-    # denominator = 2 V_ww must be negative (concavity); clamp from above.
-    denominator_safe = torch.clamp(denominator, max=-1e-8)
-    term5 = -numerator / denominator_safe
+    # Guard V_ww itself so this path uses the same effective threshold as
+    # control extraction (rather than clamping 2*V_ww at a different one).
+    V_ww_safe = safe_concave_vww(V_ww)
+    term5 = -numerator / (2.0 * V_ww_safe)
     
     residual = term1 + term2 + term3 + term4 + term5
     
@@ -663,7 +662,7 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
     # maximizer, so clamp from ABOVE at -1e-8. (The previous
     # sign(V_ww)*1e-8 + 1e-10 form gave +1e-10 at V_ww == 0: wrong sign and
     # 100x smaller than intended, letting the control blow up.)
-    V_ww_safe = torch.clamp(V_ww, max=-1e-8)
+    V_ww_safe = safe_concave_vww(V_ww)
     theta = -numerator / V_ww_safe  # (batch, N)
     theta_norm = theta / w  # (batch, N)
     
@@ -1935,7 +1934,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
 
     # Stability margins (model side)
     m_ww = float(np.min(-Vww_m))
-    guard_frac = float(np.mean(Vww_m > -1e-8))
+    guard_frac = float(np.mean(Vww_m > -VWW_GUARD))
     lam_x = lam0_np[None, :] + diag["x_np"] @ Lam_np.T            # (P, N)
     numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
     M_num = float(np.max(np.linalg.norm(numer, axis=1)))
@@ -1948,7 +1947,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     # side uses the exact (negative) V_ww*.
     rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
                      / max(np.linalg.norm(diag["V_cf"]), 1e-300))
-    theta_hat = -numer / np.minimum(Vww_m, -1e-8)[:, None]
+    theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
     numer_cf = lam_x * diag["Vw_cf"][:, None] + diag["Vwx_cf"] @ Gamma_np.T
     theta_cf = -numer_cf / diag["Vww_cf"][:, None]
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
@@ -2085,6 +2084,7 @@ if __name__ == "__main__":
         # Evaluation is unrelated to training-divergence monitoring: no
         # "running" status on the TRAINING status file, no stopper, and the
         # shared stop flag is ignored entirely.
+        recorder.prepare_eval_run()
         recorder.write_status_eval("running")
         stopper = None
     else:

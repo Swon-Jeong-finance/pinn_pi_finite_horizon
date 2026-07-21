@@ -19,6 +19,19 @@ import numpy as np
 import torch
 
 
+VWW_GUARD = 1e-8
+
+
+def safe_concave_vww(V_ww: torch.Tensor) -> torch.Tensor:
+    """Clamp a denominator-side value derivative to the concave region.
+
+    Use this helper only where ``V_ww`` appears in a denominator (nonlinear
+    HJB maximization or control extraction).  A frozen-policy linear PDE must
+    continue to use its raw ``V_ww`` coefficient.
+    """
+    return torch.clamp(V_ww, max=-VWW_GUARD)
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -262,6 +275,9 @@ def pres_from_mse(pde_mse: float, terminal_mse: float) -> float:
 
 
 class ExperimentRecorder:
+    TRAIN_MARKERS = ("_DONE", "_SUCCESS", "_STOPPED_EARLY", "_FAILED")
+    EVAL_MARKERS = ("_DONE_EVAL", "_SUCCESS_EVAL", "_FAILED_EVAL")
+
     def __init__(self, output_dir: str, weight_dir: str, args: argparse.Namespace):
         self.output_dir = output_dir
         self.weight_dir = weight_dir
@@ -295,6 +311,21 @@ class ExperimentRecorder:
                 os.replace(path, dst)
                 print(f"[recorder] previous log archived: {os.path.basename(path)} "
                       f"-> {os.path.basename(dst)}")
+
+        # A new training run invalidates every completion marker from the
+        # previous training/evaluation cycle.  Otherwise an old _SUCCESS can
+        # make a failed rerun look successful to the seed aggregator.
+        self._remove_markers(self.TRAIN_MARKERS + self.EVAL_MARKERS)
+
+    def _remove_markers(self, names: Sequence[str]) -> None:
+        for name in names:
+            path = os.path.join(self.output_dir, name)
+            if os.path.exists(path):
+                os.remove(path)
+
+    def prepare_eval_run(self) -> None:
+        """Clear stale eval-only completion state before evaluation starts."""
+        self._remove_markers(self.EVAL_MARKERS)
 
     def save_config(self, extra: Optional[Dict[str, Any]] = None) -> None:
         data = {
@@ -345,22 +376,27 @@ class ExperimentRecorder:
         save_json(self.status_eval_json, data)
 
     def mark_success_eval(self, **kwargs: Any) -> None:
+        self._remove_markers(("_FAILED_EVAL",))
         open(os.path.join(self.output_dir, "_SUCCESS_EVAL"), "a").close()
         self.write_status_eval("success", **kwargs)
 
     def mark_failed_eval(self, **kwargs: Any) -> None:
+        self._remove_markers(("_DONE_EVAL", "_SUCCESS_EVAL"))
         open(os.path.join(self.output_dir, "_FAILED_EVAL"), "a").close()
         self.write_status_eval("failed", **kwargs)
 
     def mark_success(self, **kwargs: Any) -> None:
+        self._remove_markers(("_STOPPED_EARLY", "_FAILED"))
         open(os.path.join(self.output_dir, "_SUCCESS"), "a").close()
         self.write_status("success", **kwargs)
 
     def mark_stopped_early(self, **kwargs: Any) -> None:
+        self._remove_markers(("_SUCCESS", "_FAILED"))
         open(os.path.join(self.output_dir, "_STOPPED_EARLY"), "a").close()
         self.write_status("stopped_early", **kwargs)
 
     def mark_failed(self, **kwargs: Any) -> None:
+        self._remove_markers(("_DONE", "_SUCCESS", "_STOPPED_EARLY"))
         open(os.path.join(self.output_dir, "_FAILED"), "a").close()
         self.write_status("failed", **kwargs)
 

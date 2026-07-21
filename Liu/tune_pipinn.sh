@@ -177,7 +177,9 @@ append_manifest() {
 
 remove_run_markers() {
   local out_dir="$1"
-  rm -f "$out_dir/_DONE" "$out_dir/_SUCCESS" "$out_dir/_STOPPED_EARLY" "$out_dir/_FAILED"
+  rm -f \
+    "$out_dir/_DONE" "$out_dir/_SUCCESS" "$out_dir/_STOPPED_EARLY" "$out_dir/_FAILED" \
+    "$out_dir/_DONE_EVAL" "$out_dir/_SUCCESS_EVAL" "$out_dir/_FAILED_EVAL"
   rm -f "$out_dir/train_history.csv" "$out_dir/outer_history.csv" "$out_dir/metrics.csv" "$out_dir/status.json"
 }
 
@@ -430,6 +432,11 @@ declare -A BASE_PINN=(
   [diag_every]=1
   # 1 = E8 timing mode (all diagnostics off; wall-clock reflects core work).
   [timing_mode]=0
+  # Paper main default: evaluate and generate each run's policy figures.
+  # Set skip_figures=1 to retain metrics while suppressing only figures;
+  # set skip_eval=1 only when no post-training evaluation is wanted.
+  [skip_figures]=0
+  [skip_eval]=0
 )
 
 declare -A BASE_PIPINN=(
@@ -513,6 +520,9 @@ declare -A BASE_PIPINN=(
   [diag_points]=8192
   [diag_every]=1
   [timing_mode]=0
+  # Paper main default: evaluate and generate each run's policy figures.
+  [skip_figures]=0
+  [skip_eval]=0
   # Within-evaluation collocation resampling (inner epochs): each policy
   # evaluation redraws a fresh batch every K epochs while the POLICY FUNCTION
   # stays frozen (theta recomputed from a frozen copy of the previous
@@ -596,8 +606,14 @@ run_pinn_single() {
   local diag_points="${OVR[diag_points]:-${BASE_PINN[diag_points]}}"
   local diag_every="${OVR[diag_every]:-${BASE_PINN[diag_every]}}"
   local timing_mode="${OVR[timing_mode]:-${BASE_PINN[timing_mode]}}"
+  local skip_figures="${OVR[skip_figures]:-${BASE_PINN[skip_figures]}}"
+  local skip_eval="${OVR[skip_eval]:-${BASE_PINN[skip_eval]}}"
   local timing_flag=()
   [[ "$timing_mode" == "1" ]] && timing_flag=(--timing-mode)
+  local skip_figures_flag=()
+  [[ "$skip_figures" == "1" ]] && skip_figures_flag=(--skip-figures)
+  local skip_eval_flag=()
+  [[ "$skip_eval" == "1" ]] && skip_eval_flag=(--skip-eval)
 
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
@@ -642,7 +658,7 @@ run_pinn_single() {
     --val-points "$val_points" --val-terminal-points "$val_terminal_points" --val-every "$val_every" \
     --market-seed "$market_seed" --test-points "$test_points" --diag-points "$diag_points" --diag-every "$diag_every" \
     --output-root "$run_output_root" --weight-root "$run_weight_root" \
-    "${timing_flag[@]}" "${eval_only_flag[@]}"
+    "${timing_flag[@]}" "${skip_figures_flag[@]}" "${skip_eval_flag[@]}" "${eval_only_flag[@]}"
 }
 
 # run_pinn <tag|auto> key=val ...
@@ -733,6 +749,8 @@ run_pipinn_single() {
   local diag_points="${OVR[diag_points]:-${BASE_PIPINN[diag_points]}}"
   local diag_every="${OVR[diag_every]:-${BASE_PIPINN[diag_every]}}"
   local timing_mode="${OVR[timing_mode]:-${BASE_PIPINN[timing_mode]}}"
+  local skip_figures="${OVR[skip_figures]:-${BASE_PIPINN[skip_figures]}}"
+  local skip_eval="${OVR[skip_eval]:-${BASE_PIPINN[skip_eval]}}"
   local e3b_checkpoints="${OVR[e3b_checkpoints]:-${BASE_PIPINN[e3b_checkpoints]}}"
   local pe_resample_every="${OVR[pe_resample_every]:-${BASE_PIPINN[pe_resample_every]}}"
   local inner_best="${OVR[inner_best]:-${BASE_PIPINN[inner_best]}}"
@@ -744,6 +762,10 @@ run_pipinn_single() {
   local carry_lr_max="${OVR[carry_lr_max]:-${BASE_PIPINN[carry_lr_max]}}"
   local timing_flag=()
   [[ "$timing_mode" == "1" ]] && timing_flag=(--timing-mode)
+  local skip_figures_flag=()
+  [[ "$skip_figures" == "1" ]] && skip_figures_flag=(--skip-figures)
+  local skip_eval_flag=()
+  [[ "$skip_eval" == "1" ]] && skip_eval_flag=(--skip-eval)
   local e3b_flag=()
   [[ "$e3b_checkpoints" == "1" ]] && e3b_flag=(--e3b-checkpoints)
 
@@ -796,7 +818,7 @@ run_pipinn_single() {
     --sel-every "$sel_every" --sel-patience "$sel_patience" \
     --carry-lr-min "$carry_lr_min" --carry-lr-max "$carry_lr_max" \
     --output-root "$run_output_root" --weight-root "$run_weight_root" \
-    "${timing_flag[@]}" "${e3b_flag[@]}" "${eval_only_flag[@]}"
+    "${timing_flag[@]}" "${skip_figures_flag[@]}" "${skip_eval_flag[@]}" "${e3b_flag[@]}" "${eval_only_flag[@]}"
 }
 
 # run_pipinn <tag|auto> key=val ...
