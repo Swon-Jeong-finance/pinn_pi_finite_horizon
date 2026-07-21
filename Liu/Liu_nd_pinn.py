@@ -32,67 +32,75 @@ Optimal portfolio:
 Reference: Kim & Omberg (1996), "Dynamic Nonmyopic Portfolio Behavior", RFS
 """
 import time
-import argparse
-import csv
 import os
 import sys
 import math
+import argparse
 import numpy as np
 from datetime import datetime
 from scipy.integrate import solve_ivp
 
 import torch
 import torch.nn as nn
+
+# Cap intra/inter-op CPU threads (multi-worker sweeps oversubscribe
+# cores otherwise); TORCH_NUM_THREADS is exported by tune_pipinn.sh.
+torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "2")))
+torch.set_num_interop_threads(1)
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
-# Add path for joint_market_setup
-sys.path.insert(0, '/mnt/user-data/uploads')
+# Add local path for joint_market_setup and experiment utilities
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+sys.path.insert(1, '/mnt/user-data/uploads')
 from joint_market_setup_dirichlet import generate_joint_market_params, JointMarketParams, cholesky_solve
+from experiment_utils import (
+    add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
+    ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
+    parse_eval_margins, shrink_bounds, pres_from_mse,
+)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run Liu ND PINN with configurable hyperparameters")
-    parser.add_argument("--n-assets", type=int, default=10)
-    parser.add_argument("--m-states", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=12)
-    parser.add_argument("--tau-max", type=float, default=3.0)
-    parser.add_argument("--w-min", type=float, default=0.1)
-    parser.add_argument("--w-max", type=float, default=2.0)
-    parser.add_argument("--gamma", type=float, default=2.0)
-    parser.add_argument("--r", type=float, default=0.03)
-    parser.add_argument("--x-range-scale", type=float, default=1.0)
-    parser.add_argument("--dirichlet-concentration", type=float, default=1.0)
-    parser.add_argument("--alpha-scale", type=float, default=0.25)
-    parser.add_argument("--value-hidden", type=int, default=256)
-    parser.add_argument("--value-depth", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=2000)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--w-terminal", type=float, default=20.0)
-    parser.add_argument("--w-shape", type=float, default=1.0)
-    parser.add_argument("--eval-epochs", type=int, default=200)
-    parser.add_argument("--outer-iters", type=int, default=1000)
-    parser.add_argument("--output-root", type=str, default="outputs/pinn")
-    parser.add_argument("--weight-root", type=str, default="weights/pinn")
-    parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
-    parser.add_argument("--stop-flag-path", type=str, default="")
-    return parser.parse_args()
-
-ARGS = parse_args()
 
 # =============================================================================
-# 0) Reproducibility + Device
+# 0) CLI + Reproducibility + Device
 # =============================================================================
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Liu ND PINN experiment runner")
+    add_common_experiment_args(parser, model_type_default="pinn")
+
+    parser.add_argument("--print-every", type=int, default=2000)
+    # Previously hardcoded inside train_pinn_nd; exposed so bash overrides take effect.
+    parser.add_argument("--scheduler-patience", type=int, default=5000)
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--scheduler-min-lr", type=float, default=1e-8)
+    parser.add_argument("--lr-schedule", type=str, default="plateau",
+                        choices=["plateau", "fixed"],
+                        help="plateau = ReduceLROnPlateau on the training loss (legacy default); "
+                             "fixed = constant lr, no scheduler (mirrors PI-PINN's 'fixed').")
+    return parser
+
+
+ARGS = build_arg_parser().parse_args()
+# Resolve skip flags. --skip-plots is a BACK-COMPAT alias for --skip-figures
+# (figures-only); evaluation is skipped ONLY when --skip-eval is passed. This
+# guarantees a main sweep always computes full-dim metrics.csv even when
+# per-run figures are suppressed.
+SKIP_FIGURES = bool(ARGS.skip_figures or ARGS.skip_plots)
+SKIP_EVAL = bool(ARGS.skip_eval)
 SEED = ARGS.seed
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
-device = torch.device(ARGS.device)
+# Market seed decoupled from the training seed: a seed sweep varies network
+# init / collocation / optimizer randomness while the benchmark market
+# (K, xbar, SigmaX, rho, Lambda, ...) stays FIXED. None = legacy (use SEED).
+MARKET_SEED = ARGS.market_seed if ARGS.market_seed is not None else ARGS.seed
+device = resolve_device(ARGS.device)
+set_reproducibility(SEED, device)
+if torch.cuda.is_available() and str(device).startswith("cuda"):
+    torch.cuda.reset_peak_memory_stats(device)
 print(f"Device: {device}")
 
-if torch.cuda.is_available():
-    torch.cuda.init()
-    _ = torch.zeros(1, device=device)
 
 def print_joint_market_report(params, gamma=2.0, Y_ref=None):
     n, k = params.n, params.k
@@ -113,6 +121,7 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
     print(f"  ridge delta_asset    : {params.diag['delta_asset']:.2e}")
 
     # ---- "Merton-style" quantities at a reference state ----
+    # KO/다요인에서는 mu_excess가 상태에 따라 변하므로, Y_ref에서 myopic을 찍는 게 자연스러움
     if k == 0 or params.alpha is None:
         print("\n[Myopic (reference-state) quantities] skipped (k==0 or alpha not sampled).")
         print("  - If you want Merton-style mu_excess+pi*, either:")
@@ -121,13 +130,14 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
         return
 
     if Y_ref is None:
-        Y_ref = params.theta 
+        Y_ref = params.theta  # 기본: 장기평균 상태에서 진단
 
     Y_ref = np.asarray(Y_ref, dtype=float).reshape(k,)
     risk = params.alpha @ Y_ref              # (n,)
-    mu_excess = params.sigma * risk          # (n,)
+    mu_excess = params.sigma * risk          # (n,)  (너 코드의 mu-r 구조와 동일)
     Sigma = params.Sigma_RR_safe
 
+    # Σ^{-1} mu는 inverse 만들지 말고 cholesky_solve로
     Sigma_inv_mu = cholesky_solve(params.chol_Sigma_RR_safe, mu_excess)
     Theta = float(mu_excess @ Sigma_inv_mu)  # mu^T Σ^{-1} mu
 
@@ -154,10 +164,23 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
 N_ASSETS = ARGS.n_assets    # Number of risky assets
 M_STATES = ARGS.m_states    # Number of state variables
 
-weight_dir = os.path.join(ARGS.weight_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
+weight_dir = ARGS.weight_root or f"weights/pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
 os.makedirs(weight_dir, exist_ok=True)
-output_dir = os.path.join(ARGS.output_root, f"kim_omberg_{N_ASSETS}asset-{M_STATES}state")
+output_dir = ARGS.output_root or f"outputs/pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
 os.makedirs(output_dir, exist_ok=True)
+recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
+if ARGS.eval_only:
+    # Eval-only must NOT touch training-time provenance (config.json etc.).
+    recorder.save_config_eval()
+else:
+    recorder.save_config()
+    # A NEW training run must start with FRESH per-run CSVs: appending onto a
+    # previous same-tag run interleaves two experiments in one file.
+    recorder.rotate_training_logs()
+
+# Config sanity: a residual target without a validation set cannot stop.
+if ARGS.pres_target is not None and (not ARGS.val_points or ARGS.val_points <= 0):
+    raise SystemExit("[config error] --pres-target requires --val-points > 0 (held-out set is the stopping rule).")
 
 # Time domain (τ = remaining horizon = T - t)
 tau_max = ARGS.tau_max
@@ -176,11 +199,11 @@ r = ARGS.r        # risk-free rate
 # Generate market parameters
 params = generate_joint_market_params(
     n=N_ASSETS, k=M_STATES,
-    seed=SEED,
+    seed=MARKET_SEED,
     sample_alpha=True,
     alpha_dist="dirichlet",
-    dirichlet_concentration=ARGS.dirichlet_concentration, 
-    alpha_scale=ARGS.alpha_scale,             
+    dirichlet_concentration=ARGS.dirichlet_concentration,  # 보통 1.0이 무난 (균등한 Dirichlet)
+    alpha_scale=ARGS.alpha_scale,              # row-sum이 alpha_scale이 되도록
 )
 
 # Extract parameters
@@ -205,17 +228,29 @@ X_max = xbar + X_RANGE_SCALE * eta
 
 # Print configuration
 print_joint_market_report(params)
+# print(f"\n{'='*60}")
+# print("Multi-dimensional Kim-Omberg PINN")
+# print(f"{'='*60}")
+# print(f"Dimensions: N={N_ASSETS} assets, M={M_STATES} states")
+# print(f"Parameters: γ={gamma}, r={r}, T={tau_max}")
 print(f"Minimum State domain: X ∈ {X_min}")
 print(f"Maxmimum State domain: X ∈ {X_max}")
 print(f"Minimum Wealth domain: W ∈ [{W_min}, {W_max}]")
 print(f"\nK (mean reversion):\n{np.diag(K)}")
 print(f"x̄ (long-run mean): {xbar}")
+# print(f"Σ_X (state diffusion):\n{SigmaX}")
+# print(f"ρ (correlation):\n{rho}")
+# print(f"Λ (loading):\n{Lam}")
+# print(f"λ_0 (baseline): {lam0}")
+# print(f"Γ = ρΣ_X^⊤:\n{Gamma}")
+# print(f"Q = Σ_X Σ_X^⊤:\n{Q}")
+
 
 # =============================================================================
 # 2) Closed-form Solution (ODE system)
 # =============================================================================
 def solve_closed_form_ode(T, gamma, K, xbar, SigmaX, rho, lam0, Lam,
-                          method="RK45", t_eval=None):
+                          method="RK45", t_eval=None, rtol=1e-12, atol=1e-14):
     """
     Solve normal-solution ODEs for:
       φ(t,x) = exp(a(τ) + b(τ)^T x + 0.5 x^T C(τ) x),  τ = T - t.
@@ -251,9 +286,17 @@ def solve_closed_form_ode(T, gamma, K, xbar, SigmaX, rho, lam0, Lam,
     
     y0 = np.zeros(1 + M + M * M)
     if t_eval is None:
-        t_eval = np.linspace(0.0, T, 1001)
-    
-    sol = solve_ivp(rhs, (0.0, T), y0, t_eval=t_eval, method=method)
+        # Dense grid: get_closed_form_at_tau uses LINEAR interpolation between
+        # the saved nodes, so the node spacing (not just the solver tolerance)
+        # bounds the ground-truth accuracy. 8001 nodes -> interp error ~1e-9.
+        t_eval = np.linspace(0.0, T, 8001)
+
+    # Tight tolerances: the closed form is the ground truth for every RelL2 /
+    # substitution comparison, so it must be accurate well below the smallest
+    # reported error. (solve_ivp DEFAULTS are rtol=1e-3, atol=1e-6 -- runs
+    # recorded before this fix carry ~1e-5-level ODE error in their npz.)
+    sol = solve_ivp(rhs, (0.0, T), y0, t_eval=t_eval, method=method,
+                    rtol=rtol, atol=atol)
     return sol
 
 
@@ -318,6 +361,16 @@ def closed_form_decomposition(tau, w, x, sol, M, N, gamma, lam0, Lam, Gamma):
 print("\nSolving closed-form ODE system...")
 cf_sol = solve_closed_form_ode(tau_max, gamma, K, xbar, SigmaX, rho, lam0, Lam)
 print(f"ODE solved: {len(cf_sol.t)} time points, success={cf_sol.success}")
+
+# Persist market / closed-form objects needed for later standalone plotting.
+if not ARGS.eval_only:
+    recorder.save_market_snapshot(
+        K=K, xbar=xbar, SigmaX=SigmaX, rho=rho, Lam=Lam, Q=Q, Gamma=Gamma,
+        k0=k0, lam0=lam0, X_min=X_min, X_max=X_max, eta=eta,
+        gamma=np.array([gamma]), r=np.array([r]), tau_max=np.array([tau_max]),
+        W_min=np.array([W_min]), W_max=np.array([W_max]), seed=np.array([SEED]), market_seed=np.array([MARKET_SEED]),
+    )
+    recorder.save_closed_form_solution(cf_sol)
 
 
 # =============================================================================
@@ -405,6 +458,63 @@ def sample_terminal(n, device, M, X_min, X_max, W_min, W_max):
 def V_terminal(w, gamma):
     """Terminal condition: V(0, w, x) = U(w) = w^{1-γ}/(1-γ)"""
     return torch.pow(w, 1.0 - gamma) / (1.0 - gamma)
+
+
+def build_validation_set(n_int, n_term, device, M, X_min, X_max, W_min, W_max, tau_max, seed):
+    """Held-out validation set on Q_col, sampled ONCE with a dedicated RNG.
+
+    Mirrors sample_interior / sample_terminal (same eps offsets, same uniform
+    law) but draws on a CPU generator seeded independently of the global
+    stream, so training reproducibility is unaffected and the set is fixed
+    for the whole run (paper: held-out collocation set disjoint from training).
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed) * 1000003 + 20260718)
+
+    eps_tau = 1e-3
+    eps_W = 1e-2
+    X_min_t = torch.tensor(X_min, dtype=torch.float32)
+    X_max_t = torch.tensor(X_max, dtype=torch.float32)
+
+    tau_i = eps_tau + torch.rand(n_int, 1, generator=gen) * (tau_max - eps_tau)
+    w_i = W_min + eps_W + torch.rand(n_int, 1, generator=gen) * (W_max - W_min - 2 * eps_W)
+    x_i = X_min_t + torch.rand(n_int, M, generator=gen) * (X_max_t - X_min_t)
+
+    w_t = W_min + eps_W + torch.rand(n_term, 1, generator=gen) * (W_max - W_min - 2 * eps_W)
+    x_t = X_min_t + torch.rand(n_term, M, generator=gen) * (X_max_t - X_min_t)
+    tau_t = torch.zeros(n_term, 1)
+
+    return {
+        "w_int": w_i.to(device), "x_int": x_i.to(device), "tau_int": tau_i.to(device),
+        "w_term": w_t.to(device), "x_term": x_t.to(device), "tau_term": tau_t.to(device),
+    }
+
+
+def evaluate_heldout_pres_pinn(model, val_set, M, N, gamma, r,
+                               K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t, chunk=4096):
+    """Held-out residual level for the DIRECT PINN baseline:
+    p_res = RMS(nonlinear HJB residual on Q_col) + RMS(terminal mismatch)."""
+    model.eval()
+    n = val_set["w_int"].shape[0]
+    sq_sum = 0.0
+    for i in range(0, n, chunk):
+        w_b = val_set["w_int"][i:i + chunk].detach().clone().requires_grad_(True)
+        x_b = val_set["x_int"][i:i + chunk].detach().clone().requires_grad_(True)
+        tau_b = val_set["tau_int"][i:i + chunk].detach().clone().requires_grad_(True)
+        residual, _, _, _, _ = hjb_residual_nd(
+            model, w_b, x_b, tau_b, M, N, gamma, r,
+            K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t
+        )
+        sq_sum += float(torch.sum(residual.detach() ** 2).item())
+    pde_rms = float(np.sqrt(sq_sum / max(n, 1)))
+
+    with torch.no_grad():
+        V_T_pred = model(val_set["w_term"], val_set["x_term"], val_set["tau_term"])
+        V_T_true = V_terminal(val_set["w_term"], gamma)
+        term_rms = float(torch.sqrt(torch.mean((V_T_pred - V_T_true) ** 2)).item())
+
+    model.train()
+    return pde_rms, term_rms, pde_rms + term_rms
 
 
 # =============================================================================
@@ -506,11 +616,8 @@ def hjb_residual_nd(model, w, x, tau, M, N, gamma, r, K_t, k0_t, Q_t, Gamma_t, l
     
     # denominator = 2 V_ww (should be negative for concave V)
     denominator = 2.0 * V_ww
-    denominator_safe = torch.where(
-        torch.abs(denominator) < 1e-8,
-        torch.sign(denominator) * 1e-8 + 1e-10,
-        denominator
-    )
+    # denominator = 2 V_ww must be negative (concavity); clamp from above.
+    denominator_safe = torch.clamp(denominator, max=-1e-8)
     term5 = -numerator / denominator_safe
     
     residual = term1 + term2 + term3 + term4 + term5
@@ -552,11 +659,11 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
     
     # θ* = -(λ(x)V_w + Γ V_wx) / V_ww
     numerator = lam_x * V_w + Gamma_Vwx
-    V_ww_safe = torch.where(
-        torch.abs(V_ww) < 1e-8,
-        torch.sign(V_ww) * 1e-8 + 1e-10,
-        V_ww
-    )
+    # Concavity-respecting guard: V_ww must be negative for the FOC to be a
+    # maximizer, so clamp from ABOVE at -1e-8. (The previous
+    # sign(V_ww)*1e-8 + 1e-10 form gave +1e-10 at V_ww == 0: wrong sign and
+    # 100x smaller than intended, letting the control blow up.)
+    V_ww_safe = torch.clamp(V_ww, max=-1e-8)
     theta = -numerator / V_ww_safe  # (batch, N)
     theta_norm = theta / w  # (batch, N)
     
@@ -576,122 +683,554 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
 # =============================================================================
 # 6) Training
 # =============================================================================
-def train_pinn_nd(model, M, N, gamma, r, 
+def train_pinn_nd(model, M, N, gamma, r,
                   K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t,
                   X_min, X_max, W_min, W_max, tau_max,
-                  epochs=50000, batch_size=ARGS.batch_size, lr=ARGS.lr,
-                  resample_every=ARGS.eval_epochs, w_terminal=10.0, w_concavity=1.0,
-                  print_every=2000):
-    """Train PINN for multi-dimensional Kim-Omberg HJB."""
-    
+                  epochs=50000, batch_size=2000, terminal_frac=0.5, lr=5e-4,
+                  eval_epochs=200, outer_iters=1000,
+                  w_terminal=10.0, w_concavity=1.0, w_rra=0.0,
+                  scheduler_patience=5000, scheduler_factor=0.5, scheduler_min_lr=1e-8,
+                  save_iterate_every=1,
+                  pres_target=None, val_points=100000, val_terminal_points=10000,
+                  val_every=1, val_seed=0,
+                  diag_points=0, diag_margin=0.0, diag_every=1, timing_mode=False,
+                  print_every=2000, recorder=None, stopper=None):
+    """Train PINN for multi-dimensional Kim-Omberg HJB.
+
+    eval_epochs is the old resample_every interval. One eval_epochs block is
+    treated as one pseudo-outer iteration for PDE-loss early stopping.
+
+    If pres_target is set, the held-out residual level p_res (nonlinear HJB
+    RMS + terminal RMS on a fixed validation set) is checked every val_every
+    epochs within a block, plus once BEFORE the block's first step. On the
+    FIRST time p_res <= pres_target, training STOPS GLOBALLY: the direct
+    PINN solves a single nonlinear HJB, so reaching the target means the
+    equation is solved to tolerance and further blocks would only re-verify
+    the same unchanged model. The stop epoch/block and achieved p_res are
+    recorded; this is a SUCCESS stop, distinct from the divergence stopper.
+    """
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5000, min_lr=1e-8
-    )
-    
+    if ARGS.lr_schedule == "fixed":
+        scheduler = None  # constant lr throughout (scheduler-off test mode)
+        print("[lr] schedule = fixed (no scheduler; constant lr)")
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=scheduler_factor, patience=scheduler_patience, min_lr=scheduler_min_lr
+        )
+
+    # Held-out validation set: sampled ONCE per run with a dedicated RNG
+    # stream (training RNG untouched).
+    val_set = None
+    skip_val = timing_mode and pres_target is None  # audit-only val = diagnostic
+    if val_points and val_points > 0 and not skip_val:
+        val_set = build_validation_set(
+            int(val_points), max(1, int(val_terminal_points)), device,
+            M, X_min, X_max, W_min, W_max, tau_max, seed=val_seed,
+        )
+
+    if timing_mode:
+        # Timing runs must not write iterate checkpoints regardless of caller.
+        save_iterate_every = 0
+
+    diag = None
+    diag_col = None
+    if diag_points and diag_points > 0 and not timing_mode:
+        diag = build_diag_set(
+            int(diag_points), float(diag_margin), M, N, gamma, r,
+            X_min, X_max, W_min, W_max, tau_max,
+            cf_sol, lam0, Lam, Gamma, market_seed=MARKET_SEED,
+        )
+        # Q_col subsample for the ellipticity of the implied GREEDY policy
+        # (the direct method has no frozen policy; theta here is derived
+        # from the current V, so the column is named ..._greedy).
+        diag_col = build_validation_set(
+            int(diag_points), 1, device, M,
+            X_min, X_max, W_min, W_max, tau_max, seed=MARKET_SEED,
+        )
+        print(f"[diag] {diag_points} pts on Q_ev(margin={diag_margin}) for e_n / margins "
+              f"+ {diag_points} Q_col pts for greedy-policy ellipticity")
+
+    def _val_check():
+        return evaluate_heldout_pres_pinn(
+            model, val_set, M, N, gamma, r,
+            K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t)
+
     loss_history = []
     best_loss = float('inf')
-    
+    start_time = time.time()
+
+    # Weight-saving policy (paper protocol): final = official, best = diagnostic.
+    # iterates/value_net_iter{NNNN}.pt snapshots one state per pseudo-outer
+    # (resampling) block, mirroring the PI-PINN per-iteration snapshots.
+    best_path = os.path.join(weight_dir, "value_net_best.pt")
+    last_path = os.path.join(weight_dir, "value_net_last.pt")
+    final_path = os.path.join(weight_dir, "value_net_final.pt")
+    iterate_dir = os.path.join(weight_dir, "iterates")
+    if save_iterate_every and save_iterate_every > 0:
+        os.makedirs(iterate_dir, exist_ok=True)
+    legacy_best_path = os.path.join(
+        weight_dir,
+        f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).pt"
+    )
+
+    train_fields = [
+        "timestamp", "model_type", "run_tag", "epoch", "outer_iter", "inner_epoch",
+        "total_loss", "pde_loss", "terminal_loss", "concavity_loss", "monotonicity_loss","rra_loss",
+        "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
+        "theta_diff", "eval_loss", "lr", "best_loss", "elapsed_sec", "stopped", "stop_reason",
+    ]
+    outer_fields = [
+        "timestamp", "model_type", "run_tag", "outer_iter", "epoch", "total_loss", "pde_loss",
+        "terminal_loss", "monotonicity_loss", "concavity_loss", "rra_loss",
+        "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
+        "inner_epochs_used", "target_reached",
+        "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_theta",
+        "m_ww", "M_num", "guard_frac_ev",
+        "lam_min_sigma_greedy", "lam_max_sigma_greedy", "clip_frac_frozen",
+        "lr", "best_loss", "bad_count", "stop_active",
+        "stop_is_bad", "stopped", "stop_reason", "elapsed_sec",
+    ]
+    pending_train_rows = []
+
+    # Diagnostic best cache (flushed to disk at block boundaries only).
+    best_state_cpu = None
+    best_dirty = False
+
+    # Explicit optimizer-step counter (E8): with the target global stop the
+    # executed steps cannot be recovered from epochs alone.
+    total_opt_steps = 0
+
+    # Per-block early-stop state (pres-target rule).
+    block_stopped = False
+    block_target_reached = False
+    block_epochs_used = 0
+    block_last_val = None        # (pde_rms, term_rms, pres) at the block's final state
+    block_last_val_at_final = False
+
     # Initial sampling
     w_int, x_int, tau_int = sample_interior(batch_size, device, M, X_min, X_max, W_min, W_max, tau_max)
-    w_term, x_term, tau_term = sample_terminal(batch_size, device, M, X_min, X_max, W_min, W_max)
+    # w_term, x_term, tau_term = sample_terminal(batch_size // 4, device, M, X_min, X_max, W_min, W_max)
+    w_term, x_term, tau_term = sample_terminal(max(1, int(batch_size * terminal_frac)), device, M, X_min, X_max, W_min, W_max)
     V_T_target = V_terminal(w_term, gamma).detach()
-    
+
     print(f"\n{'='*60}")
     print(f"Training {M+2}D PINN (N={N} assets, M={M} states)")
+    print(f"  outer_iters : {outer_iters}")
+    print(f"  eval_epochs : {eval_epochs}  (old resample_every)")
+    print(f"  epochs      : {epochs}")
     print(f"{'='*60}")
-    
-    stopped_early = False
+
+    stop_info = {"stopped_early": False}
+    # Safe defaults (referenced at block boundaries even if a block was fully
+    # skipped by the pre-step target check before any training step ran).
+    current_loss = current_pde = current_terminal = float("nan")
+    current_conc = current_mono = current_rra = float("nan")
+    current_lr = float(lr)
+    elapsed = 0.0
+
     for epoch in range(1, epochs + 1):
-        if ARGS.stop_flag_path and os.path.exists(ARGS.stop_flag_path):
-            print(f"[stop-flag] detected: {ARGS.stop_flag_path}. Stop this run.")
-            stopped_early = True
-            break
-        if epoch % resample_every == 0:
-            w_int, x_int, tau_int = sample_interior(batch_size, device, M, X_min, X_max, W_min, W_max, tau_max)
-            w_term, x_term, tau_term = sample_terminal(batch_size, device, M, X_min, X_max, W_min, W_max)
-            V_T_target = V_terminal(w_term, gamma).detach()
-        
-        optimizer.zero_grad()
-        
-        # PDE loss
-        residual, V, V_w, V_ww, V_wx = hjb_residual_nd(
-            model, w_int, x_int, tau_int, M, N, gamma, r,
-            K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t
-        )
-        pde_loss = torch.mean(residual ** 2)
-        
-        # Terminal condition loss
-        V_T_pred = model(w_term, x_term, tau_term)
-        terminal_loss = torch.mean((V_T_pred - V_T_target) ** 2)
-        
-        # Concavity loss: V_ww < 0
-        concavity_violation = torch.relu(V_ww)
-        concavity_loss = torch.mean(concavity_violation ** 2)
-        
-        # Total loss
-        total_loss = pde_loss + w_terminal * terminal_loss + w_concavity * concavity_loss
-        
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step(total_loss.detach().cpu())
-        
-        # Clear gradients
-        for var in [w_int, x_int, tau_int]:
-            if var.grad is not None:
-                var.grad = None
-        
-        # Track best
-        current_loss = total_loss.item()
-        if current_loss < best_loss:
-            best_loss = current_loss
-            torch.save(model.state_dict(), os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"))
-        
-        loss_history.append({
-            'epoch': epoch,
-            'total': current_loss,
-            'pde': pde_loss.item(),
-            'terminal': terminal_loss.item(),
-            'concavity': concavity_loss.item(),
-            'lr': optimizer.param_groups[0]['lr']
-        })
-        
-        if epoch % print_every == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"[{epoch:6d}/{epochs}] Total: {current_loss:.3e} | "
-                  f"PDE: {pde_loss.item():.3e} | Term: {terminal_loss.item():.3e} | "
-                  f"Conc: {concavity_loss.item():.3e} | LR: {current_lr:.2e}")
+        outer_iter_float = (epoch - 1) // eval_epochs + 1
+        inner_epoch = (epoch - 1) % eval_epochs + 1
 
-        # Early stop rule: check PDE loss at outer_iter=50 and abort current run if too large.
-        # In this script, outer_iter ~ epoch // resample_every.
-        outer_iter_now = epoch // resample_every
-        if outer_iter_now == 50 and pde_loss.item() > 1.0:
-            print(f"[early-stop] outer_iter=50 and PDE={pde_loss.item():.4e} (>1.0). Stop this run.")
-            if ARGS.stop_flag_path:
-                os.makedirs(os.path.dirname(ARGS.stop_flag_path), exist_ok=True)
-                open(ARGS.stop_flag_path, "a").close()
-            stopped_early = True
-            break
-    
-    # Restore best model
-    ckpt_path = os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt")
-    if os.path.exists(ckpt_path):
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        print(f"\nRestored best model (loss: {best_loss:.3e})")
-        
-    return loss_history, optimizer, stopped_early
+        # Block start. BUGFIX (off-by-one): the batch used to be refreshed at
+        # `epoch % eval_epochs == 0`, i.e. on the LAST epoch of a block, so
+        # each block's final step already trained on the NEXT block's batch.
+        # Resampling now happens at the FIRST epoch of every block (block 1
+        # uses the initial sample drawn above), so one block = one batch.
+        if inner_epoch == 1:
+            if epoch > 1:
+                w_int, x_int, tau_int = sample_interior(batch_size, device, M, X_min, X_max, W_min, W_max, tau_max)
+                w_term, x_term, tau_term = sample_terminal(max(1, int(batch_size * terminal_frac)), device, M, X_min, X_max, W_min, W_max)
+                V_T_target = V_terminal(w_term, gamma).detach()
 
-def save_loss_history_csv(loss_history, save_path):
-    if not loss_history:
-        return
-    fields = ["epoch", "total", "pde", "terminal", "concavity", "lr"]
-    with open(save_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in loss_history:
-            writer.writerow({k: row.get(k) for k in fields})
-    print(f"Saved: {save_path}")
+            # Reset the per-block pres-target state and run the pre-step
+            # check (a state that already meets the target must not be
+            # perturbed by further steps -- skip the whole block).
+            block_stopped = False
+            block_target_reached = False
+            block_epochs_used = 0
+            block_last_val = None
+            block_last_val_at_final = False
+            if val_set is not None and pres_target is not None:
+                v = _val_check()
+                block_last_val, block_last_val_at_final = v, True
+                if v[2] <= float(pres_target):
+                    block_stopped = True
+                    block_target_reached = True
+                    # GLOBAL STOP (pre-step): the model already satisfies the
+                    # target, so training ends here. Run one diagnostic
+                    # forward (no optimizer step) so current_* and one train
+                    # row reflect the final state (mirrors the PI-PINN
+                    # epoch-0 synthetic row), then finalize below.
+                    w_d = w_int.detach().clone().requires_grad_(True)
+                    x_d = x_int.detach().clone().requires_grad_(True)
+                    tau_d = tau_int.detach().clone().requires_grad_(True)
+                    residual_d, V_d, V_w_d, V_ww_d, _ = hjb_residual_nd(
+                        model, w_d, x_d, tau_d, M, N, gamma, r,
+                        K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t
+                    )
+                    with torch.no_grad():
+                        V_T_pred_d = model(w_term, x_term, tau_term)
+                        terminal_d = torch.mean((V_T_pred_d - V_T_target) ** 2)
+                    pde_d = torch.mean(residual_d.detach() ** 2)
+                    conc_d = torch.mean(torch.relu(V_ww_d.detach()) ** 2)
+                    mono_d = torch.mean(torch.relu(-V_w_d.detach()) ** 2)
+                    eta_d = -w_d.detach() * V_ww_d.detach() / torch.clamp(V_w_d.detach(), min=1e-8)
+                    rra_d = torch.mean((eta_d - gamma) ** 2)
+                    current_pde = float(pde_d.item())
+                    current_terminal = float(terminal_d.item())
+                    current_conc = float(conc_d.item())
+                    current_mono = float(mono_d.item())
+                    current_rra = float(rra_d.item())
+                    current_loss = float(current_pde + w_terminal * current_terminal
+                                         + w_concavity * (current_conc + current_mono)
+                                         + w_rra * current_rra)
+                    current_lr = float(optimizer.param_groups[0]['lr'])
+                    elapsed = time.time() - start_time
+                    if not timing_mode:
+                     pending_train_rows.append({
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "model_type": ARGS.model_type,
+                        "run_tag": ARGS.run_tag,
+                        "epoch": epoch,
+                        "outer_iter": outer_iter_float,
+                        "inner_epoch": 0,
+                        "total_loss": current_loss,
+                        "pde_loss": current_pde,
+                        "terminal_loss": current_terminal,
+                        "concavity_loss": current_conc,
+                        "monotonicity_loss": current_mono,
+                        "rra_loss": current_rra,
+                        "train_pres": pres_from_mse(current_pde, current_terminal),
+                        "val_pde_rms": v[0],
+                        "val_terminal_rms": v[1],
+                        "val_pres": v[2],
+                        "theta_diff": "",
+                        "eval_loss": "",
+                        "lr": current_lr,
+                        "best_loss": best_loss,
+                        "elapsed_sec": elapsed,
+                        "stopped": 0,
+                        "stop_reason": "pres_target_reached",
+                    })
+
+        if not block_stopped:
+            optimizer.zero_grad()
+
+            # PDE loss
+            residual, V, V_w, V_ww, V_wx = hjb_residual_nd(
+                model, w_int, x_int, tau_int, M, N, gamma, r,
+                K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t
+            )
+            pde_loss = torch.mean(residual ** 2)
+
+            # Terminal condition loss
+            V_T_pred = model(w_term, x_term, tau_term)
+            terminal_loss = torch.mean((V_T_pred - V_T_target) ** 2)
+
+            # Concavity loss: V_ww < 0
+            concavity_violation = torch.relu(V_ww)
+            concavity_loss = torch.mean(concavity_violation ** 2)
+
+            # shape constraints in wealth direction
+            mono_loss = torch.mean(torch.relu(-V_w) ** 2)
+
+            # CRRA homogeneity: local relative risk aversion eta = -w V_ww / V_w must equal gamma.
+            # (Equivalently the myopic coefficient -V_w/(w V_ww) must equal 1/gamma.)
+            eta = -w_int * V_ww / torch.clamp(V_w, min=1e-8)
+            rra_loss = torch.mean((eta - gamma) ** 2)
+
+            # Total loss
+            total_loss = (pde_loss + w_terminal * terminal_loss + w_concavity * (concavity_loss + mono_loss) + w_rra * rra_loss)
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_opt_steps += 1
+            if scheduler is not None:
+                scheduler.step(total_loss.detach().cpu())
+
+            # Clear gradients
+            for var in [w_int, x_int, tau_int]:
+                if var.grad is not None:
+                    var.grad = None
+
+            current_loss = float(total_loss.item())
+            current_pde = float(pde_loss.item())
+            current_terminal = float(terminal_loss.item())
+            current_conc = float(concavity_loss.item())
+            current_mono = float(mono_loss.item())
+            current_rra = float(rra_loss.item())
+            current_lr = float(optimizer.param_groups[0]['lr'])
+            elapsed = time.time() - start_time
+            block_epochs_used = inner_epoch
+            block_last_val_at_final = False  # state changed since the last check
+
+            # Track best (diagnostic only). Disk writes moved to block
+            # boundaries: the old per-improvement double torch.save could
+            # fire nearly every epoch and pollutes E8 wall-clock.
+            if current_loss < best_loss:
+                best_loss = current_loss
+                if not timing_mode:
+                    best_state_cpu = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    best_dirty = True
+
+            _lh_row = {
+                'total': current_loss,
+                'pde': current_pde,
+                'terminal': current_terminal,
+                'monotonicity': current_mono,
+                'concavity': current_conc,
+                "rra": current_rra,
+            }
+            if timing_mode and loss_history:
+                loss_history[-1] = _lh_row  # timing: keep only the latest row
+            else:
+                loss_history.append(_lh_row)
+
+            row_val = {"val_pde_rms": "", "val_terminal_rms": "", "val_pres": ""}
+
+            # Post-step held-out check against the residual target.
+            # First satisfaction triggers the GLOBAL stop below.
+            if val_set is not None and pres_target is not None and (inner_epoch % max(1, int(val_every)) == 0):
+                v = _val_check()
+                block_last_val, block_last_val_at_final = v, True
+                row_val = {"val_pde_rms": v[0], "val_terminal_rms": v[1], "val_pres": v[2]}
+                if v[2] <= float(pres_target):
+                    block_stopped = True
+                    block_target_reached = True
+
+            if not timing_mode:
+             pending_train_rows.append({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model_type": ARGS.model_type,
+                "run_tag": ARGS.run_tag,
+                "epoch": epoch,
+                "outer_iter": outer_iter_float,
+                "inner_epoch": inner_epoch,
+                "total_loss": current_loss,
+                "pde_loss": current_pde,
+                "terminal_loss": current_terminal,
+                "concavity_loss": current_conc,
+                "monotonicity_loss": current_mono,
+                "rra_loss": current_rra,
+                "train_pres": pres_from_mse(current_pde, current_terminal),
+                **row_val,
+                "theta_diff": "",
+                "eval_loss": "",
+                "lr": current_lr,
+                "best_loss": best_loss,
+                "elapsed_sec": elapsed,
+                "stopped": 0,
+                "stop_reason": "",
+            })
+
+            if epoch % print_every == 0:
+                print(f"[{epoch:6d}/{epochs}] Total: {current_loss:.3e} | "
+                      f"PDE: {current_pde:.3e} | Term: {current_terminal:.3e} | Mono: {current_mono:.3e} |"
+                      f"Conc: {current_conc:.3e} | RRA(η-γ)²: {current_rra:.3e} | LR: {current_lr:.2e}")
+
+        # GLOBAL STOP on first target satisfaction (pre-step or post-step).
+        if block_target_reached:
+            if best_dirty and best_state_cpu is not None:
+                torch.save(best_state_cpu, best_path)
+                torch.save(best_state_cpu, legacy_best_path)
+                best_dirty = False
+            diag_res = {}
+            if diag is not None:
+                diag_res = eval_diag_metrics(
+                    model, diag, M, N, gamma,
+                    Gamma_t, lam0_t, Lam_t, Gamma, lam0, Lam,
+                )
+            # Timing mode: no CSV I/O inside the timed loop (kept symmetric
+            # with PI-PINN); the stop summary still goes to status.json.
+            if recorder is not None and not timing_mode:
+                if pending_train_rows:
+                    append_csv_rows(recorder.train_csv, pending_train_rows, train_fields)
+                    pending_train_rows = []
+                _bv = block_last_val if block_last_val is not None else ("", "", "")
+                append_csv_rows(recorder.outer_csv, [{
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "model_type": ARGS.model_type,
+                    "run_tag": ARGS.run_tag,
+                    "outer_iter": outer_iter_float,
+                    "epoch": epoch,
+                    "total_loss": current_loss,
+                    "pde_loss": current_pde,
+                    "terminal_loss": current_terminal,
+                    "monotonicity_loss": current_mono,
+                    "concavity_loss": current_conc,
+                    "rra_loss": current_rra,
+                    "train_pres": pres_from_mse(current_pde, current_terminal) if current_pde == current_pde else "",
+                    "val_pde_rms": _bv[0],
+                    "val_terminal_rms": _bv[1],
+                    "val_pres": _bv[2],
+                    "inner_epochs_used": block_epochs_used,
+                    "target_reached": 1,
+                    "e_V_sup": diag_res.get("e_V_sup", ""),
+                    "e_bundle_sup": diag_res.get("e_bundle_sup", ""),
+                    "e_Xev": diag_res.get("e_Xev", ""),
+                    "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
+                    "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
+                    "m_ww": diag_res.get("m_ww", ""),
+                    "M_num": diag_res.get("M_num", ""),
+                    "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
+                    "lam_min_sigma_greedy": "",
+                    "lam_max_sigma_greedy": "",
+                    "clip_frac_frozen": "",
+                    "lr": current_lr,
+                    "best_loss": best_loss,
+                    "bad_count": "",
+                    "stop_active": "",
+                    "stop_is_bad": "",
+                    "stopped": 0,
+                    "stop_reason": "pres_target_reached",
+                    "elapsed_sec": time.time() - start_time,
+                }], outer_fields)
+            torch.save(model.state_dict(), last_path)
+            torch.save(model.state_dict(), final_path)
+            _achieved = block_last_val[2] if block_last_val is not None else float("nan")
+            print(f"\n[target-stop] PINN reached pres_target at epoch {epoch} "
+                  f"(block {outer_iter_float}, {block_epochs_used} steps in block, "
+                  f"achieved p_res={_achieved:.3e}). Training ends; model = FINAL state -> {final_path}")
+            stop_info = {
+                "stopped_early": False,
+                "target_reached": True,
+                "epoch_at_stop": int(epoch),
+                "block_at_stop": int(outer_iter_float),
+                "inner_epochs_in_stop_block": int(block_epochs_used),
+                "achieved_pres": float(_achieved),
+                "total_optimizer_steps": int(total_opt_steps),
+            }
+            return loss_history, optimizer, stop_info
+
+        # One PINN pseudo-outer iteration = one eval_epochs block.
+        if epoch % eval_epochs == 0:
+            outer_iter = epoch // eval_epochs
+
+            # Snapshot the state at the end of this pseudo-outer block
+            # (kept symmetric with PI-PINN iterate snapshots).
+            if save_iterate_every and save_iterate_every > 0 and (outer_iter % save_iterate_every == 0):
+                torch.save(model.state_dict(), os.path.join(iterate_dir, f"value_net_iter{outer_iter:04d}.pt"))
+
+            # Flush the diagnostic best cache once per block (not per epoch).
+            if best_dirty and best_state_cpu is not None:
+                torch.save(best_state_cpu, best_path)
+                torch.save(best_state_cpu, legacy_best_path)
+                best_dirty = False
+
+            # End-of-block held-out measurement (the reported per-block
+            # p_res). Reuse the last check if the state is unchanged since.
+            if val_set is not None and not block_last_val_at_final:
+                block_last_val = _val_check()
+                block_last_val_at_final = True
+            _bv = block_last_val if block_last_val is not None else ("", "", "")
+
+            # Fixed-set diagnostics for this pseudo-outer state (E1-b/c
+            # analogues + closed-form e_n components).
+            diag_res = {}
+            greedy_lam_min = ""
+            greedy_lam_max = ""
+            if diag is not None and (diag_every <= 1 or outer_iter % diag_every == 0 or outer_iter == 1):
+                diag_res = eval_diag_metrics(
+                    model, diag, M, N, gamma,
+                    Gamma_t, lam0_t, Lam_t, Gamma, lam0, Lam,
+                )
+                # Ellipticity of the implied greedy policy on Q_col.
+                _th_l = []
+                _P = diag_col["w_int"].shape[0]
+                for _i in range(0, _P, 4096):
+                    _w = diag_col["w_int"][_i:_i + 4096].detach().clone().requires_grad_(True)
+                    _x = diag_col["x_int"][_i:_i + 4096].detach().clone().requires_grad_(True)
+                    _tau = diag_col["tau_int"][_i:_i + 4096]
+                    _, _th, _, _, _ = compute_optimal_theta_nd(
+                        model, _w, _x, _tau, M, N, gamma,
+                        Gamma_t, lam0_t, Lam_t, create_graph=True)
+                    _th_l.append(_th.detach().cpu())
+                _th_np = torch.cat(_th_l, dim=0).numpy()
+                _lmin, _lmax = sigma_eig_extremes_batch(_th_np, Gamma, Q)
+                greedy_lam_min = float(np.min(_lmin))
+                greedy_lam_max = float(np.max(_lmax))
+
+            stop_triggered = False
+            stop_meta = {"active": False, "is_bad": False, "bad_count": 0}
+            if stopper is not None:
+                stop_triggered, stop_meta = stopper.update(outer_iter, current_pde)
+
+            outer_row = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model_type": ARGS.model_type,
+                "run_tag": ARGS.run_tag,
+                "outer_iter": outer_iter,
+                "epoch": epoch,
+                "total_loss": current_loss,
+                "pde_loss": current_pde,
+                "terminal_loss": current_terminal,
+                "monotonicity_loss": current_mono,
+                "concavity_loss": current_conc,
+                "rra_loss": current_rra,
+                "train_pres": pres_from_mse(current_pde, current_terminal) if current_pde == current_pde else "",
+                "val_pde_rms": _bv[0],
+                "val_terminal_rms": _bv[1],
+                "val_pres": _bv[2],
+                "inner_epochs_used": block_epochs_used,
+                "target_reached": int(bool(block_target_reached)),
+                "e_V_sup": diag_res.get("e_V_sup", ""),
+                "e_bundle_sup": diag_res.get("e_bundle_sup", ""),
+                "e_Xev": diag_res.get("e_Xev", ""),
+                    "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
+                    "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
+                "m_ww": diag_res.get("m_ww", ""),
+                "M_num": diag_res.get("M_num", ""),
+                "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
+                "lam_min_sigma_greedy": greedy_lam_min,
+                "lam_max_sigma_greedy": greedy_lam_max,
+                "clip_frac_frozen": "",
+                "lr": current_lr,
+                "best_loss": best_loss,
+                "bad_count": stop_meta.get("bad_count", ""),
+                "stop_active": int(bool(stop_meta.get("active", False))),
+                "stop_is_bad": int(bool(stop_meta.get("is_bad", False))),
+                "stopped": int(bool(stop_triggered)),
+                "stop_reason": stop_meta.get("reason", ""),
+                "elapsed_sec": elapsed,
+            }
+
+            # Timing mode: outer CSV writes are excluded from the timed loop
+            # on BOTH methods (symmetric E8 accounting).
+            if recorder is not None and not timing_mode:
+                append_csv_rows(recorder.train_csv, pending_train_rows, train_fields)
+                pending_train_rows = []
+                append_csv_rows(recorder.outer_csv, [outer_row], outer_fields)
+            elif timing_mode:
+                pending_train_rows = []
+
+            if stop_triggered:
+                torch.save(model.state_dict(), last_path)
+                torch.save(model.state_dict(), final_path)
+                stop_info = {"stopped_early": True, **stop_meta, "outer_iter": outer_iter, "epoch": epoch,
+                             "total_optimizer_steps": int(total_opt_steps)}
+                print(f"\n[early-stop] PINN stopped at outer={outer_iter}, epoch={epoch}, PDE={current_pde:.4e}, reason={stop_meta.get('reason', '')}")
+                return loss_history, optimizer, stop_info
+
+    if recorder is not None and pending_train_rows:
+        append_csv_rows(recorder.train_csv, pending_train_rows, train_fields)
+
+    if best_dirty and best_state_cpu is not None:
+        torch.save(best_state_cpu, best_path)
+        torch.save(best_state_cpu, legacy_best_path)
+
+    # FINAL-ITERATE POLICY: the reported model is the final training state.
+    # best is saved during training but kept as a diagnostic artifact only
+    # (no best-restore here).
+    torch.save(model.state_dict(), last_path)
+    torch.save(model.state_dict(), final_path)
+    print(f"\nPINN finished. Reported model = FINAL state -> {final_path}")
+    print(f"  [diagnostic] best checkpoint (loss={best_loss:.3e}) -> {best_path}")
+
+    stop_info["total_optimizer_steps"] = int(total_opt_steps)
+    return loss_history, optimizer, stop_info
 
 
 # =============================================================================
@@ -788,35 +1327,43 @@ def eval_closed_form_on_grid_2d_slice(tau_fixed, w_fixed, dim1, dim2, x_fixed,
 def compute_metrics(V_pinn, V_cf, theta_pinn, theta_cf,
                     myopic_pinn, myopic_cf, hedging_pinn, hedging_cf):
     """
-    Compute MSE and RelRMSE for V, θ, myopic, hedging.
+    Compute MSE, RelL2 (headline) and StdNRMSE for V, θ, myopic, hedging.
     
     Returns dict with metrics for total and per-asset.
     """
     metrics = {}
     
-    # Value function
+    # Relative L2 error: ||f_hat - f*||_2 / ||f*||_2  (standard PINN convention)
+    EPS = 1e-8
+    
     mse_V = np.mean((V_pinn - V_cf) ** 2)
-    rel_V = np.sqrt(mse_V) / (np.std(V_cf) + 1e-8)
+    rel_V = np.sqrt(mse_V) / (np.std(V_cf) + EPS)
+    rel_V_l2 = np.sqrt(np.sum((V_pinn - V_cf) ** 2)) / (np.sqrt(np.sum(V_cf ** 2)) + EPS)
     metrics['MSE_V'] = mse_V
-    metrics['RelRMSE_V'] = rel_V
+    metrics['StdNRMSE_V'] = rel_V
+    metrics['RelL2_V'] = rel_V_l2
     
-    # Total portfolio (all assets combined)
+    # Total portfolio
     mse_theta = np.mean((theta_pinn - theta_cf) ** 2)
-    rel_theta = np.sqrt(mse_theta) / (np.std(theta_cf) + 1e-8)
+    rel_theta = np.sqrt(mse_theta) / (np.std(theta_cf) + EPS)
+    rel_theta_l2 = np.sqrt(np.sum((theta_pinn - theta_cf) ** 2)) / (np.sqrt(np.sum(theta_cf ** 2)) + EPS)
     metrics['MSE_theta'] = mse_theta
-    metrics['RelRMSE_theta'] = rel_theta
+    metrics['StdNRMSE_theta'] = rel_theta
+    metrics['RelL2_theta'] = rel_theta_l2
     
-    # Myopic (all assets combined)
     mse_myopic = np.mean((myopic_pinn - myopic_cf) ** 2)
-    rel_myopic = np.sqrt(mse_myopic) / (np.std(myopic_cf) + 1e-8)
+    rel_myopic = np.sqrt(mse_myopic) / (np.std(myopic_cf) + EPS)
+    rel_myopic_l2 = np.sqrt(np.sum((myopic_pinn - myopic_cf) ** 2)) / (np.sqrt(np.sum(myopic_cf ** 2)) + EPS)
     metrics['MSE_myopic'] = mse_myopic
-    metrics['RelRMSE_myopic'] = rel_myopic
+    metrics['StdNRMSE_myopic'] = rel_myopic
+    metrics['RelL2_myopic'] = rel_myopic_l2
     
-    # Hedging (all assets combined)
     mse_hedging = np.mean((hedging_pinn - hedging_cf) ** 2)
-    rel_hedging = np.sqrt(mse_hedging) / (np.std(hedging_cf) + 1e-8)
+    rel_hedging = np.sqrt(mse_hedging) / (np.std(hedging_cf) + EPS)
+    rel_hedging_l2 = np.sqrt(np.sum((hedging_pinn - hedging_cf) ** 2)) / (np.sqrt(np.sum(hedging_cf ** 2)) + EPS)
     metrics['MSE_hedging'] = mse_hedging
-    metrics['RelRMSE_hedging'] = rel_hedging
+    metrics['StdNRMSE_hedging'] = rel_hedging
+    metrics['RelL2_hedging'] = rel_hedging_l2
     
     # Per-asset metrics
     N = theta_pinn.shape[-1]
@@ -828,8 +1375,8 @@ def compute_metrics(V_pinn, V_cf, theta_pinn, theta_cf,
         hedging_p = hedging_pinn[..., asset_idx]
         hedging_c = hedging_cf[..., asset_idx]
         
-        # metrics[f'MSE_theta_{asset_idx}'] = np.mean((theta_p - theta_c) ** 2)
-        # metrics[f'MSE_myopic_{asset_idx}'] = np.mean((myopic_p - myopic_c) ** 2)
+        metrics[f'MSE_theta_{asset_idx}'] = np.mean((theta_p - theta_c) ** 2)
+        metrics[f'MSE_myopic_{asset_idx}'] = np.mean((myopic_p - myopic_c) ** 2)
         metrics[f'MSE_hedging_{asset_idx}'] = np.mean((hedging_p - hedging_c) ** 2)
     
     return metrics
@@ -1275,6 +1822,217 @@ def eval_closed_form_on_tau_X_grid(
 
 
 
+def build_diag_set(n_points, margin, M, N, gamma, r,
+                   X_min, X_max, W_min, W_max, tau_max,
+                   sol, lam0, Lam, Gamma, market_seed):
+    """Fixed Q_ev diagnostic set for per-iteration e_n and stability margins.
+
+    Points are uniform over (0, tau_max] x Omega_ev at the PRIMARY margin,
+    drawn from a MARKET-seed-derived RNG so every training seed and both
+    methods use the SAME set. Closed-form V and the reduced derivative
+    bundle (V_w, V_ww, grad_x V_w) are precomputed here once:
+
+        V    = D * w^{1-g}/(1-g) * phi,  phi = exp(a + b'x + x'Cx/2),
+        V_w  = D * w^{-g} * phi,         D = exp((1-g) r tau),
+        V_ww = -g * D * w^{-g-1} * phi,
+        d_x V_w = D * w^{-g} * phi * (b + C x).
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(market_seed) * 1000003 + 7)
+    U = torch.rand(int(n_points), 2 + M, generator=gen).numpy().astype(np.float64)
+    eps_tau = 1e-3
+    W_lo, W_hi = shrink_bounds(float(W_min), float(W_max), float(margin))
+    X_lo, X_hi = shrink_bounds(np.asarray(X_min, dtype=np.float64),
+                               np.asarray(X_max, dtype=np.float64), float(margin))
+    tau_np = eps_tau + U[:, 0] * (tau_max - eps_tau)
+    w_np = W_lo + U[:, 1] * (W_hi - W_lo)
+    x_np = X_lo[None, :] + U[:, 2:] * (X_hi - X_lo)[None, :]
+
+    P = int(n_points)
+    V_cf = np.zeros(P)
+    Vw_cf = np.zeros(P)
+    Vww_cf = np.zeros(P)
+    Vwx_cf = np.zeros((P, M))
+    for i in range(P):
+        a, b, C = get_closed_form_at_tau(float(tau_np[i]), sol, M)
+        phi = np.exp(a + b @ x_np[i] + 0.5 * x_np[i] @ C @ x_np[i])
+        D = np.exp((1.0 - gamma) * r * tau_np[i])
+        w_i = w_np[i]
+        V_cf[i] = D * np.power(w_i, 1.0 - gamma) / (1.0 - gamma) * phi
+        Vw_cf[i] = D * np.power(w_i, -gamma) * phi
+        Vww_cf[i] = -gamma * D * np.power(w_i, -gamma - 1.0) * phi
+        Vwx_cf[i] = D * np.power(w_i, -gamma) * phi * (b + C @ x_np[i])
+
+    dev = device
+    return {
+        "w": torch.tensor(w_np.reshape(-1, 1), dtype=torch.float32, device=dev),
+        "x": torch.tensor(x_np, dtype=torch.float32, device=dev),
+        "tau": torch.tensor(tau_np.reshape(-1, 1), dtype=torch.float32, device=dev),
+        "w_np": w_np, "x_np": x_np,
+        "V_cf": V_cf, "Vw_cf": Vw_cf, "Vww_cf": Vww_cf, "Vwx_cf": Vwx_cf,
+    }
+
+
+def sigma_eig_extremes_batch(theta_np, Gamma_np, Q_np):
+    """Vectorized extreme eigenvalues of the joint covariance Sigma(theta) =
+    [[theta'theta, theta'Gamma], [Gamma'theta, Q]] for a batch of policies.
+
+    theta_np: (P, N). Returns (lam_min, lam_max), each (P,), via one batched
+    eigvalsh call. Both ends are needed to check the two-sided uniform
+    ellipticity assumption nu*I <= Sigma^alpha <= Lambda*I."""
+    P = theta_np.shape[0]
+    Mq = Q_np.shape[0]
+    Sig = np.zeros((P, 1 + Mq, 1 + Mq))
+    Sig[:, 0, 0] = np.einsum("pn,pn->p", theta_np, theta_np)
+    cross = theta_np @ Gamma_np                     # (P, M)
+    Sig[:, 0, 1:] = cross
+    Sig[:, 1:, 0] = cross
+    Sig[:, 1:, 1:] = Q_np[None, :, :]
+    ev = np.linalg.eigvalsh(Sig)
+    return ev[:, 0], ev[:, -1]
+
+
+def eval_diag_metrics(model, diag, M, N, gamma,
+                      Gamma_t, lam0_t, Lam_t, Gamma_np, lam0_np, Lam_np,
+                      chunk=4096):
+    """One diagnostic pass on the fixed Q_EV set.
+
+    Returns e_n components (sup-norms vs the closed form) plus the margins
+    m_ww = min(-V_ww) and M_num = max||lam(x)V_w + Gamma V_wx|| and the
+    V_ww guard-activation fraction ON OMEGA_EV. Ellipticity of the frozen
+    policy (lambda_min, clip fraction) is measured separately on the
+    Q_col held-out points -- see the caller.
+    """
+    was_training = model.training
+    model.eval()
+    P = diag["w"].shape[0]
+    V_l, Vw_l, Vww_l, Vwx_l = [], [], [], []
+    for i in range(0, P, chunk):
+        w_b = diag["w"][i:i + chunk].detach().clone().requires_grad_(True)
+        x_b = diag["x"][i:i + chunk].detach().clone().requires_grad_(True)
+        tau_b = diag["tau"][i:i + chunk]
+        V_b = model(w_b, x_b, tau_b)
+        V_w = torch.autograd.grad(V_b.sum(), w_b, create_graph=True)[0]
+        V_ww = torch.autograd.grad(V_w.sum(), w_b, create_graph=True)[0]
+        V_wx = torch.autograd.grad(V_w.sum(), x_b, create_graph=True)[0]
+        V_l.append(V_b.detach().cpu()); Vw_l.append(V_w.detach().cpu())
+        Vww_l.append(V_ww.detach().cpu()); Vwx_l.append(V_wx.detach().cpu())
+    V_m = torch.cat(V_l).numpy().reshape(-1)
+    Vw_m = torch.cat(Vw_l).numpy().reshape(-1)
+    Vww_m = torch.cat(Vww_l).numpy().reshape(-1)
+    Vwx_m = torch.cat(Vwx_l).numpy()
+    if was_training:
+        model.train()
+
+    # e_n on the fixed set: sup |V - V*| + sup ||bundle - bundle*||_2
+    e_V = float(np.max(np.abs(V_m - diag["V_cf"])))
+    bundle_err = np.concatenate([
+        (Vw_m - diag["Vw_cf"]).reshape(-1, 1),
+        (Vww_m - diag["Vww_cf"]).reshape(-1, 1),
+        (Vwx_m - diag["Vwx_cf"]),
+    ], axis=1)
+    e_D = float(np.max(np.linalg.norm(bundle_err, axis=1)))
+
+    # Stability margins (model side)
+    m_ww = float(np.min(-Vww_m))
+    guard_frac = float(np.mean(Vww_m > -1e-8))
+    lam_x = lam0_np[None, :] + diag["x_np"] @ Lam_np.T            # (P, N)
+    numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
+    M_num = float(np.max(np.linalg.norm(numer, axis=1)))
+
+    # Table-grade norms on the SAME diagnostic set (same RelL2 norm as the
+    # full-dim Table metric, primary margin only): per-outer convergence
+    # trajectory without saving per-iteration weights. theta is derived from
+    # the ALREADY computed bundle (no extra autograd): the model side reuses
+    # the FOC numerator with the training-side V_ww guard; the closed-form
+    # side uses the exact (negative) V_ww*.
+    rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
+                     / max(np.linalg.norm(diag["V_cf"]), 1e-300))
+    theta_hat = -numer / np.minimum(Vww_m, -1e-8)[:, None]
+    numer_cf = lam_x * diag["Vw_cf"][:, None] + diag["Vwx_cf"] @ Gamma_np.T
+    theta_cf = -numer_cf / diag["Vww_cf"][:, None]
+    rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
+                         / max(np.linalg.norm(theta_cf), 1e-300))
+
+    return {
+        "e_V_sup": e_V, "e_bundle_sup": e_D, "e_Xev": e_V + e_D,
+        "diag_RelL2_V": rel_l2_V, "diag_RelL2_theta": rel_l2_theta,
+        "m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac,
+    }
+
+
+
+def eval_fulldim_test_metrics(model, n_points, margins,
+                              M, N, gamma, r,
+                              Gamma_t, lam0_t, Lam_t,
+                              lam0, Lam, Gamma, sol,
+                              X_min, X_max, W_min, W_max, tau_max,
+                              chunk=4096, base_seed=727):
+    """Independent FULL-DIMENSIONAL test evaluation on Omega_ev.
+
+    Unlike the (tau, x_0) visualization slice (fixed w, other factors at
+    xbar), this varies ALL coordinates: uniform points over
+    (0, tau_max] x [W_ev] x prod_i [X_ev,i]. One base sample in the unit
+    cube -- drawn from a FIXED dedicated RNG, identical across runs and
+    seeds -- is affinely mapped into every requested evaluation window, so
+    nested-window (E9) evaluations use corresponding points.
+
+    Returns {margin: metrics_dict} via compute_metrics against the
+    closed-form solution.
+    """
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(base_seed))
+    U = torch.rand(int(n_points), 2 + M, generator=gen).numpy().astype(np.float64)
+    eps_tau = 1e-3
+
+    out = {}
+    was_training = model.training
+    model.eval()
+    for m in margins:
+        W_lo, W_hi = shrink_bounds(float(W_min), float(W_max), float(m))
+        X_lo, X_hi = shrink_bounds(np.asarray(X_min, dtype=np.float64),
+                                   np.asarray(X_max, dtype=np.float64), float(m))
+        tau_np = eps_tau + U[:, 0] * (tau_max - eps_tau)
+        w_np = W_lo + U[:, 1] * (W_hi - W_lo)
+        x_np = X_lo[None, :] + U[:, 2:] * (X_hi - X_lo)[None, :]
+
+        P = int(n_points)
+        w_t = torch.tensor(w_np.reshape(-1, 1), device=device, dtype=torch.float32, requires_grad=True)
+        x_t = torch.tensor(x_np, device=device, dtype=torch.float32, requires_grad=True)
+        tau_t = torch.tensor(tau_np.reshape(-1, 1), device=device, dtype=torch.float32)
+
+        V_l, tn_l, my_l, he_l = [], [], [], []
+        for i in range(0, P, chunk):
+            V_b, _, tn_b, my_b, he_b = compute_optimal_theta_nd(
+                model, w_t[i:i + chunk], x_t[i:i + chunk], tau_t[i:i + chunk],
+                M, N, gamma, Gamma_t, lam0_t, Lam_t, create_graph=True
+            )
+            V_l.append(V_b.detach().cpu())
+            tn_l.append(tn_b.detach().cpu())
+            my_l.append(my_b.detach().cpu())
+            he_l.append(he_b.detach().cpu())
+        V_pinn = torch.cat(V_l, dim=0).numpy().reshape(-1)
+        theta_pinn = torch.cat(tn_l, dim=0).numpy()
+        myopic_pinn = torch.cat(my_l, dim=0).numpy()
+        hedging_pinn = torch.cat(he_l, dim=0).numpy()
+
+        V_cf = np.zeros(P)
+        theta_cf = np.zeros((P, N))
+        myopic_cf = np.zeros((P, N))
+        hedging_cf = np.zeros((P, N))
+        for i in range(P):
+            V_cf[i] = closed_form_V(float(tau_np[i]), float(w_np[i]), x_np[i], sol, M, gamma, r)
+            _, theta_cf[i], myopic_cf[i], hedging_cf[i] = closed_form_decomposition(
+                float(tau_np[i]), float(w_np[i]), x_np[i], sol, M, N, gamma, lam0, Lam, Gamma
+            )
+
+        out[m] = compute_metrics(V_pinn, V_cf, theta_pinn, theta_cf,
+                                 myopic_pinn, myopic_cf, hedging_pinn, hedging_cf)
+    if was_training:
+        model.train()
+    return out
+
+
 def plot_loss_history(loss_history, save_path=None, show=True):
     """Plot training loss history."""
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -1301,86 +2059,50 @@ def plot_loss_history(loss_history, save_path=None, show=True):
     else:
         plt.close()
 
-def plot_slices(model, tau_fixed, save_path=None, show=True):
-    """
-    Plot V and θ* as functions of W for different X values.
-    """
-    fig, axs = plt.subplots(2, 3, figsize=(15, 10))
-    
-    W_vals = np.linspace(W_min, W_max, 100)
-    X_test_vals = [0.1, 0.3, 0.5]
-    
-    model.eval()
-    
-    for idx, X_fixed in enumerate(X_test_vals):
-        V_pinn_list = []
-        V_cf_list = []
-        theta_pinn_list = []
-        theta_cf_list = []
-        
-        for W_val in W_vals:
-            # PINN
-            W_t = torch.tensor([[W_val]], device=device, dtype=torch.float32, requires_grad=True)
-            X_t = torch.tensor([[X_fixed]], device=device, dtype=torch.float32, requires_grad=True)
-            tau_t = torch.tensor([[tau_fixed]], device=device, dtype=torch.float32)
-            
-            V_p, theta_p, _,_,_ = compute_optimal_theta(model, W_t, X_t, tau_t, create_graph=True)
-            V_pinn_list.append(V_p.item())
-            theta_pinn_list.append(theta_p.item())
-            
-            # Closed-form
-            V_cf_list.append(closed_form_V(tau_fixed, W_val, X_fixed))
-            theta_cf_list.append(closed_form_theta(tau_fixed, W_val, X_fixed))
-        
-        # Plot V
-        axs[0, idx].plot(W_vals, V_pinn_list, 'b-', label='PINN', linewidth=2)
-        axs[0, idx].plot(W_vals, V_cf_list, 'r--', label='Closed-form', linewidth=2)
-        axs[0, idx].set_xlabel('Wealth W')
-        axs[0, idx].set_ylabel('V')
-        axs[0, idx].set_title(f'X = {X_fixed}')
-        axs[0, idx].legend()
-        axs[0, idx].grid(True, alpha=0.3)
-        
-        # Plot θ
-        axs[1, idx].plot(W_vals, theta_pinn_list, 'b-', label='PINN', linewidth=2)
-        axs[1, idx].plot(W_vals, theta_cf_list, 'r--', label='Closed-form', linewidth=2)
-        axs[1, idx].set_xlabel('Wealth W')
-        axs[1, idx].set_ylabel('θ*')
-        axs[1, idx].set_title(f'X = {X_fixed}')
-        axs[1, idx].legend()
-        axs[1, idx].grid(True, alpha=0.3)
-    
-    model.train()
-    
-    plt.suptitle(f'Kim-Omberg ND: V and θ* vs W at τ={tau_fixed} [γ={gamma}, ρ={rho}]', fontsize=14)
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {save_path}")
-    
-    if show:
-        plt.show()
-    else:
-        plt.close()
+# (legacy plot_slices removed: unused; referenced undefined helper functions)
 
-value_hidden=ARGS.value_hidden
-value_depth=ARGS.value_depth
 
-batch_size=ARGS.batch_size
-lr=ARGS.lr
-w_terminal=ARGS.w_terminal
-resample_every=ARGS.eval_epochs
-epochs = resample_every * ARGS.outer_iters
-w_shape=ARGS.w_shape
+value_hidden = ARGS.value_hidden
+value_depth = ARGS.value_depth
 
+batch_size = ARGS.batch_size
+terminal_frac = ARGS.terminal_frac
+
+lr = ARGS.lr
+w_terminal = ARGS.w_terminal
+eval_epochs = ARGS.eval_epochs  # old resample_every
+outer_iters = ARGS.outer_iters
+epochs = eval_epochs * outer_iters
+w_shape = ARGS.w_shape
+w_rra = ARGS.w_rra
 
 # =============================================================================
 # 9) Main Execution
 # =============================================================================
 start = time.time()
 if __name__ == "__main__":
-   
+    if ARGS.eval_only:
+        # Evaluation is unrelated to training-divergence monitoring: no
+        # "running" status on the TRAINING status file, no stopper, and the
+        # shared stop flag is ignored entirely.
+        recorder.write_status_eval("running")
+        stopper = None
+    else:
+        recorder.write_status("running")
+        stopper = PDEEarlyStopper(
+            threshold=ARGS.pde_stop_threshold,
+            start_outer=ARGS.pde_stop_start_outer,
+            patience=ARGS.pde_stop_patience,
+            stop_flag_path=ARGS.stop_flag_path,
+            recorder=recorder,
+            run_tag=ARGS.run_tag,
+            model_type=ARGS.model_type,
+        )
+        if stopper.shared_stop_exists():
+            info = stopper.mark_from_existing_flag(outer_iter=0, pde_loss=None)
+            print(f"[early-stop] shared stop flag already exists. Skipping run. {info}")
+            sys.exit(0)
+
     # Convert parameters to torch
     K_t = torch.tensor(K, device=device, dtype=torch.float32)
     k0_t = torch.tensor(k0, device=device, dtype=torch.float32)
@@ -1388,139 +2110,281 @@ if __name__ == "__main__":
     Gamma_t = torch.tensor(Gamma, device=device, dtype=torch.float32)
     lam0_t = torch.tensor(lam0, device=device, dtype=torch.float32)
     Lam_t = torch.tensor(Lam, device=device, dtype=torch.float32)
-    
+
     # Initialize model
     model = ValueNetND(M=M_STATES, hidden=value_hidden, depth=value_depth).to(device)
-    
-    # Training
-    loss_history, optimizer, stopped_early = train_pinn_nd(
-        model, M_STATES, N_ASSETS, gamma, r,
-        K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t,
-        X_min, X_max, W_min, W_max, tau_max,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr=lr,
-        resample_every=resample_every,
-        w_terminal=w_terminal,
-        w_concavity=w_shape,
-        print_every=5000
-    )
+
+    if ARGS.eval_only:
+        print("\n[eval-only] Skipping training. Loading saved weights for evaluation.")
+        loss_history, optimizer, stop_info = [], None, {"stopped_early": False}
+        elapsed = 0.0
+    else:
+        # Training
+        loss_history, optimizer, stop_info = train_pinn_nd(
+            model, M_STATES, N_ASSETS, gamma, r,
+            K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t,
+            X_min, X_max, W_min, W_max, tau_max,
+            epochs=epochs,
+            batch_size=batch_size,
+            terminal_frac=terminal_frac,
+            lr=lr,
+            eval_epochs=eval_epochs,
+            outer_iters=outer_iters,
+            w_terminal=w_terminal,
+            w_concavity=w_shape,
+            w_rra=w_rra,
+            scheduler_patience=ARGS.scheduler_patience,
+            scheduler_factor=ARGS.scheduler_factor,
+            scheduler_min_lr=ARGS.scheduler_min_lr,
+            save_iterate_every=ARGS.save_iterate_every,
+            pres_target=ARGS.pres_target,
+            val_points=ARGS.val_points,
+            val_terminal_points=ARGS.val_terminal_points,
+            val_every=ARGS.val_every,
+            # MARKET-seed-derived held-out set: identical across training
+            # seeds and both methods.
+            val_seed=MARKET_SEED,
+            diag_points=ARGS.diag_points,
+            diag_margin=parse_eval_margins(ARGS.eval_margin)[0],
+            diag_every=ARGS.diag_every,
+            timing_mode=ARGS.timing_mode,
+            print_every=ARGS.print_every,
+            recorder=recorder,
+            stopper=stopper,
+        )
 
     end = time.time()
     elapsed = end - start
-    
+
+    # E8: capture the TRAINING GPU peak before evaluation allocates memory.
+    _train_gpu_peak = None
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        _train_gpu_peak = int(torch.cuda.max_memory_allocated(device))
+        torch.cuda.reset_peak_memory_stats(device)
+
     h = int(elapsed // 3600)
     m = int((elapsed % 3600) // 60)
     s = elapsed % 60
-    
+
+    if stop_info.get("stopped_early", False):
+        recorder.write_status("stopped_early", elapsed_sec=elapsed, **stop_info)
+        print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
+        sys.exit(0)
+    if stop_info.get("target_reached", False):
+        print(f"[target-stop] pres target reached at epoch {stop_info.get('epoch_at_stop')} "
+              f"(block {stop_info.get('block_at_stop')}); proceeding to evaluation.")
+
     print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
-
-    # Plot loss history / csv are useful even for early-stopped runs.
-    plot_loss_history(
-        loss_history,
-        save_path=os.path.join(output_dir, f"loss_history_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).png"),
-        show=True
-    )
-    save_loss_history_csv(
-        loss_history,
-        save_path=os.path.join(output_dir, "training_metrics.csv")
-    )
-
-    if stopped_early:
-        print("[early-stop] Skip evaluation and proceed to next experiment.")
-        raise SystemExit(0)
 
     print(f"\n{'='*60}")
     print("Evaluating PINN vs Closed-form...")
     print(f"{'='*60}")
     print(f"  hidden node : {value_hidden}")
     print(f"  num of hidden layers : {value_depth}")
+    print(f"  outer_iters  : {outer_iters}")
+    print(f"  eval_epochs  : {eval_epochs}")
     print(f"  epochs       : {epochs}")
     print(f"  batch size   : {batch_size}")
-    print(f"  resample every    : {resample_every}")
     print(f"  initial lr   : {lr}")
     print(f"  T.C weight   : {w_terminal}")
     print(f"  Seed         : {SEED}")
     print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
     print(f"{'='*70}")
-    
-    model = ValueNetND(M=M_STATES, hidden=value_hidden, depth=value_depth).to(device)
-    model.load_state_dict(torch.load(os.path.join(weight_dir, f"value_net_best_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).pt"), map_location=device))
-    
-   
+
+    # FINAL-ITERATE POLICY: evaluation always uses the final training state.
+    # best is loaded only as a legacy fallback (older runs without final).
+    final_weight_path = os.path.join(weight_dir, "value_net_final.pt")
+    best_weight_path = os.path.join(weight_dir, "value_net_best.pt")
+    last_weight_path = os.path.join(weight_dir, "value_net_last.pt")
+    if ARGS.eval_only:
+        if os.path.exists(final_weight_path):
+            model.load_state_dict(torch.load(final_weight_path, map_location=device))
+            print(f"[eval-only] Loaded FINAL state: {final_weight_path}")
+        elif os.path.exists(last_weight_path):
+            model.load_state_dict(torch.load(last_weight_path, map_location=device))
+            print(f"[eval-only][warn] final weight not found; loaded last: {last_weight_path}")
+        elif os.path.exists(best_weight_path):
+            model.load_state_dict(torch.load(best_weight_path, map_location=device))
+            print(f"[eval-only][warn] final/last not found; loaded BEST (legacy run): {best_weight_path}")
+        else:
+            msg = f"no saved weights (final/last/best) under {weight_dir}"
+            print(f"[eval-only][FATAL] {msg}")
+            recorder.mark_failed_eval(reason=msg)
+            sys.exit(1)
+    # (Normal runs: the in-memory model already IS the final state.)
+
+    if SKIP_EVAL:
+        # Evaluation fully skipped (opt-in). No metrics.csv is produced.
+        if ARGS.eval_only:
+            recorder.mark_success_eval(elapsed_sec=elapsed, final_weight_path=final_weight_path,
+                                       skipped_eval=True)
+        else:
+            recorder.mark_success(elapsed_sec=elapsed, final_weight_path=final_weight_path,
+                                  best_weight_path=best_weight_path, skipped_eval=True,
+                                  train_gpu_peak_mem_bytes=_train_gpu_peak,
+                                  timing_mode=bool(ARGS.timing_mode))
+        sys.exit(0)
+
+    # Plot loss history (figure only; suppressed under --skip-figures/--skip-plots).
+    if not SKIP_FIGURES:
+        plot_loss_history(
+            loss_history,
+            save_path=os.path.join(output_dir, f"loss_history_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).png"),
+            show=True
+        )
+
     # Evaluation
     print(f"\n{'='*60}")
     print("Evaluating PINN vs Closed-form...")
     print(f"{'='*60}")
-    
-    
+
     # (x-axis = state X, y-axis = time-to-maturity tau), holding other states fixed
     dimX = 0
     x_fixed = xbar.copy()  # Fix other state dimensions at long-run mean
-    
-    W_levels = [0.5]
-    N_tau, N_X = 100, 100
-    # X_min_test = X_min.max().item()
-    # X_max_test = X_max.min().item()
-    
-    X_min_test = X_min
-    X_max_test = X_max
-    
-    for w_test in W_levels:
-        print(f"\n--- Grid evaluation: w={w_test:.2f} ---")
-    
-        # PINN evaluation on (tau, X) grid
+
+    W_levels = parse_w_levels(ARGS.w_levels)
+    N_tau, N_X = ARGS.n_tau, ARGS.n_x
+
+    metric_fields = ["timestamp", "model_type", "run_tag", "scope", "eval_margin", "metric", "value"]
+
+    # Evaluation windows Omega_ev (per-side shrink of each SPATIAL axis; tau
+    # keeps its full range). First margin = primary (headline metrics, plots);
+    # every listed margin is re-evaluated with the SAME trained network and
+    # recorded to metrics.csv -- the E9 window-sensitivity study for free.
+    EVAL_MARGINS = parse_eval_margins(ARGS.eval_margin)
+    primary_margin = EVAL_MARGINS[0]
+    print(f"\nEvaluation windows (per-side margins): {EVAL_MARGINS} (primary={primary_margin})")
+    for _m in EVAL_MARGINS:
+        _w_lo, _w_hi = shrink_bounds(W_min, W_max, _m)
+        for _w_test in W_levels:
+            if not (_w_lo <= _w_test <= _w_hi):
+                print(f"[warn] w_level {_w_test} lies OUTSIDE W_ev=[{_w_lo:.4f}, {_w_hi:.4f}] "
+                      f"for eval_margin={_m}; that slice is not inside the evaluation window.")
+
+    # Eval-only metrics are written ATOMICALLY: everything goes to a tmp
+    # file and only replaces metrics.csv after the evaluation SUCCEEDS. A
+    # mid-evaluation crash therefore leaves the existing (training) metrics
+    # untouched instead of a deleted/partial file next to a training
+    # _SUCCESS marker.
+    _metrics_final_path = recorder.metrics_csv
+    if ARGS.eval_only:
+        recorder.metrics_csv = _metrics_final_path + ".eval_tmp"
+        if os.path.exists(recorder.metrics_csv):
+            os.remove(recorder.metrics_csv)  # stale tmp from an older failed eval
+        print(f"[eval-only] Recording metrics to {recorder.metrics_csv} (atomic swap on success).")
+
+    # Independent FULL-DIMENSIONAL test evaluation on Omega_ev (Table / E9).
+    # All coordinates vary; the same base points are mapped into every margin
+    # window so nested-window results are directly comparable. Printed BEFORE
+    # the (tau, x_0) grid slices; per-asset metrics go to metrics.csv only.
+    if ARGS.test_points and ARGS.test_points > 0:
+        fulldim_metrics = eval_fulldim_test_metrics(
+            model, ARGS.test_points, EVAL_MARGINS,
+            M_STATES, N_ASSETS, gamma, r,
+            Gamma_t, lam0_t, Lam_t,
+            lam0, Lam, Gamma, cf_sol,
+            X_min, X_max, W_min, W_max, tau_max,
+        )
+        for _m, mets in sorted(fulldim_metrics.items()):
+            _is_primary = (_m == primary_margin)
+            print(f"\n--- Full-dimensional Omega_ev test: {ARGS.test_points} points, "
+                  f"eval_margin={_m:.2f}{' (primary)' if _is_primary else ''} ---")
+            print("Metrics:")
+            print("-" * 40)
+            rows = []
+            for k, v in mets.items():
+                if not k.rsplit("_", 1)[-1].isdigit():
+                    print(f"  {k}: {v:.6e}")
+                rows.append({
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "model_type": ARGS.model_type,
+                    "run_tag": ARGS.run_tag,
+                    "scope": "fulldim",
+                    "eval_margin": _m,
+                    "metric": k,
+                    "value": float(v),
+                })
+            append_csv_rows(recorder.metrics_csv, rows, metric_fields)
+
+    # The (tau, x_0) grid slice is retained for PLOTS ONLY, on the primary
+    # evaluation window. Slice metrics were removed: all reported numbers come
+    # from the full-dimensional Omega_ev test above. Under --skip-figures the
+    # slice loop is skipped entirely (figures only; metrics already written).
+    for w_test in ([] if SKIP_FIGURES else W_levels):
+        X_ev_min, X_ev_max = shrink_bounds(X_min, X_max, primary_margin)
+        print(f"\n--- Grid slice for plots: w={w_test:.2f}, eval_margin={primary_margin:.2f} ---")
+
+        # PINN evaluation on (tau, X) grid restricted to Omega_ev
         tau_grid, X_grid, V_pinn, theta_norm_pinn, myopic_pinn, hedging_pinn = \
             eval_pinn_on_tau_X_grid(
                 model, w_test, dimX=dimX, x_fixed=x_fixed,
                 M=M_STATES, N=N_ASSETS, gamma=gamma,
                 Gamma_t=Gamma_t, lam0_t=lam0_t, Lam_t=Lam_t,
-                X_min=X_min_test, X_max=X_max_test, tau_min=tau_min, tau_max=tau_max,
+                X_min=X_ev_min, X_max=X_ev_max, tau_min=tau_min, tau_max=tau_max,
                 N_tau=N_tau, N_X=N_X
             )
-    
-        # Closed-form evaluation on (tau, X) grid
+
+        # Closed-form evaluation on the same Omega_ev grid
         _, _, V_cf, theta_norm_cf, myopic_cf, hedging_cf = \
             eval_closed_form_on_tau_X_grid(
                 w_test, dimX=dimX, x_fixed=x_fixed,
                 M=M_STATES, N=N_ASSETS, gamma=gamma, r=r,
                 lam0=lam0, Lam=Lam, Gamma=Gamma, sol=cf_sol,
-                X_min=X_min_test, X_max=X_max_test, tau_min=tau_min, tau_max=tau_max,
+                X_min=X_ev_min, X_max=X_ev_max, tau_min=tau_min, tau_max=tau_max,
                 N_tau=N_tau, N_X=N_X
             )
-    
-        # Metrics
-        metrics = compute_metrics(
-            V_pinn, V_cf,
-            theta_norm_pinn, theta_norm_cf,
-            myopic_pinn, myopic_cf,
-            hedging_pinn, hedging_cf
-        )
-    
-        print("Metrics:")
-        print("-" * 40)
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.6e}")
-    
+
         # Plots
         plot_value_comparison_tauX(
             tau_grid, X_grid, V_pinn, V_cf,
             dimX=dimX, w_fixed=w_test,
-            save_path=os.path.join(output_dir, f"value_{w_test:.2f}_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).png"),
+            save_path=os.path.join(output_dir, f"value_{w_test:.2f}_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).png"),
             show=True,
             xlabel=f"risk premium X",
-            ylabel=r"$\tau$"
+            ylabel=r"$	au$"
         )
-    
+
         plot_portfolio_comparison_tauX(
             tau_grid, X_grid,
             theta_norm_pinn, theta_norm_cf,
             myopic_pinn, myopic_cf,
             hedging_pinn, hedging_cf,
             dimX=dimX, w_fixed=w_test, N_ASSETS=N_ASSETS,
-            save_path=os.path.join(output_dir, f"portfolio_w{w_test:.2f}_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {resample_every}-eval epoch).png"),
-            show=True,only_hedge=False,
+            save_path=os.path.join(output_dir, f"portfolio_w{w_test:.2f}_{N_ASSETS}-asset_{M_STATES}-state({batch_size}-batch, {eval_epochs}-eval epoch).png"),
+            show=True, only_hedge=False,
             xlabel=f"risk premium X",
-            ylabel=r"$\tau$",
+            ylabel=r"$	au$",
             max_assets=10, sort_by_range=True
         )
+
+
+    _eval_gpu_peak = None
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        _eval_gpu_peak = int(torch.cuda.max_memory_allocated(device))
+    if ARGS.eval_only:
+        # Atomic commit: back up the training metrics once, then replace.
+        if os.path.exists(recorder.metrics_csv):
+            _bak = _metrics_final_path + ".bak_train"
+            if os.path.exists(_metrics_final_path) and not os.path.exists(_bak):
+                import shutil as _sh
+                _sh.copyfile(_metrics_final_path, _bak)
+                print(f"[eval-only] Backed up training metrics to {_bak}")
+            os.replace(recorder.metrics_csv, _metrics_final_path)
+            recorder.metrics_csv = _metrics_final_path
+            print(f"[eval-only] Committed metrics -> {_metrics_final_path}")
+        recorder.mark_success_eval(elapsed_sec=elapsed, final_weight_path=final_weight_path,
+                                   eval_margins=EVAL_MARGINS,
+                                   eval_gpu_peak_mem_bytes=_eval_gpu_peak)
+    else:
+        recorder.mark_success(elapsed_sec=elapsed, final_weight_path=final_weight_path,
+                              best_weight_path=best_weight_path, skipped_figures=bool(SKIP_FIGURES),
+                              pres_target=ARGS.pres_target,
+                              target_reached=bool(stop_info.get("target_reached", False)),
+                              epoch_at_stop=stop_info.get("epoch_at_stop"),
+                              achieved_pres=stop_info.get("achieved_pres"),
+                              total_optimizer_steps=stop_info.get("total_optimizer_steps"),
+                              train_wall_sec=elapsed,
+                              timing_mode=bool(ARGS.timing_mode),
+                              train_gpu_peak_mem_bytes=_train_gpu_peak,
+                              eval_gpu_peak_mem_bytes=_eval_gpu_peak,
+                              eval_margins=EVAL_MARGINS)
