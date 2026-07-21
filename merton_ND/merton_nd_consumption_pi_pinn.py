@@ -54,6 +54,7 @@ Notes
 
 import os
 import time
+import argparse
 import numpy as np
 from typing import Optional, Tuple, Dict, List
 
@@ -64,17 +65,122 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 import market_setup  # <-- keep as requested
+import merton_experiment_utils as mxu
+
+
+# =============================================================================
+# Command-line configuration (Merton PI-PINN). --seed drives network/
+# collocation/optimizer; --market-seed drives ONLY the market draw so a
+# training-seed sweep reuses the same market. Module-level constants below are
+# populated from ARGS (minimal-diff refactor; the global-reference structure
+# of the original script is preserved).
+# =============================================================================
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Multi-asset Merton (with consumption) PI-PINN [log-wealth].")
+    # Reproducibility / device
+    p.add_argument("--seed", type=int, default=12)
+    p.add_argument("--market-seed", type=int, default=12)
+    p.add_argument("--device", type=str, default=None)
+    # Market generation
+    p.add_argument("--n-assets", type=int, default=50)
+    p.add_argument("--sigma-lo", type=float, default=0.10)
+    p.add_argument("--sigma-hi", type=float, default=0.25)
+    p.add_argument("--rho-max", type=float, default=1.0)
+    p.add_argument("--kappa-max", type=float, default=30.0)
+    p.add_argument("--delta-rel", type=float, default=1e-4)
+    p.add_argument("--pi-scale", type=float, default=0.6)
+    p.add_argument("--mu-noise-rel", type=float, default=0.02)
+    p.add_argument("--mu-mode", type=str, default="pi_target", choices=["pi_target", "sharpe"])
+    # Preferences / market scalars
+    p.add_argument("--gamma", type=float, default=2.0)
+    p.add_argument("--rho-discount", type=float, default=0.04)
+    p.add_argument("--r", type=float, default=0.03)
+    p.add_argument("--epsilon-bequest", type=float, default=1.0)
+    p.add_argument("--tau-max", type=float, default=1.0, help="Horizon T.")
+    # Domain
+    p.add_argument("--w-min", type=float, default=0.1)
+    p.add_argument("--w-max", type=float, default=2.0)
+    # Control bounds (PI-PINN-specific)
+    p.add_argument("--pi-min", type=float, default=-2.0)
+    p.add_argument("--pi-max", type=float, default=2.0)
+    p.add_argument("--kappa-max-bound", type=float, default=3.0,
+                   help="Upper bound on kappa = c/W.")
+    p.add_argument("--utility-cap", type=float, default=1e3,
+                   help="M in the CRRA floor c_floor = ((gamma-1) M)^(-1/(gamma-1)).")
+    # Network / optimization
+    p.add_argument("--value-hidden", type=int, default=256)
+    p.add_argument("--value-depth", type=int, default=3)
+    p.add_argument("--batch-size", type=int, default=3000)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--outer-iters", type=int, default=500)
+    p.add_argument("--eval-epochs", type=int, default=200)
+    p.add_argument("--scheduler-patience", type=int, default=10)
+    p.add_argument("--scheduler-factor", type=float, default=0.5)
+    p.add_argument("--scheduler-min-lr", type=float, default=1e-8)
+    # Policy init
+    p.add_argument("--pi-init-method", type=str, default="myopic")
+    p.add_argument("--c-init-method", type=str, default="proportional")
+    # Loss weights
+    p.add_argument("--w-terminal", type=float, default=10.0)
+    p.add_argument("--w-eta", type=float, default=3.0)
+    p.add_argument("--eta-clip", type=str, default="10.0",
+                   help="Optional |.|-clip for the eta penalty (none = off).")
+    p.add_argument("--eta-focus-w", type=str, default="none",
+                   help="Optional wealth focus for the eta penalty (none = off).")
+    # Evaluation window(s): first = PRIMARY; half-width margin shrinks the
+    # t-axis and y=log W axis inward. 0.0 = full window.
+    p.add_argument("--eval-margin", type=str, default="0.10,0.0,0.05,0.15,0.20")
+    p.add_argument("--test-points", type=int, default=100000)
+    p.add_argument("--n-tau", type=int, default=100)
+    p.add_argument("--n-x", type=int, default=100)
+    # Logging / output
+    p.add_argument("--print-every-outer", type=int, default=10)
+    p.add_argument("--print-every-eval", type=int, default=0)
+    p.add_argument("--output-root", type=str, default="outputs_merton")
+    p.add_argument("--weight-root", type=str, default=None)
+    p.add_argument("--run-tag", type=str, default="merton_pipinn")
+    p.add_argument("--model-type", type=str, default="pipinn", choices=["pinn", "pipinn"])
+    # Merton state dimension is 1 (wealth only). Recorded as m_states so the
+    # shared make_figure2_contraction reader (which filters on m_states) selects
+    # Merton runs with --merton-m-states 1. Not a tunable; fixed by the problem.
+    p.add_argument("--m-states", type=int, default=1,
+                   help="Fixed = 1 for Merton (wealth-only state); used for Figure-2 selection.")
+    p.add_argument("--skip-plots", action="store_true")
+    # Infrastructure (wired with the recorder)
+    p.add_argument("--eval-only", action="store_true")
+    p.add_argument("--timing-mode", type=int, default=0)
+    p.add_argument("--stop-flag-path", type=str, default=None)
+    p.add_argument("--pde-stop-threshold", type=float, default=None)
+    p.add_argument("--pde-stop-start-outer", type=int, default=0)
+    p.add_argument("--pde-stop-patience", type=int, default=1)
+    return p
+
+
+ARGS = build_arg_parser().parse_args()
 
 # =============================================================================
 # 0) Reproducibility + Device
 # =============================================================================
-SEED = 12
+SEED = int(ARGS.seed)
+MARKET_SEED = int(ARGS.market_seed)
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-GPU_ID = 0
-device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+# Cap intra/inter-op CPU threads (parallel sweep workers otherwise
+# oversubscribe cores); TORCH_NUM_THREADS is exported by the tune script.
+torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "2")))
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
+
+if ARGS.device is not None:
+    device = torch.device(ARGS.device)
+else:
+    GPU_ID = int(os.environ.get("GPU_ID", "0"))
+    device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 
 if torch.cuda.is_available():
@@ -84,38 +190,41 @@ if torch.cuda.is_available():
 # =============================================================================
 # 1) Problem Parameters
 # =============================================================================
-T_FINAL = 1.0
+T_FINAL = float(ARGS.tau_max)
 t_min, t_max = 0.0, T_FINAL
 
 # Wealth domain (W)
-x_min, x_max = 0.1, 2.0
+x_min, x_max = float(ARGS.w_min), float(ARGS.w_max)
+# Alias kept so recorder/eval helpers can use w_min/w_max like the PINN.
+w_min, w_max = x_min, x_max
 
 # Log-wealth domain (y = log W)
 y_min, y_max = float(np.log(x_min)), float(np.log(x_max))
 
 # Preferences
-gamma_risk = 2.0
-rho_discount = 0.04
-epsilon = 1.0  # bequest weight
+gamma_risk = float(ARGS.gamma)
+rho_discount = float(ARGS.rho_discount)
+epsilon = float(ARGS.epsilon_bequest)  # bequest weight
 
 # Risk-free rate
-r_rate = 0.03
+r_rate = float(ARGS.r)
 
 # Multi-asset market dimension
-N_ASSETS = 10
+N_ASSETS = int(ARGS.n_assets)
 
-# Synthetic market configuration (tune as you like)
+# Synthetic market configuration. Drawn from MARKET_SEED (not SEED) so a
+# training-seed sweep reuses the SAME market.
 market_params = market_setup.generate_synthetic_merton_market(
     n=N_ASSETS,
     gamma=gamma_risk,
-    sigma_range=(0.10, 0.25),
-    rho_max=1.0,
-    kappa_max=30.0,
-    delta_rel=1e-4,
-    seed=SEED,
-    mu_mode="pi_target",
-    pi_scale=0.6,
-    mu_noise_rel=0.02,
+    sigma_range=(float(ARGS.sigma_lo), float(ARGS.sigma_hi)),
+    rho_max=float(ARGS.rho_max),
+    kappa_max=float(ARGS.kappa_max),
+    delta_rel=float(ARGS.delta_rel),
+    seed=MARKET_SEED,
+    mu_mode=str(ARGS.mu_mode),
+    pi_scale=float(ARGS.pi_scale),
+    mu_noise_rel=float(ARGS.mu_noise_rel),
 )
 
 mu_excess_np = np.asarray(market_params["mu_excess"], dtype=np.float64).reshape(N_ASSETS)
@@ -137,14 +246,14 @@ nu = rho_discount / gamma_risk - (1.0 - gamma_risk) * (
 )
 
 # Control bounds (componentwise for pi)
-pi_min_bound = -2.0
-pi_max_bound = 2.0
+pi_min_bound = float(ARGS.pi_min)
+pi_max_bound = float(ARGS.pi_max)
 
 # Consumption bounds: use kappa=c/W bounds to avoid CRRA blow-up at tiny c
-M_utility_cap = 1e3
+M_utility_cap = float(ARGS.utility_cap)
 c_floor = ((gamma_risk - 1.0) * M_utility_cap) ** (-1.0 / (gamma_risk - 1.0))
 kappa_min_bound = c_floor / x_min
-kappa_max_bound = 3.0
+kappa_max_bound = float(ARGS.kappa_max_bound)
 
 # Optional level clamp for c (mainly for printing / extra safety)
 c_min_bound = c_floor
@@ -727,6 +836,50 @@ def eval_pinn_on_grid(
     value_net.train()
     return tt, ww, V_grid, c_grid, pi_grid, pi_norm_grid
 
+def eval_pinn_on_grid_margin(
+    value_net: nn.Module,
+    Nt: int = 100,
+    Nw: int = 100,
+    margin: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Grid evaluation on an eval window shrunk by HALF-WIDTH `margin`.
+
+    Both the t-axis and the y=log W axis are shrunk inward (shrink_bounds
+    convention); the W grid is exp of the shrunk y-range so points stay inside
+    the trained log-wealth box. margin=0.0 reproduces the full-window grid.
+    """
+    value_net.eval()
+    t_lo, t_hi = mxu.shrink_bounds(t_min, t_max - 1e-3, margin)
+    y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, margin)
+    t_vals = np.linspace(t_lo, t_hi, Nt)
+    w_vals = np.exp(np.linspace(y_lo, y_hi, Nw))
+
+    tt = np.zeros((Nt, Nw)); ww = np.zeros((Nt, Nw))
+    V_grid = np.zeros((Nt, Nw)); c_grid = np.zeros((Nt, Nw))
+    pi_grid = np.zeros((Nt, Nw, N_ASSETS)); pi_norm_grid = np.zeros((Nt, Nw))
+
+    for i, t_val in enumerate(t_vals):
+        for j, w_val in enumerate(w_vals):
+            tt[i, j] = t_val
+            ww[i, j] = w_val
+            t_t = torch.tensor([[t_val]], device=device, dtype=torch.float32).requires_grad_(True)
+            y_t = torch.tensor([[np.log(w_val)]], device=device, dtype=torch.float32).requires_grad_(True)
+            V = value_net(t_t, y_t)
+            ones = torch.ones_like(V)
+            V_y = torch.autograd.grad(V, y_t, grad_outputs=ones, create_graph=True, retain_graph=True)[0]
+            V_yy = torch.autograd.grad(V_y, y_t, grad_outputs=torch.ones_like(V_y), create_graph=True, retain_graph=True)[0]
+            c_val = compute_c_from_foc_log(V_y, y_t)
+            pi_val = compute_pi_from_foc_log_multi(V_y, V_yy, Sigma_inv_mu)
+            V_grid[i, j] = float(V.item())
+            c_grid[i, j] = float(c_val.item())
+            pi_np = pi_val.detach().cpu().numpy().reshape(-1)
+            pi_grid[i, j, :] = pi_np
+            pi_norm_grid[i, j] = float(np.linalg.norm(pi_np))
+
+    value_net.train()
+    return tt, ww, V_grid, c_grid, pi_grid, pi_norm_grid
+
+
 def compute_metrics(V_pinn, c_pinn, pi_pinn, V_cf, c_cf, pi_cf) -> Dict[str, float]:
     """Compute MSE / RelRMSE / MaxErr for (V, c, pi)."""
     mse_V = np.mean((V_pinn - V_cf) ** 2)
@@ -912,100 +1065,146 @@ def plot_comparison_heatmaps(
 # =============================================================================
 # 11) Main
 # =============================================================================
+def main():
+    out_dir = os.path.join(ARGS.output_root, ARGS.run_tag)
+    weight_dir = ARGS.weight_root or os.path.join(out_dir, "weights")
+    recorder = mxu.ExperimentRecorder(out_dir, weight_dir, ARGS)
+
+    if ARGS.eval_only:
+        recorder.save_config_eval()
+    else:
+        recorder.save_config()
+        recorder.rotate_training_logs()
+        recorder.save_market_snapshot(
+            mu_excess=mu_excess_np, Sigma_safe=Sigma_np, chol=chol_Sigma_np,
+            pi_star=pi_star_np, Theta=np.array([Theta]), nu=np.array([nu]),
+            gamma=np.array([gamma_risk]), r=np.array([r_rate]),
+            rho_discount=np.array([rho_discount]), epsilon=np.array([epsilon]),
+            T=np.array([T_FINAL]), w_min=np.array([x_min]), w_max=np.array([x_max]),
+            n_assets=np.array([N_ASSETS]), market_seed=np.array([MARKET_SEED]),
+            seed=np.array([SEED]),
+        )
+
+    try:
+        eta_clip = None if str(ARGS.eta_clip).lower() == "none" else float(ARGS.eta_clip)
+        eta_focus_w = None if str(ARGS.eta_focus_w).lower() == "none" else float(ARGS.eta_focus_w)
+
+        start = time.time()
+        solver = PIPINN_MultiAsset_Consumption_LogW(
+            value_hidden=int(ARGS.value_hidden),
+            value_depth=int(ARGS.value_depth),
+            lr=float(ARGS.lr),
+            scheduler_patience=int(ARGS.scheduler_patience),
+            scheduler_factor=float(ARGS.scheduler_factor),
+            scheduler_min_lr=float(ARGS.scheduler_min_lr),
+            pi_min=pi_min_bound,
+            pi_max=pi_max_bound,
+            c_min=c_min_bound,
+            c_max=c_max_bound,
+            device=device,
+        )
+
+        results = None
+        if not ARGS.eval_only:
+            results = solver.run_policy_iteration(
+                outer_iters=int(ARGS.outer_iters),
+                eval_epochs=int(ARGS.eval_epochs),
+                batch_size=int(ARGS.batch_size),
+                w_terminal=float(ARGS.w_terminal),
+                w_eta=float(ARGS.w_eta),
+                eta_focus_w=eta_focus_w,
+                eta_clip=eta_clip,
+                pi_init_method=str(ARGS.pi_init_method),
+                c_init_method=str(ARGS.c_init_method),
+                print_every_outer=int(ARGS.print_every_outer),
+                print_every_eval=int(ARGS.print_every_eval),
+                verbose_detail=bool(ARGS.print_every_eval > 0),
+            )
+            elapsed = time.time() - start
+            h = int(elapsed // 3600); m = int((elapsed % 3600) // 60); s = elapsed % 60
+            print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
+
+            # Per-outer history for the E3-a / Figure-2 contraction analysis.
+            # e_Xev is the closed-form-referenced convergence signal (here the
+            # policy L2 gap to the closed form), matching the Liu column name
+            # so make_figure2_contraction reads it unchanged.
+            n_outer = len(results["eval_loss"])
+            outer_rows = []
+            for i in range(n_outer):
+                pi_cf = results["pi_vs_closed_form"][i]
+                c_cf = results["c_vs_closed_form"][i]
+                outer_rows.append({
+                    "outer_iter": i + 1,
+                    "inner_epochs_used": int(ARGS.eval_epochs),
+                    "eval_loss": results["eval_loss"][i],
+                    "eta_loss": results["eta_loss"][i],
+                    "pi_diff": results["pi_diff"][i],
+                    "c_diff": results["c_diff"][i],
+                    "pi_vs_closed_form": pi_cf,
+                    "c_vs_closed_form": c_cf,
+                    # sqrt(policy MSE-gap): an L2-type distance to the optimal
+                    # controls; e_Xev = pi-part (primary contraction signal).
+                    "e_Xev": float(np.sqrt(max(pi_cf, 0.0))),
+                    "e_pi": float(np.sqrt(max(pi_cf, 0.0))),
+                    "e_c": float(np.sqrt(max(c_cf, 0.0))),
+                    "lr": results["lr"][i],
+                    "pi_mean": results["pi_mean"][i], "pi_std": results["pi_std"][i],
+                    "c_mean": results["c_mean"][i], "c_std": results["c_std"][i],
+                })
+            mxu.append_csv_rows(recorder.outer_csv, outer_rows,
+                                ["outer_iter", "inner_epochs_used", "eval_loss", "eta_loss",
+                                 "pi_diff", "c_diff", "pi_vs_closed_form", "c_vs_closed_form",
+                                 "e_Xev", "e_pi", "e_c", "lr",
+                                 "pi_mean", "pi_std", "c_mean", "c_std"])
+        else:
+            elapsed = 0.0
+
+        # Grid evaluation vs closed-form at every eval margin (first = primary).
+        Nt, Nw = int(ARGS.n_tau), int(ARGS.n_x)
+        margins = mxu.parse_eval_margins(ARGS.eval_margin)
+        metric_rows = []
+        primary_metrics = None
+        for mi, margin in enumerate(margins):
+            tt, ww, V_pinn, c_pinn, pi_pinn, pi_norm = eval_pinn_on_grid_margin(
+                solver.value_net, Nt=Nt, Nw=Nw, margin=margin)
+            V_cf, c_cf, pi_cf = closed_form_numpy(tt, ww)
+            metrics = compute_metrics(V_pinn, c_pinn, pi_pinn, V_cf, c_cf, pi_cf)
+            if mi == 0:
+                primary_metrics = metrics
+            for key, val in metrics.items():
+                metric_rows.append({
+                    "timestamp": mxu.now_iso(), "model_type": ARGS.model_type,
+                    "run_tag": ARGS.run_tag, "scope": "fulldim", "eval_margin": margin,
+                    "metric": key, "value": val})
+        mxu.append_csv_rows(recorder.metrics_csv, metric_rows,
+                            ["timestamp", "model_type", "run_tag", "scope", "eval_margin", "metric", "value"])
+
+        print("\nMetrics (primary margin):")
+        for k, v in primary_metrics.items():
+            print(f"  {k}: {v:.6e}")
+
+        if not ARGS.skip_plots and not ARGS.eval_only:
+            plot_convergence(results, save_path=os.path.join(out_dir, "plots", "convergence.png"), show=False)
+            tt, ww, V_pinn, c_pinn, pi_pinn, pi_norm = eval_pinn_on_grid_margin(
+                solver.value_net, Nt=Nt, Nw=Nw, margin=margins[0])
+            plot_comparison_heatmaps(
+                tt, ww, V_pinn, c_pinn, pi_norm,
+                save_path=os.path.join(out_dir, "plots", "comparison_heatmap.png"), show=False)
+
+        if ARGS.eval_only:
+            recorder.mark_success_eval(elapsed_sec=elapsed, primary_margin=margins[0])
+        else:
+            recorder.mark_success(elapsed_sec=elapsed, outer_iters=int(ARGS.outer_iters),
+                                  total_optimizer_steps=int(ARGS.outer_iters) * int(ARGS.eval_epochs),
+                                  train_wall_sec=elapsed, primary_margin=margins[0])
+        print("\nDone.")
+    except Exception as exc:
+        if ARGS.eval_only:
+            recorder.mark_failed_eval(reason=repr(exc))
+        else:
+            recorder.mark_failed(reason=repr(exc))
+        raise
+
+
 if __name__ == "__main__":
-    # Hyperparameters
-    value_hidden = 256
-    value_depth = 3
-
-    outer_iters = 500
-    eval_epochs = 200
-    batch_size = 3000
-
-    lr = 5e-4
-    w_terminal = 20.0
-    w_eta = 5.0
-    eta_focus_w=None
-    eta_clip=10.0
-
-    pi_init_method="zero"
-    c_init_method="zero"
-
-    print_every_outer = 10
-    print_every_eval = 100
-    verbose_detail = False
-
-    start = time.time()
-
-    solver = PIPINN_MultiAsset_Consumption_LogW(
-        value_hidden=value_hidden,
-        value_depth=value_depth,
-        lr=lr,
-        scheduler_patience=50,
-        scheduler_factor=0.5,
-        scheduler_min_lr=1e-6,
-        pi_min=pi_min_bound,
-        pi_max=pi_max_bound,
-        c_min=c_min_bound,
-        c_max=c_max_bound,
-        device=device,
-    )
-
-    results = solver.run_policy_iteration(
-        outer_iters=outer_iters,
-        eval_epochs=eval_epochs,
-        batch_size=batch_size,
-        w_terminal=w_terminal,
-        w_eta=w_eta,
-        eta_focus_w=None,
-        eta_clip=10.0,
-        pi_init_method="zero",
-        c_init_method="zero",
-        print_every_outer=print_every_outer,
-        print_every_eval=print_every_eval,
-        verbose_detail=verbose_detail,
-    )
-
-    elapsed = time.time() - start
-    h = int(elapsed // 3600)
-    m = int((elapsed % 3600) // 60)
-    s = elapsed % 60
-    print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
-
-    print("\n" + "=" * 60)
-    print("Evaluating PI-PINN (log W) vs Closed-form...")
-    print(f"{'='*60}")
-    print(f"  {N_ASSETS}-asset, T={T_FINAL}, W ∈ [{x_min}, {x_max}] // y ∈ [{y_min:.3f}, {y_max:.3f}]")
-    print(f"  π ∈ [{pi_min_bound}, {pi_max_bound}] // κ ∈ [{kappa_min_bound:.3g}, {kappa_max_bound}]")
-    print(f"  pi init method: {pi_init_method}")
-    print(f"  c  init method: {c_init_method}")
-    print(f"  hidden={value_hidden}, depth={value_depth}")
-    print(f"  outer={outer_iters}, eval_epochs={eval_epochs}, batch={batch_size}")
-    print(f"  lr={lr}, w_term={w_terminal}, w_eta={w_eta}, eta_focus_x={eta_focus_w}, eta_clip={eta_clip}")
-    print(f"  Seed={SEED}")
-    print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
-    print(f"{'='*70}")
-    
-    out_dir = "outputs/merton_multiasset_consumption_logw"
-    os.makedirs(out_dir, exist_ok=True)
-    
-    plot_convergence(results, save_path=os.path.join(out_dir, "convergence.png"), show=True)
-    
-    Nt, Nw = 100, 100
-    tt, ww, V_pinn, c_pinn, pi_pinn, pi_norm = eval_pinn_on_grid(solver.value_net, Nt=Nt, Nw=Nw)
-    
-    # Closed-form arrays on the same grid
-    V_cf, c_cf, pi_cf = closed_form_numpy(tt, ww)
-    
-    metrics = compute_metrics(V_pinn, c_pinn, pi_pinn, V_cf, c_cf, pi_cf)
-    print("\nMetrics:")
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.6e}")
-    
-    # Keep the compact visualization (||pi||_2) heatmap
-    plot_comparison_heatmaps(
-        tt, ww, V_pinn, c_pinn, pi_norm,
-        save_path=os.path.join(out_dir, "comparison_heatmap.png"),
-        show=True,
-    )
-    
-    print("\nDone.")
+    main()
