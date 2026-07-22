@@ -1555,9 +1555,20 @@ def main():
         mxu.append_csv_rows(recorder.metrics_csv, metric_rows,
                             ["timestamp", "model_type", "run_tag", "scope", "eval_margin", "metric", "value"])
 
-        print("\nMetrics (primary margin):")
-        for k, v in metrics_by_margin[float(margins[0])].items():
-            print(f"  {k}: {v:.6e}")
+        eval_source = (
+            f"{int(ARGS.test_points)} fixed random points"
+            if int(ARGS.test_points) > 0
+            else f"{Nt}x{Nw} deterministic grid"
+        )
+        print(f"\nEvaluation metrics by margin ({eval_source}):")
+        for margin in margins:
+            is_primary = float(margin) == float(margins[0])
+            print(
+                f"\n--- eval_margin={float(margin):.2f}"
+                f"{' (primary)' if is_primary else ''} ---"
+            )
+            for key, value in metrics_by_margin[float(margin)].items():
+                print(f"  {key}: {value:.6e}")
 
         if not skip_figures and not ARGS.eval_only:
             plot_loss_history(loss_history, save_path=os.path.join(out_dir, "plots", "loss_history.png"), show=False)
