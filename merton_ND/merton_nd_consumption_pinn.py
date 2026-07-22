@@ -406,17 +406,21 @@ def reduced_hjb_residual_log_multi(
             + (gamma/(1-gamma)) * ( (v_y / W) ^ ((gamma-1)/gamma) )
             + 0.5 * Theta * v_y^2 / (v_y - v_yy)
 
-    Numerical guards are one-sided: they preserve the required signs instead
-    of reflecting an invalid derivative back into the admissible region.
+    During early training, use an absolute-value continuation outside the
+    admissible derivative region to avoid dead gradients and singular HJB
+    terms.  The shape penalties still enforce V_y > 0 and V_y - V_yy > 0.
     """
     V, V_t, V_y, V_yy = compute_derivatives_log(value_net, t, y)
     W = torch.exp(y)
 
-    # For CRRA exponent (gamma-1)/gamma in (0,1), V_y must be positive.
-    V_y_safe = torch.clamp(V_y, min=eps)
+    # For CRRA exponent (gamma-1)/gamma in (0,1), the base must be positive.
+    # abs() keeps a gradient when the randomly initialized network has V_y < 0.
+    V_y_safe = torch.abs(V_y) + eps
 
     denom = (V_y - V_yy)            # should be positive (concavity in W)
-    denom_safe = torch.clamp(denom, min=eps)
+    # Likewise, do not collapse every wrong-sign curvature to eps: that would
+    # create a large portfolio term while blocking its curvature gradient.
+    denom_safe = torch.abs(denom) + eps
 
     exp_c = (gamma_risk - 1.0) / gamma_risk
     term_consumption = (gamma_risk / (1.0 - gamma_risk)) * ( (V_y_safe / W).pow(exp_c) )
@@ -852,7 +856,8 @@ def train_pinn_hybrid_reduced_logw_multi(
                 mono0 = torch.mean(torch.relu(-Vy0.detach()) ** 2)
                 conc0 = torch.mean(torch.relu(-denom0.detach()) ** 2)
                 if w_eta != 0.0 and eta_clip is not None:
-                    eta0 = 1.0 - Vyy0.detach() / torch.clamp(Vy0.detach(), min=1e-8)
+                    eta0 = 1.0 - Vyy0.detach() / torch.clamp(
+                        torch.abs(Vy0.detach()), min=1e-8)
                     eta_loss0 = torch.mean(torch.clamp(
                         eta0 - gamma_risk, -float(eta_clip), float(eta_clip)) ** 2)
                 else:
@@ -911,7 +916,7 @@ def train_pinn_hybrid_reduced_logw_multi(
             mono_penalty = torch.mean(torch.relu(-V_y) ** 2)
             conc_penalty = torch.mean(torch.relu(-denom) ** 2)
             if w_eta != 0.0 and eta_clip is not None:
-                V_y_safe = torch.clamp(V_y, min=1e-8)
+                V_y_safe = torch.clamp(torch.abs(V_y), min=1e-8)
                 eta = 1.0 - V_yy / V_y_safe
                 eta_err = torch.clamp(
                     eta - gamma_risk, -float(eta_clip), float(eta_clip))

@@ -35,7 +35,7 @@ AGGREGATE="${AGGREGATE:-1}"          # 1: run aggregate_seeds after the sweep
 # seed=... override expands into one job per seed (seed goes into the tag, so
 # each seed gets its own output/weight dir). market_seed stays fixed so all
 # seeds solve the SAME market.
-SEEDS="${SEEDS:-1,2,3,4,5,6,7,8,9,10}"
+SEEDS="${SEEDS:-1,2,3,5,7,11,17,23,42,101}"
 N_ASSETS_LIST="${N_ASSETS_LIST:-10,50}"
 PINN_OVERRIDES="${PINN_OVERRIDES:-}"
 PIPINN_OVERRIDES="${PIPINN_OVERRIDES:-}"
@@ -132,12 +132,12 @@ declare -A BASE_PINN=(
   [mu_noise_rel]=0.02
   [value_hidden]=256
   [value_depth]=3
-  [batch_size]=3000
-  [terminal_frac]=0.5
+  [batch_size]=5000
+  [terminal_frac]=0.25
   [lr]=5e-4
-  [outer_iters]=500
-  [eval_epochs]=200
-  [resample_every]=0
+  [outer_iters]=20
+  [eval_epochs]=2000
+  [resample_every]=200
   [scheduler_patience]=5000
   [scheduler_factor]=0.5
   [scheduler_min_lr]=1e-8
@@ -148,15 +148,15 @@ declare -A BASE_PINN=(
   [eta_clip]=10.0
   [pi_clip_abs]="${PI_CLIP_ABS:-2.0}"
   [pres_target]=none
-  [val_points]=100000
+  [val_points]=50000
   [val_terminal_points]=10000
-  [val_every]=1
+  [val_every]=25
   [save_iterate_every]=0
-  [diag_points]=4096
+  [diag_points]=8192
   [diag_every]=1
-  [print_every]=5000
+  [print_every]=1000
   # First margin = PRIMARY (diagnostic + representative metric).
-  [eval_margin]="0.10,0.0,0.05,0.15,0.20"
+  [eval_margin]="0.10,0.0,0.05,0.15,0.20,0.25,0.30"
   [test_points]=100000
   [n_tau]=100
   [n_x]=100
@@ -184,24 +184,24 @@ declare -A BASE_PIPINN=(
   [utility_cap]=1e3
   [value_hidden]=256
   [value_depth]=3
-  [batch_size]=3000
+  [batch_size]=5000
   [terminal_frac]=0.5
   [lr]=5e-4
-  [outer_iters]=500
-  [eval_epochs]=200
+  [outer_iters]=20
+  [eval_epochs]=2000
   [scheduler_patience]=10
   [scheduler_factor]=0.5
   [scheduler_min_lr]=1e-8
   [lr_schedule]=carry_plateau
   [adam_reset]=keep
-  [carry_lr_min]=1e-5
+  [carry_lr_min]=1e-8
   [carry_lr_max]=5e-4
   # Paper alignment: nondegenerate initial policy (Assumption 1). Override
   # pi_init_method=zero c_init_method=zero to reproduce the ipynb runs.
   [pi_init_method]=myopic
   # Bash/public name intentionally follows the Liu experiment vocabulary;
   # build_flags maps it to Python's Merton-specific --pi-init-scale.
-  [theta_init_scale]="${THETA_INIT_SCALE:-1.0}"
+  [theta_init_scale]="${THETA_INIT_SCALE:-0.5}"
   [c_init_method]=proportional
   [w_terminal]=10.0
   [w_shape]=1.0
@@ -209,21 +209,21 @@ declare -A BASE_PIPINN=(
   [eta_clip]=10.0
   [eta_focus_w]=none
   [pres_target]=none
-  [val_points]=100000
+  [val_points]=50000
   [val_terminal_points]=10000
-  [val_every]=1
+  [val_every]=25
   [inner_best_restore]=1
   [sel_points]=10000
   [sel_terminal_points]=2000
   [sel_every]=50
-  [sel_patience]=6
+  [sel_patience]=0
   [pe_resample_every]="${PE_RESAMPLE_EVERY:-0}"
   [save_iterate_every]=0
-  [diag_points]=4096
+  [diag_points]=8192
   [diag_every]=1
-  [print_every_outer]=10
+  [print_every_outer]=1
   [print_every_eval]=0
-  [eval_margin]="0.10,0.0,0.05,0.15,0.20"
+  [eval_margin]="0.10,0.0,0.05,0.15,0.20,0.25,0.30"
   [test_points]=100000
   [n_tau]=100
   [n_x]=100
@@ -322,10 +322,19 @@ enqueue() {
 # Expand a run into per-seed jobs when SEEDS is set and no explicit seed given.
 run_pinn()   { _run_model pinn   "$@"; }
 run_pipinn() { _run_model pipinn "$@"; }
+declare -A ENQUEUED_N=()
 _run_model() {
   local model="$1"; shift
-  local has_seed=0
-  for kv in "$@"; do [[ "${kv%%=*}" == "seed" ]] && has_seed=1; done
+  local has_seed=0 n_val=""
+  for kv in "$@"; do
+    [[ "${kv%%=*}" == "seed" ]] && has_seed=1
+    [[ "${kv%%=*}" == "n_assets" ]] && n_val="${kv#*=}"
+  done
+  if [[ -z "$n_val" ]]; then
+    if [[ "$model" == "pinn" ]]; then n_val="${BASE_PINN[n_assets]}"; else n_val="${BASE_PIPINN[n_assets]}"; fi
+  fi
+  [[ "$n_val" =~ ^[1-9][0-9]*$ ]] || { echo "[error] invalid n_assets: $n_val" >&2; exit 2; }
+  ENQUEUED_N["$n_val"]=1
   if [[ ${#SEED_LIST[@]} -gt 0 && $has_seed -eq 0 ]]; then
     for sd in "${SEED_LIST[@]}"; do enqueue "$model" "$@" "seed=$sd"; done
   else
@@ -390,20 +399,27 @@ run_all_jobs() {
   return "$failed"
 }
 
-# =========================================================================
-# Sweep definition. Merton state is wealth-only, so there is NO m_states
-# sweep (fixed at 1, recorded by the scripts). The paper needs both methods
-# on the same market across the seed sweep; add tuning variants as extra
-# run_* lines (e.g. run_pipinn w_eta=1.0).
-# =========================================================================
-for n_assets in "${N_ASSET_VALUES[@]}"; do
-  [[ "$n_assets" =~ ^[1-9][0-9]*$ ]] || {
-    echo "[error] invalid N_ASSETS_LIST entry: $n_assets" >&2
-    exit 2
-  }
-  run_pinn n_assets="$n_assets" "${PINN_OVERRIDE_ARGS[@]}"
-  run_pipinn n_assets="$n_assets" "${PIPINN_OVERRIDE_ARGS[@]}"
-done
+# Paper default: N in {10, 50} x both methods. Edit/add run_* lines freely;
+# tuning variants get their own tag (=own output/weight dir) automatically.
+#   run_pipinn n_assets=10 theta_init_scale=0.5
+#   run_pipinn n_assets=50 w_eta=1.0 sel_patience=3
+#   run_pinn   n_assets=10 seed=1            # single-seed (no SEEDS expansion)
+
+run_pinn   n_assets=10
+run_pinn   n_assets=10 outer_iters=30
+run_pipinn n_assets=10
+run_pipinn n_assets=10 outer_iters=30
+run_pipinn n_assets=10 scheduler_patience=20
+
+run_pinn   n_assets=50
+run_pinn   n_assets=50 outer_iters=30
+run_pipinn n_assets=50 
+run_pipinn n_assets=50 outer_iters=30
+run_pipinn n_assets=50 scheduler_patience=20
+
+
+
+
 
 if ! run_all_jobs; then
   echo "[error] at least one Merton job failed; aggregation is not run." >&2
@@ -415,7 +431,7 @@ if [[ "$AGGREGATE" == "1" && "$EVAL_ONLY" != "1" ]]; then
   "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" \
     --out-root "$OUT_ROOT" \
     --expected-seeds "$SEEDS" \
-    --expected-n-assets "$N_ASSETS_LIST" \
+    --expected-n-assets "$(printf '%s\n' "${!ENQUEUED_N[@]}" | sort -n | paste -sd, -)" \
     --expected-m-states "1" \
     --expected-models "pinn,pipinn" \
     --strict-market-snapshots
