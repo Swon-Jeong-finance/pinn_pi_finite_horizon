@@ -117,14 +117,14 @@ class PilotFixture:
 
 
 class ContractionPilotTests(unittest.TestCase):
-    def run_main(self, root: str, *extra: str):
+    def run_main(self, root: str, *extra: str, seeds: str = "1,2"):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = pilot.main(["--out-root", root, "--seeds", "1,2", *extra])
+            code = pilot.main(["--out-root", root, "--seeds", seeds, *extra])
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def complete_grid(self, fixture: PilotFixture, kind: str = "pass"):
-        for seed in (1, 2):
+    def complete_grid(self, fixture: PilotFixture, kind: str = "pass", seeds=(1, 2)):
+        for seed in seeds:
             for scale in (0.5, 1.5):
                 fixture.add_run(seed, scale, kind=kind)
 
@@ -133,6 +133,15 @@ class ContractionPilotTests(unittest.TestCase):
             self.complete_grid(PilotFixture(root), "pass")
             code, output, _ = self.run_main(root)
             self.assertEqual(code, 0)
+            self.assertIn("GLOBAL VERDICT: PASS", output)
+
+    def test_arbitrary_seed_count_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            seeds = (1, 2, 3)
+            self.complete_grid(PilotFixture(root), "pass", seeds=seeds)
+            code, output, _ = self.run_main(root, seeds="1,2,3")
+            self.assertEqual(code, 0)
+            self.assertIn("runs=6", output)
             self.assertIn("GLOBAL VERDICT: PASS", output)
 
     def test_consistent_norm_proxy_is_global_only(self):

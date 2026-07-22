@@ -3,7 +3,7 @@
 
 The intended pilot is the complete Cartesian grid
 
-    theta_0 = a * theta_myopic,  a in {0.5, 1.5},  one or two seeds.
+    theta_0 = a * theta_myopic,  a in {0.5, 1.5},  one or more seeds.
 
 Before looking at trajectories, this script verifies that every run completed,
 that outer_history.csv contains exactly outer_iter=1,...,outer_iters, that the
@@ -157,8 +157,8 @@ def parse_int_list(raw: str) -> Optional[List[int]]:
         values = [int(part.strip()) for part in raw.split(",") if part.strip()]
     except ValueError as exc:
         raise InvalidPilot(f"invalid --seeds value: {raw!r}") from exc
-    if not 1 <= len(values) <= 2:
-        raise InvalidPilot("the pilot requires one or two expected seeds")
+    if not values:
+        raise InvalidPilot("the pilot requires at least one expected seed")
     if len(set(values)) != len(values):
         raise InvalidPilot("--seeds contains duplicates")
     return values
@@ -321,10 +321,8 @@ def discover_runs(out_root: str, m_states: int, requested_seeds: Optional[List[i
     if not candidates:
         raise InvalidPilot(f"no matching scale-pilot runs found below {out_root}")
     seeds = requested_seeds or sorted({item[2] for item in candidates})
-    if not 1 <= len(seeds) <= 2:
-        raise InvalidPilot(
-            f"inferred {len(seeds)} seeds ({seeds}); the pilot requires one or two"
-        )
+    if not seeds:
+        raise InvalidPilot("the pilot requires at least one seed")
 
     grid: Dict[Tuple[int, int], Run] = {}
     for run_dir, args, seed, scale in candidates:
@@ -580,7 +578,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--m-states", type=int, default=3)
     parser.add_argument(
         "--seeds", default="",
-        help="Expected comma-separated one or two seeds; blank infers from matching runs.",
+        help="Expected comma-separated seeds (any positive count); blank infers from matching runs.",
     )
     parser.add_argument("--expected-scales", default="0.5,1.5")
     parser.add_argument("--range-threshold", type=float, default=5.0)
@@ -643,7 +641,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         message = "criteria or runs disagree; do not extend or redefine the norm yet"
     print(f"GLOBAL VERDICT: {verdict} -- {message}")
     print(
-        "[scope] This is a one/two-seed finite-set pilot gate, not a continuum "
+        "[scope] This is a finite-set pilot gate, not a continuum "
         "ellipticity proof or a 10-seed statistical conclusion."
     )
     return 0 if verdict == "PASS" else 1

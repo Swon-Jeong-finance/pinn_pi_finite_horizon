@@ -77,8 +77,8 @@ if [[ -n "$SEEDS" ]]; then
   IFS=', ' read -ra SEED_LIST <<< "$SEEDS"
   echo "[info] multi-seed mode: seeds = ${SEED_LIST[*]}"
   if [[ "$CONTRACTION_PILOT" == "1" ]]; then
-    if (( ${#SEED_LIST[@]} < 1 || ${#SEED_LIST[@]} > 2 )); then
-      echo "[error] contraction pilot requires one or two seeds; got: ${SEED_LIST[*]}" >&2
+    if (( ${#SEED_LIST[@]} < 1 )); then
+      echo "[error] contraction pilot requires at least one seed" >&2
       exit 2
     fi
     declare -A _pilot_seed_seen=()
