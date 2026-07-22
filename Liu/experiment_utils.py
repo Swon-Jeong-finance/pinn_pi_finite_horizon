@@ -19,6 +19,50 @@ import numpy as np
 import torch
 
 
+VWW_GUARD = 1e-8
+
+
+def safe_concave_vww(V_ww: torch.Tensor) -> torch.Tensor:
+    """Clamp a denominator-side value derivative to the concave region.
+
+    Use this helper only where ``V_ww`` appears in a denominator (nonlinear
+    HJB maximization or control extraction).  A frozen-policy linear PDE must
+    continue to use its raw ``V_ww`` coefficient.
+    """
+    return torch.clamp(V_ww, max=-VWW_GUARD)
+
+
+def normalized_control_stats(theta: torch.Tensor, w: torch.Tensor) -> Dict[str, float]:
+    """Summarize the wealth-normalized volatility control ``theta / w``.
+
+    The paper uses the unconstrained normalized control
+    ``vartheta = theta / w``.  Recording these range diagnostics at every
+    outer iteration is much cheaper and safer than retaining every network
+    solely to reconstruct the ranges after training.
+    """
+
+    if theta.ndim != 2:
+        raise ValueError(f"theta must have shape (points, assets), got {tuple(theta.shape)}")
+    w_col = w.reshape(-1, 1)
+    if w_col.shape[0] != theta.shape[0]:
+        raise ValueError(
+            f"theta/w point-count mismatch: {theta.shape[0]} vs {w_col.shape[0]}"
+        )
+    if theta.shape[0] == 0 or theta.shape[1] == 0:
+        raise ValueError("theta must contain at least one point and one asset")
+
+    with torch.no_grad():
+        vartheta = theta.detach() / torch.clamp(w_col.detach(), min=1.0e-8)
+        row_l2 = torch.linalg.vector_norm(vartheta, ord=2, dim=1)
+        return {
+            "vartheta_l2_min": float(torch.min(row_l2).item()),
+            "vartheta_l2_max": float(torch.max(row_l2).item()),
+            "vartheta_component_min": float(torch.min(vartheta).item()),
+            "vartheta_component_max": float(torch.max(vartheta).item()),
+            "vartheta_abs_max": float(torch.max(torch.abs(vartheta)).item()),
+        }
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -180,13 +224,13 @@ def add_common_experiment_args(parser: argparse.ArgumentParser, *, model_type_de
     parser.add_argument("--test-points", type=int, default=20000,
                         help="Number of full-dimensional Omega_ev test points for Table metrics (0 = off).")
 
-    # Fixed Q_ev diagnostic set: per-outer-iteration e_n = |v~_n - V|_sup +
-    # |Dv~_n - DV|_sup (reduced bundle, pointwise Euclidean norm) plus the
-    # stability margins (m_ww, M_num, lambda_min(Sigma), guard fraction) are
-    # recorded to outer_history.csv, replacing per-iteration weight dumps for
-    # the E3-a contraction-ratio analysis. Sampled once from Q_ev at the
-    # primary margin with a MARKET-seed-derived RNG (identical across
-    # training seeds). 0 disables.
+    # Fixed diagnostics: Q_ev supplies per-outer-iteration
+    # e_n = |v~_n - V|_sup + |Dv~_n - DV|_sup (reduced bundle, pointwise
+    # Euclidean norm), m_ww, M_num, guard fraction, and observed improved
+    # wealth-normalized-control ranges.  A same-size Q_col design supplies
+    # frozen/implied policy-covariance eigenvalues.  All are recorded in
+    # outer_history.csv using MARKET-seed-derived designs shared across
+    # training seeds. 0 disables.
     parser.add_argument("--diag-points", type=int, default=4096,
                         help="Fixed Q_ev diagnostic-set size for per-iteration e_n / stability margins (0 = off).")
     parser.add_argument("--diag-every", type=int, default=1,
@@ -262,6 +306,9 @@ def pres_from_mse(pde_mse: float, terminal_mse: float) -> float:
 
 
 class ExperimentRecorder:
+    TRAIN_MARKERS = ("_DONE", "_SUCCESS", "_STOPPED_EARLY", "_FAILED")
+    EVAL_MARKERS = ("_DONE_EVAL", "_SUCCESS_EVAL", "_FAILED_EVAL")
+
     def __init__(self, output_dir: str, weight_dir: str, args: argparse.Namespace):
         self.output_dir = output_dir
         self.weight_dir = weight_dir
@@ -279,22 +326,107 @@ class ExperimentRecorder:
         self.status_eval_json = os.path.join(self.output_dir, "status_eval.json")
 
     def rotate_training_logs(self) -> None:
-        """Archive any pre-existing per-run CSV logs before a NEW training run.
+        """Archive artifacts from an older run before NEW training starts.
 
-        The CSV writers append (so one run's epochs accumulate incrementally),
-        which means re-running the SAME run tag into the same output dir would
-        interleave two experiments in one file and silently corrupt Figure-2
-        ratios / inner-best statistics. Called only at TRAINING start --
-        eval-only reruns must never touch these files.
-        Existing files are renamed to <name>.old.<timestamp>, not deleted.
+        CSV writers append, and checkpoint filenames are reused.  Rotating
+        only CSVs therefore leaves a dangerous failure mode: a short or failed
+        rerun can coexist with stale ``value_net_final.pt`` or stale iterate
+        snapshots from an older successful run.  This method moves the known
+        training/evaluation provenance files, plots, root checkpoints, and the
+        complete iterate directory to timestamped ``.old`` names.  Renaming is
+        non-destructive and normally atomic because source and destination are
+        in the same directory.
+
+        Call this only for a NEW training run and *before* ``save_config``.
+        Eval-only runs must never invoke it.
         """
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        for path in (self.train_csv, self.outer_csv, self.metrics_csv):
+        stamp = f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-p{os.getpid()}"
+        archived: Dict[str, str] = {}
+
+        def archive(path: str) -> None:
+            if not os.path.lexists(path):
+                return
+            dst = f"{path}.old.{stamp}"
+            suffix = 1
+            while os.path.lexists(dst):
+                dst = f"{path}.old.{stamp}.{suffix}"
+                suffix += 1
+            os.replace(path, dst)
+            archived[os.path.abspath(path)] = os.path.abspath(dst)
+            print(
+                f"[recorder] previous artifact archived: {os.path.basename(path)} "
+                f"-> {os.path.basename(dst)}"
+            )
+
+        # Per-run outputs and provenance that would otherwise be overwritten
+        # or accidentally combined with a rerun.
+        for path in (
+            self.train_csv,
+            self.outer_csv,
+            self.metrics_csv,
+            self.config_json,
+            self.status_json,
+            self.config_eval_json,
+            self.status_eval_json,
+            self.metrics_csv + ".eval_tmp",
+            os.path.join(self.output_dir, "market_params.npz"),
+            os.path.join(self.output_dir, "closed_form_ode.npz"),
+        ):
+            archive(path)
+
+        # Per-run figures are currently written both directly under the run
+        # directory and under plots/.  Leave unrelated notebooks/directories
+        # alone, but quarantine standard figure formats so a failed rerun
+        # cannot look complete because of an older image.
+        if os.path.isdir(self.output_dir):
+            for entry in list(os.scandir(self.output_dir)):
+                if (entry.is_file(follow_symlinks=False) or entry.is_symlink()) and entry.name.lower().endswith(
+                    (".png", ".pdf", ".svg", ".eps")
+                ):
+                    archive(entry.path)
+
+        plots_dir = os.path.join(self.output_dir, "plots")
+        if os.path.isdir(plots_dir) and os.listdir(plots_dir):
+            archive(plots_dir)
+        ensure_dir(plots_dir)
+
+        # A weight directory belongs to one run tag.  Archive every root-level
+        # torch checkpoint, including legacy dimension-encoded best filenames,
+        # plus the iterate directory as one unit.  Previously archived files
+        # do not end in a checkpoint suffix and are intentionally ignored.
+        if os.path.isdir(self.weight_dir):
+            for entry in list(os.scandir(self.weight_dir)):
+                if entry.name == "iterates" and entry.is_dir(follow_symlinks=False):
+                    archive(entry.path)
+                elif (entry.is_file(follow_symlinks=False) or entry.is_symlink()) and entry.name.lower().endswith(
+                    (".pt", ".pth", ".ckpt")
+                ):
+                    archive(entry.path)
+
+        if archived:
+            save_json(
+                os.path.join(self.output_dir, f"rerun_archive.{stamp}.json"),
+                {
+                    "archived_at": now_iso(),
+                    "reason": "new_training_run_same_output_or_weight_directory",
+                    "artifacts": archived,
+                },
+            )
+
+        # A new training run invalidates every completion marker from the
+        # previous training/evaluation cycle.  Otherwise an old _SUCCESS can
+        # make a failed rerun look successful to the seed aggregator.
+        self._remove_markers(self.TRAIN_MARKERS + self.EVAL_MARKERS)
+
+    def _remove_markers(self, names: Sequence[str]) -> None:
+        for name in names:
+            path = os.path.join(self.output_dir, name)
             if os.path.exists(path):
-                dst = f"{path}.old.{stamp}"
-                os.replace(path, dst)
-                print(f"[recorder] previous log archived: {os.path.basename(path)} "
-                      f"-> {os.path.basename(dst)}")
+                os.remove(path)
+
+    def prepare_eval_run(self) -> None:
+        """Clear stale eval-only completion state before evaluation starts."""
+        self._remove_markers(self.EVAL_MARKERS)
 
     def save_config(self, extra: Optional[Dict[str, Any]] = None) -> None:
         data = {
@@ -345,22 +477,27 @@ class ExperimentRecorder:
         save_json(self.status_eval_json, data)
 
     def mark_success_eval(self, **kwargs: Any) -> None:
+        self._remove_markers(("_FAILED_EVAL",))
         open(os.path.join(self.output_dir, "_SUCCESS_EVAL"), "a").close()
         self.write_status_eval("success", **kwargs)
 
     def mark_failed_eval(self, **kwargs: Any) -> None:
+        self._remove_markers(("_DONE_EVAL", "_SUCCESS_EVAL"))
         open(os.path.join(self.output_dir, "_FAILED_EVAL"), "a").close()
         self.write_status_eval("failed", **kwargs)
 
     def mark_success(self, **kwargs: Any) -> None:
+        self._remove_markers(("_STOPPED_EARLY", "_FAILED"))
         open(os.path.join(self.output_dir, "_SUCCESS"), "a").close()
         self.write_status("success", **kwargs)
 
     def mark_stopped_early(self, **kwargs: Any) -> None:
+        self._remove_markers(("_SUCCESS", "_FAILED"))
         open(os.path.join(self.output_dir, "_STOPPED_EARLY"), "a").close()
         self.write_status("stopped_early", **kwargs)
 
     def mark_failed(self, **kwargs: Any) -> None:
+        self._remove_markers(("_DONE", "_SUCCESS", "_STOPPED_EARLY"))
         open(os.path.join(self.output_dir, "_FAILED"), "a").close()
         self.write_status("failed", **kwargs)
 

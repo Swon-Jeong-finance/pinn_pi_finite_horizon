@@ -60,7 +60,8 @@ from joint_market_setup_dirichlet import generate_joint_market_params, JointMark
 from experiment_utils import (
     add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
-    parse_eval_margins, shrink_bounds, pres_from_mse,
+    parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
+    normalized_control_stats,
 )
 
 
@@ -168,19 +169,31 @@ weight_dir = ARGS.weight_root or f"weights/pinn/kim_omberg_{N_ASSETS}asset-{M_ST
 os.makedirs(weight_dir, exist_ok=True)
 output_dir = ARGS.output_root or f"outputs/pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
 os.makedirs(output_dir, exist_ok=True)
+
+# Validate launch-only invariants before quarantining an older run.  Invalid
+# command lines must fail without moving valid checkpoints or provenance.
+if ARGS.pres_target is not None and (not ARGS.val_points or ARGS.val_points <= 0):
+    raise SystemExit("[config error] --pres-target requires --val-points > 0 (held-out set is the stopping rule).")
+if (
+    not ARGS.eval_only
+    and ARGS.stop_flag_path
+    and os.path.exists(ARGS.stop_flag_path)
+):
+    print(
+        f"[early-stop] shared stop flag already exists; preserving the current "
+        f"run artifacts unchanged: {ARGS.stop_flag_path}"
+    )
+    raise SystemExit(0)
+
 recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
 if ARGS.eval_only:
     # Eval-only must NOT touch training-time provenance (config.json etc.).
     recorder.save_config_eval()
 else:
-    recorder.save_config()
-    # A NEW training run must start with FRESH per-run CSVs: appending onto a
-    # previous same-tag run interleaves two experiments in one file.
+    # Quarantine the complete previous attempt before creating the new
+    # canonical config/checkpoint namespace.
     recorder.rotate_training_logs()
-
-# Config sanity: a residual target without a validation set cannot stop.
-if ARGS.pres_target is not None and (not ARGS.val_points or ARGS.val_points <= 0):
-    raise SystemExit("[config error] --pres-target requires --val-points > 0 (held-out set is the stopping rule).")
+    recorder.save_config()
 
 # Time domain (τ = remaining horizon = T - t)
 tau_max = ARGS.tau_max
@@ -614,11 +627,10 @@ def hjb_residual_nd(model, w, x, tau, M, N, gamma, r, K_t, k0_t, Q_t, Gamma_t, l
     combined = lam_x * V_w + Gamma_Vwx  # (batch, N)
     numerator = torch.sum(combined ** 2, dim=1, keepdim=True)  # (batch, 1)
     
-    # denominator = 2 V_ww (should be negative for concave V)
-    denominator = 2.0 * V_ww
-    # denominator = 2 V_ww must be negative (concavity); clamp from above.
-    denominator_safe = torch.clamp(denominator, max=-1e-8)
-    term5 = -numerator / denominator_safe
+    # Guard V_ww itself so this path uses the same effective threshold as
+    # control extraction (rather than clamping 2*V_ww at a different one).
+    V_ww_safe = safe_concave_vww(V_ww)
+    term5 = -numerator / (2.0 * V_ww_safe)
     
     residual = term1 + term2 + term3 + term4 + term5
     
@@ -663,7 +675,7 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
     # maximizer, so clamp from ABOVE at -1e-8. (The previous
     # sign(V_ww)*1e-8 + 1e-10 form gave +1e-10 at V_ww == 0: wrong sign and
     # 100x smaller than intended, letting the control blow up.)
-    V_ww_safe = torch.clamp(V_ww, max=-1e-8)
+    V_ww_safe = safe_concave_vww(V_ww)
     theta = -numerator / V_ww_safe  # (batch, N)
     theta_norm = theta / w  # (batch, N)
     
@@ -756,6 +768,39 @@ def train_pinn_nd(model, M, N, gamma, r,
             model, val_set, M, N, gamma, r,
             K_t, k0_t, Q_t, Gamma_t, lam0_t, Lam_t)
 
+    def _greedy_qcol_diagnostics():
+        """Ellipticity of the implied greedy policy on dedicated Q_col."""
+
+        out = {
+            "lam_min_sigma_greedy": "",
+            "lam_max_sigma_greedy": "",
+        }
+        if diag_col is None:
+            return out
+
+        was_training = model.training
+        model.eval()
+        theta_chunks = []
+        point_count = int(diag_col["w_int"].shape[0])
+        for start in range(0, point_count, 4096):
+            w_chunk = diag_col["w_int"][start:start + 4096].detach().clone().requires_grad_(True)
+            x_chunk = diag_col["x_int"][start:start + 4096].detach().clone().requires_grad_(True)
+            tau_chunk = diag_col["tau_int"][start:start + 4096]
+            _, theta_chunk, _, _, _ = compute_optimal_theta_nd(
+                model, w_chunk, x_chunk, tau_chunk, M, N, gamma,
+                Gamma_t, lam0_t, Lam_t, create_graph=True,
+            )
+            theta_chunks.append(theta_chunk.detach().cpu())
+        if was_training:
+            model.train()
+
+        theta_all = torch.cat(theta_chunks, dim=0)
+        theta_np = theta_all.numpy()
+        lam_min, lam_max = sigma_eig_extremes_batch(theta_np, Gamma, Q)
+        out["lam_min_sigma_greedy"] = float(np.min(lam_min))
+        out["lam_max_sigma_greedy"] = float(np.max(lam_max))
+        return out
+
     loss_history = []
     best_loss = float('inf')
     start_time = time.time()
@@ -788,6 +833,8 @@ def train_pinn_nd(model, M, N, gamma, r,
         "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_theta",
         "m_ww", "M_num", "guard_frac_ev",
         "lam_min_sigma_greedy", "lam_max_sigma_greedy", "clip_frac_frozen",
+        "vartheta_l2_min", "vartheta_l2_max",
+        "vartheta_component_min", "vartheta_component_max", "vartheta_abs_max",
         "lr", "best_loss", "bad_count", "stop_active",
         "stop_is_bad", "stopped", "stop_reason", "elapsed_sec",
     ]
@@ -1043,6 +1090,7 @@ def train_pinn_nd(model, M, N, gamma, r,
                     model, diag, M, N, gamma,
                     Gamma_t, lam0_t, Lam_t, Gamma, lam0, Lam,
                 )
+            greedy_diag = _greedy_qcol_diagnostics()
             # Timing mode: no CSV I/O inside the timed loop (kept symmetric
             # with PI-PINN); the stop summary still goes to status.json.
             if recorder is not None and not timing_mode:
@@ -1076,9 +1124,14 @@ def train_pinn_nd(model, M, N, gamma, r,
                     "m_ww": diag_res.get("m_ww", ""),
                     "M_num": diag_res.get("M_num", ""),
                     "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
-                    "lam_min_sigma_greedy": "",
-                    "lam_max_sigma_greedy": "",
+                    "lam_min_sigma_greedy": greedy_diag["lam_min_sigma_greedy"],
+                    "lam_max_sigma_greedy": greedy_diag["lam_max_sigma_greedy"],
                     "clip_frac_frozen": "",
+                    "vartheta_l2_min": diag_res.get("vartheta_l2_min", ""),
+                    "vartheta_l2_max": diag_res.get("vartheta_l2_max", ""),
+                    "vartheta_component_min": diag_res.get("vartheta_component_min", ""),
+                    "vartheta_component_max": diag_res.get("vartheta_component_max", ""),
+                    "vartheta_abs_max": diag_res.get("vartheta_abs_max", ""),
                     "lr": current_lr,
                     "best_loss": best_loss,
                     "bad_count": "",
@@ -1130,28 +1183,19 @@ def train_pinn_nd(model, M, N, gamma, r,
             # Fixed-set diagnostics for this pseudo-outer state (E1-b/c
             # analogues + closed-form e_n components).
             diag_res = {}
-            greedy_lam_min = ""
-            greedy_lam_max = ""
-            if diag is not None and (diag_every <= 1 or outer_iter % diag_every == 0 or outer_iter == 1):
+            greedy_diag = {
+                "lam_min_sigma_greedy": "",
+                "lam_max_sigma_greedy": "",
+            }
+            if diag is not None and (
+                diag_every <= 1 or outer_iter % diag_every == 0
+                or outer_iter == 1 or outer_iter == outer_iters
+            ):
                 diag_res = eval_diag_metrics(
                     model, diag, M, N, gamma,
                     Gamma_t, lam0_t, Lam_t, Gamma, lam0, Lam,
                 )
-                # Ellipticity of the implied greedy policy on Q_col.
-                _th_l = []
-                _P = diag_col["w_int"].shape[0]
-                for _i in range(0, _P, 4096):
-                    _w = diag_col["w_int"][_i:_i + 4096].detach().clone().requires_grad_(True)
-                    _x = diag_col["x_int"][_i:_i + 4096].detach().clone().requires_grad_(True)
-                    _tau = diag_col["tau_int"][_i:_i + 4096]
-                    _, _th, _, _, _ = compute_optimal_theta_nd(
-                        model, _w, _x, _tau, M, N, gamma,
-                        Gamma_t, lam0_t, Lam_t, create_graph=True)
-                    _th_l.append(_th.detach().cpu())
-                _th_np = torch.cat(_th_l, dim=0).numpy()
-                _lmin, _lmax = sigma_eig_extremes_batch(_th_np, Gamma, Q)
-                greedy_lam_min = float(np.min(_lmin))
-                greedy_lam_max = float(np.max(_lmax))
+                greedy_diag = _greedy_qcol_diagnostics()
 
             stop_triggered = False
             stop_meta = {"active": False, "is_bad": False, "bad_count": 0}
@@ -1184,9 +1228,14 @@ def train_pinn_nd(model, M, N, gamma, r,
                 "m_ww": diag_res.get("m_ww", ""),
                 "M_num": diag_res.get("M_num", ""),
                 "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
-                "lam_min_sigma_greedy": greedy_lam_min,
-                "lam_max_sigma_greedy": greedy_lam_max,
+                "lam_min_sigma_greedy": greedy_diag["lam_min_sigma_greedy"],
+                "lam_max_sigma_greedy": greedy_diag["lam_max_sigma_greedy"],
                 "clip_frac_frozen": "",
+                "vartheta_l2_min": diag_res.get("vartheta_l2_min", ""),
+                "vartheta_l2_max": diag_res.get("vartheta_l2_max", ""),
+                "vartheta_component_min": diag_res.get("vartheta_component_min", ""),
+                "vartheta_component_max": diag_res.get("vartheta_component_max", ""),
+                "vartheta_abs_max": diag_res.get("vartheta_abs_max", ""),
                 "lr": current_lr,
                 "best_loss": best_loss,
                 "bad_count": stop_meta.get("bad_count", ""),
@@ -1899,9 +1948,9 @@ def eval_diag_metrics(model, diag, M, N, gamma,
 
     Returns e_n components (sup-norms vs the closed form) plus the margins
     m_ww = min(-V_ww) and M_num = max||lam(x)V_w + Gamma V_wx|| and the
-    V_ww guard-activation fraction ON OMEGA_EV. Ellipticity of the frozen
-    policy (lambda_min, clip fraction) is measured separately on the
-    Q_col held-out points -- see the caller.
+    V_ww guard-activation fraction and normalized-control range ON OMEGA_EV.
+    Ellipticity of the implied greedy policy is measured separately on the
+    dedicated Q_col points -- see the caller.
     """
     was_training = model.training
     model.eval()
@@ -1935,7 +1984,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
 
     # Stability margins (model side)
     m_ww = float(np.min(-Vww_m))
-    guard_frac = float(np.mean(Vww_m > -1e-8))
+    guard_frac = float(np.mean(Vww_m > -VWW_GUARD))
     lam_x = lam0_np[None, :] + diag["x_np"] @ Lam_np.T            # (P, N)
     numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
     M_num = float(np.max(np.linalg.norm(numer, axis=1)))
@@ -1948,7 +1997,11 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     # side uses the exact (negative) V_ww*.
     rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
                      / max(np.linalg.norm(diag["V_cf"]), 1e-300))
-    theta_hat = -numer / np.minimum(Vww_m, -1e-8)[:, None]
+    theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
+    vartheta_stats = normalized_control_stats(
+        torch.from_numpy(theta_hat),
+        torch.from_numpy(np.asarray(diag["w_np"]).reshape(-1, 1)),
+    )
     numer_cf = lam_x * diag["Vw_cf"][:, None] + diag["Vwx_cf"] @ Gamma_np.T
     theta_cf = -numer_cf / diag["Vww_cf"][:, None]
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
@@ -1958,6 +2011,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
         "e_V_sup": e_V, "e_bundle_sup": e_D, "e_Xev": e_V + e_D,
         "diag_RelL2_V": rel_l2_V, "diag_RelL2_theta": rel_l2_theta,
         "m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac,
+        **vartheta_stats,
     }
 
 
@@ -2085,6 +2139,7 @@ if __name__ == "__main__":
         # Evaluation is unrelated to training-divergence monitoring: no
         # "running" status on the TRAINING status file, no stopper, and the
         # shared stop flag is ignored entirely.
+        recorder.prepare_eval_run()
         recorder.write_status_eval("running")
         stopper = None
     else:

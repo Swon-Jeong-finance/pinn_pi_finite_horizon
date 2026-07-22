@@ -12,7 +12,7 @@ set -euo pipefail
 #   RERUN_STOPPED=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   SEEDS="1,2,3,4,5,6,7,8,9,10" DEVICE_LIST="cuda:0,cuda:1" bash tune_pipinn.sh /workspace/outputs/main10seed
 #   AGGREGATE=0 bash tune_pipinn.sh ...   # skip the automatic seed aggregation step
-#   STRICT_PAPER_AGGREGATION=0 SEEDS="1,2" bash tune_pipinn.sh ...  # smoke/non-paper sweep
+#   STRICT_PAPER_AGGREGATION=0 SEEDS="1,2" bash tune_pipinn.sh ...  # do not fail on an incomplete aggregate
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
@@ -43,9 +43,10 @@ PDE_STOP_PATIENCE="${PDE_STOP_PATIENCE:-20}"
 # pass seed=... explicitly are left untouched. When SEEDS is empty, behavior
 # is identical to the original single-seed script (BASE seed).
 SEEDS="${SEEDS:-}"
-# Main-paper default: a multi-seed launch is valid only for the exact seed
-# set 1..10, and a failed post-run audit makes the launcher fail.  Explicitly
-# disable this only for smoke tests or non-paper sweeps.
+# A strict aggregate requires every seed requested by the caller, but does not
+# prescribe either the seed values or their count.  This keeps the launcher
+# usable for pilots and custom replication designs while still detecting a
+# missing run.  Disable only if an incomplete aggregate is acceptable.
 STRICT_PAPER_AGGREGATION="${STRICT_PAPER_AGGREGATION:-1}"
 
 # Cap CPU thread pools: parallel workers otherwise oversubscribe cores
@@ -76,24 +77,6 @@ if [[ -n "$SEEDS" ]]; then
     fi
     _seed_seen[$_seed_key]=1
   done
-  if [[ "$STRICT_PAPER_AGGREGATION" == "1" ]]; then
-    if (( ${#SEED_LIST[@]} != 10 )); then
-      echo "[error] paper main requires exactly 10 training seeds (1..10); got: ${SEED_LIST[*]}" >&2
-      exit 2
-    fi
-    for _seed in "${SEED_LIST[@]}"; do
-      if (( 10#$_seed < 1 || 10#$_seed > 10 )); then
-        echo "[error] paper main seed set must be exactly 1..10; got: ${SEED_LIST[*]}" >&2
-        exit 2
-      fi
-    done
-    for _seed in {1..10}; do
-      if [[ -z "${_seed_seen[$_seed]+x}" ]]; then
-        echo "[error] missing paper seed: $_seed" >&2
-        exit 2
-      fi
-    done
-  fi
 fi
 
 # Device worker queue.
@@ -327,6 +310,9 @@ should_skip_run() {
 run_job() {
   local tag="$1" model="$2" overrides="$3" out_dir="$4" weight_dir="$5" stop_flag_path="$6"; shift 6
   local log="$LOG_DIR/${tag}.log"
+  if [[ "$EVAL_ONLY" == "1" ]]; then
+    log="$LOG_DIR/${tag}.eval.log"
+  fi
   mkdir -p "$out_dir" "$weight_dir"
 
   if should_skip_run "$tag" "$model" "$out_dir" "$stop_flag_path"; then
@@ -401,6 +387,15 @@ EOF
     fi
 
     echo "[run ] $tag on $dev (worker $worker_id)"
+
+    # Preserve the previous attempt's console provenance.  Training and
+    # eval-only logs use separate canonical names, and a rerun rotates rather
+    # than truncates the existing file.
+    if [[ -f "$log" ]]; then
+      local log_stamp
+      log_stamp="$(date +%Y%m%d-%H%M%S-%N)-p$$-w${worker_id}"
+      mv "$log" "${log}.old.${log_stamp}"
+    fi
 
     local dev_q
     printf -v dev_q '%q' "$dev"
@@ -507,8 +502,8 @@ declare -A BASE_PINN=(
   [scheduler_min_lr]=1e-5
   # Main runs save NO per-iteration weights (final/best only); the E3-a
   # contraction data comes from the per-iteration e_n columns in
-  # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1
-  # exact-map reference runs.
+  # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1 FD
+  # reference runs; it retains every completed outer iterate.
   [save_iterate_every]=0
   # HALF-WIDTH margins: m keeps (1-m) of each axis length. FIRST = PRIMARY:
   # the fixed diagnostic set (e_n, stability margins) and the run-level
@@ -613,8 +608,8 @@ declare -A BASE_PIPINN=(
   [scheduler_min_lr]=1e-8
   # Main runs save NO per-iteration weights (final/best only); the E3-a
   # contraction data comes from the per-iteration e_n columns in
-  # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1
-  # exact-map reference runs.
+  # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1 FD
+  # reference runs; it retains every completed outer iterate.
   [save_iterate_every]=0
   # HALF-WIDTH margins: FIRST = PRIMARY (diagnostic set + representative
   # full-dim metric); keep 0.10 first for the paper convention. Others are
@@ -651,7 +646,7 @@ declare -A BASE_PIPINN=(
   [sel_terminal_points]=2000
   [sel_every]=50
   [sel_patience]=0
-  # 1 = E3-b reference checkpoint schedule (iters 1-10, every 10th, final).
+  # 1 = FD-reference checkpoint schedule (every completed outer iterate).
   [e3b_checkpoints]=0
 )
 
@@ -1053,7 +1048,7 @@ fi
 #   run_pipinn auto m_states=3 pres_target=$PT eval_epochs=1000
 # done
 
-# --- E3-b exact-map reference (low-dimensional, checkpoints ON) ------------
+# --- Liu M=1 FD frozen-policy reference (all outer checkpoints ON) ----------
 # run_pipinn auto m_states=1 e3b_checkpoints=1
 
 # --- E8 timing runs (all diagnostics off) ----------------------------------
@@ -1080,11 +1075,7 @@ if [[ "$SWEEP_PROFILE" == "main" && "${AGGREGATE:-1}" == "1" ]]; then
   echo "[aggregate] computing seed statistics (mean / std / 95% CI) ..."
   aggregate_args=(--out-root "$OUT_ROOT")
   if (( ${#SEED_LIST[@]} > 0 )); then
-    if [[ "$STRICT_PAPER_AGGREGATION" == "1" ]]; then
-      aggregate_args+=(--expected-seeds "1-10" --min-runs 10)
-    else
-      aggregate_args+=(--expected-seeds "$SEEDS" --min-runs "${#SEED_LIST[@]}")
-    fi
+    aggregate_args+=(--expected-seeds "$SEEDS" --min-runs "${#SEED_LIST[@]}")
     aggregate_args+=(--expected-n-assets 30 --expected-m-states "1,3,5" --expected-models "pinn,pipinn")
   fi
   if "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" "${aggregate_args[@]}"; then

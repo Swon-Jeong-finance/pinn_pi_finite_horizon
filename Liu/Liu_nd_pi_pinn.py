@@ -65,6 +65,7 @@ from experiment_utils import (
     add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
     parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
+    normalized_control_stats,
 )
 from liu_risk_premium import (
     RISK_PREMIUM_MODES,
@@ -82,11 +83,11 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(description="Liu ND PIPINN experiment runner")
     add_common_experiment_args(parser, model_type_default="pipinn")
 
-    parser.add_argument("--theta-init-method", type=str, default="zero", choices=["myopic", "zero", "closed_form"])
+    parser.add_argument("--theta-init-method", type=str, default="myopic", choices=["myopic", "zero", "closed_form"])
     parser.add_argument("--theta-init-scale", type=float, default=1.0,
                         help="theta_0 = scale * theta_init(method). Nondegenerate fixed-point "
                              "perturbation for the contraction pilot (e.g. 0.5, 1.5); 1.0 = unchanged.")
-    parser.add_argument("--theta-clip-abs", type=none_or_float, default=3.0)
+    parser.add_argument("--theta-clip-abs", type=none_or_float, default=None)
     parser.add_argument("--risk-premium-mode", choices=RISK_PREMIUM_MODES, default="affine",
                         help="affine benchmark or the paper's aligned tanh perturbation.")
     parser.add_argument("--nonaffine-eps", type=float, default=0.0,
@@ -139,7 +140,7 @@ def build_arg_parser():
                              "the policy function stays frozen (source = previous iterate / "
                              "analytic init). 0 = single fixed batch per policy evaluation.")
     parser.add_argument("--e3b-checkpoints", action="store_true",
-                        help="E3-b reference schedule: save iterates 1-10, then every 10th, and the final one.")
+                        help="FD-reference schedule: save every completed outer iterate.")
     return parser
 
 
@@ -242,19 +243,40 @@ weight_dir = ARGS.weight_root or f"weights/pi-pinn/{_default_exp_name}"
 os.makedirs(weight_dir, exist_ok=True)
 output_dir = ARGS.output_root or f"outputs/pi-pinn/{_default_exp_name}"
 os.makedirs(output_dir, exist_ok=True)
+
+# Validate launch-only invariants before quarantining an older run.  Invalid
+# command lines must fail without moving valid checkpoints or provenance.
+if ARGS.pres_target is not None and (not ARGS.val_points or ARGS.val_points <= 0):
+    raise SystemExit("[config error] --pres-target requires --val-points > 0 (held-out set is the stopping rule).")
+if (
+    RISK_PREMIUM_MODE == "tanh"
+    and NONAFFINE_EPS > 0.0
+    and ARGS.theta_init_method == "closed_form"
+):
+    raise SystemExit(
+        "[config error] --theta-init-method=closed_form is unavailable for "
+        "non-affine eps>0; use myopic or zero."
+    )
+if (
+    not ARGS.eval_only
+    and ARGS.stop_flag_path
+    and os.path.exists(ARGS.stop_flag_path)
+):
+    print(
+        f"[early-stop] shared stop flag already exists; preserving the current "
+        f"run artifacts unchanged: {ARGS.stop_flag_path}"
+    )
+    raise SystemExit(0)
+
 recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
 if ARGS.eval_only:
     # Eval-only must NOT touch training-time provenance (config.json etc.).
     recorder.save_config_eval()
 else:
-    recorder.save_config()
-    # A NEW training run must start with FRESH per-run CSVs: appending onto a
-    # previous same-tag run interleaves two experiments in one file.
+    # Quarantine the complete previous attempt before creating the new
+    # canonical config/checkpoint namespace.
     recorder.rotate_training_logs()
-
-# Config sanity: a residual target without a validation set cannot stop.
-if ARGS.pres_target is not None and (not ARGS.val_points or ARGS.val_points <= 0):
-    raise SystemExit("[config error] --pres-target requires --val-points > 0 (held-out set is the stopping rule).")
+    recorder.save_config()
 
 # Time domain (τ = remaining horizon = T - t)
 tau_max = ARGS.tau_max
@@ -1557,9 +1579,12 @@ class PIPINN_KimOmbergND:
             print(f"  selection set : {sel_points} interior / {sel_terminal_points} terminal "
                   f"(check every {sel_every} epochs, patience {sel_patience}, restore ON)")
 
-        # Fixed Q_ev diagnostic set (E3-a e_n + stability margins). Built from
-        # the MARKET seed so all training seeds and both methods share it.
+        # Fixed Q_ev diagnostics plus a dedicated full-window Q_col design for
+        # frozen-policy ellipticity.  Both use the MARKET seed so all training
+        # seeds and both methods share exactly the same points, independently
+        # of val_points and inner-best selection settings.
         diag = None
+        diag_col = None
         if diag_points and diag_points > 0 and not timing_mode:
             diag = build_diag_set(
                 int(diag_points), float(diag_margin), self.M, self.N, self.gamma, self.r,
@@ -1567,8 +1592,13 @@ class PIPINN_KimOmbergND:
                 cf_sol, lam0, Lam, Gamma, market_seed=MARKET_SEED,
                 include_affine_reference=HAS_AFFINE_REFERENCE,
             )
+            diag_col = build_validation_set(
+                int(diag_points), 1, self.device, self.M,
+                X_min, X_max, W_min, W_max, tau_max, seed=MARKET_SEED,
+            )
             _diag_kind = "e_n / margins" if HAS_AFFINE_REFERENCE else "model-side margins only"
-            print(f"  diag set      : {diag_points} pts on Q_ev(margin={diag_margin}) for {_diag_kind}")
+            print(f"  diag set      : {diag_points} pts on Q_ev(margin={diag_margin}) for {_diag_kind} "
+                  f"+ {diag_points} pts on Q_col for frozen-policy ellipticity")
 
         best_eval_loss = float("inf")
         best_iter = 0
@@ -1618,7 +1648,10 @@ class PIPINN_KimOmbergND:
             "e_Vw_sup", "e_Vww_sup", "e_Vwx_sup",
             "diag_RelL2_V", "diag_RelL2_theta",
             "m_ww", "M_num", "guard_frac_ev",
+            "frozen_policy_iter", "improved_policy_iter",
             "lam_min_sigma_frozen", "lam_max_sigma_frozen", "clip_frac_frozen",
+            "vartheta_l2_min", "vartheta_l2_max",
+            "vartheta_component_min", "vartheta_component_max", "vartheta_abs_max",
             "lr", "best_eval_loss", "bad_count", "stop_active", "stop_is_bad",
             "stopped", "stop_reason", "elapsed_sec",
         ]
@@ -1692,6 +1725,7 @@ class PIPINN_KimOmbergND:
             # Frozen policy on the held-out points (same rule, same clipping)
             # and the resulting per-outer validation evaluator.
             val_fn = None
+            theta_val = None
             frozen_lam_min = ""
             frozen_lam_max = ""
             frozen_clip_frac = ""
@@ -1705,6 +1739,39 @@ class PIPINN_KimOmbergND:
                         method=theta_init_method)
                 theta_val = theta_val.detach()
                 val_fn = lambda: self.evaluate_heldout_pres(theta_val, val_set)
+
+            # Ellipticity concerns the FROZEN policy used in this evaluation
+            # (alpha_{it-1}) on a dedicated Q_col design.  It is independent
+            # of held-out validation and inner-best selection settings.
+            _do_frozen_diag = (
+                diag_col is not None and not timing_mode
+                and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
+            )
+            if _do_frozen_diag:
+                if it > 1:
+                    _theta_diag = self.policy_improvement_chunked(
+                        diag_col["w_int"], diag_col["x_int"], diag_col["tau_int"]
+                    )
+                else:
+                    _theta_diag = self.initialize_theta(
+                        diag_col["w_int"], diag_col["x_int"], diag_col["tau_int"],
+                        method=theta_init_method,
+                    )
+                _theta_diag = _theta_diag.detach()
+                _tv = _theta_diag.cpu().numpy()
+                _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
+                frozen_lam_min = float(np.min(_lmin))
+                frozen_lam_max = float(np.max(_lmax))
+                if self.theta_clip_abs is not None:
+                    _c = float(self.theta_clip_abs)
+                    frozen_clip_frac = float(
+                        np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1))
+                    )
+                if it == 1:
+                    results["theta0_lam_min_sigma"] = frozen_lam_min
+                    results["theta0_lam_max_sigma"] = frozen_lam_max
+                    print(f"  [init policy] lam(Sigma^theta0) on Q_col subsample: "
+                          f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
 
             sel_fn = None
             if sel_set is None and self.lr_schedule == "carry_plateau" and it == 1:
@@ -1720,31 +1787,6 @@ class PIPINN_KimOmbergND:
                         method=theta_init_method)
                 theta_sel = theta_sel.detach()
                 sel_fn = lambda: self.evaluate_heldout_pres(theta_sel, sel_set)
-
-                # Ellipticity of the FROZEN policy alpha_n on Q_col: reuse
-                # theta_val (already computed on the held-out points, which
-                # sample the FULL collocation window) -- no extra autograd.
-                # Cost control: only a FIXED Q_col subsample (first
-                # diag_points held-out points) and only on the diag schedule;
-                # iteration 1 (initial-policy nondegeneracy) and the final
-                # iteration always run.
-                _do_frozen_diag = (
-                    diag_points and diag_points > 0 and not timing_mode
-                    and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
-                )
-                if _do_frozen_diag:
-                    _tv = theta_val[: int(diag_points)].cpu().numpy()
-                    _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
-                    frozen_lam_min = float(np.min(_lmin))
-                    frozen_lam_max = float(np.max(_lmax))
-                    if self.theta_clip_abs is not None:
-                        _c = float(self.theta_clip_abs)
-                        frozen_clip_frac = float(np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1)))
-                    if it == 1:
-                        results["theta0_lam_min_sigma"] = frozen_lam_min
-                        results["theta0_lam_max_sigma"] = frozen_lam_max
-                        print(f"  [init policy] lam(Sigma^theta0) on Q_col subsample: "
-                              f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
 
             # LR protocol for this outer iteration (inner_plateau: reset).
             self.prepare_optimizer_for_outer()
@@ -1795,11 +1837,12 @@ class PIPINN_KimOmbergND:
 
             # Snapshot the current iterate v~_n (state right after policy
             # evaluation at outer iter `it`). Main runs keep this OFF; the
-            # E3-b reference schedule saves iters 1-10, then every 10th, and
-            # the final iterate (added after the loop).
+            # FD-reference mode retains every completed outer iterate.  The
+            # approximation-hypothesis audit needs 11--19 as well as the old
+            # sparse 1--10/every-10 schedule.
             _save_this_iter = False
             if e3b_checkpoints:
-                _save_this_iter = (it <= 10) or (it % 10 == 0)
+                _save_this_iter = True
             elif save_iterate_every and save_iterate_every > 0:
                 _save_this_iter = (it % save_iterate_every == 0)
             if _save_this_iter:
@@ -1952,9 +1995,16 @@ class PIPINN_KimOmbergND:
                     "m_ww": diag_res.get("m_ww", ""),
                     "M_num": diag_res.get("M_num", ""),
                     "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
+                    "frozen_policy_iter": it - 1,
+                    "improved_policy_iter": it,
                     "lam_min_sigma_frozen": frozen_lam_min,
                     "lam_max_sigma_frozen": frozen_lam_max,
                     "clip_frac_frozen": frozen_clip_frac,
+                    "vartheta_l2_min": diag_res.get("vartheta_l2_min", ""),
+                    "vartheta_l2_max": diag_res.get("vartheta_l2_max", ""),
+                    "vartheta_component_min": diag_res.get("vartheta_component_min", ""),
+                    "vartheta_component_max": diag_res.get("vartheta_component_max", ""),
+                    "vartheta_abs_max": diag_res.get("vartheta_abs_max", ""),
                     "lr": lr_now,
                     "best_eval_loss": best_eval_loss,
                     "bad_count": stop_meta.get("bad_count", ""),
@@ -2678,10 +2728,11 @@ def eval_diag_metrics(model, diag, M, N, gamma,
                       chunk=4096):
     """One diagnostic pass on the fixed Q_EV set.
 
-    Always returns model-side margins m_ww, M_num, and guard_frac.  The e_n
-    and RelL2 fields are returned only when ``diag`` contains an exact affine
-    reference; for tanh eps>0 those fields would conflate deformation with
-    solver error and are intentionally omitted.
+    Always returns model-side margins, guard fraction, and the improved
+    normalized-control range on Q_ev.  The e_n and RelL2 fields are returned
+    only when ``diag`` contains an exact affine reference; for tanh eps>0
+    those fields would conflate deformation with solver error and are
+    intentionally omitted.
     """
     was_training = model.training
     model.eval()
@@ -2710,8 +2761,18 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     lam_x = actual_risk_premium_numpy(diag["x_np"], lam0_np, Lam_np)  # (P, N)
     numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
     M_num = float(np.max(np.linalg.norm(numer, axis=1)))
+    theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
+    vartheta_stats = normalized_control_stats(
+        torch.from_numpy(theta_hat),
+        torch.from_numpy(np.asarray(diag["w_np"]).reshape(-1, 1)),
+    )
 
-    out = {"m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac}
+    out = {
+        "m_ww": m_ww,
+        "M_num": M_num,
+        "guard_frac_ev": guard_frac,
+        **vartheta_stats,
+    }
     if not bool(diag.get("has_affine_reference", False)):
         return out
 
@@ -2735,7 +2796,6 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     # side uses the exact (negative) V_ww*.
     rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
                      / max(np.linalg.norm(diag["V_cf"]), 1e-300))
-    theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
     numer_cf = lam_x * diag["Vw_cf"][:, None] + diag["Vwx_cf"] @ Gamma_np.T
     theta_cf = -numer_cf / diag["Vww_cf"][:, None]
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
