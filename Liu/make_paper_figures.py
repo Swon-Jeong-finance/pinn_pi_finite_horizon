@@ -14,7 +14,7 @@ It does NOT train models. It reads saved outputs such as:
   run_dir/metrics.csv
   run_dir/market_params.npz
   run_dir/closed_form_ode.npz
-  weight_dir/value_net_best.pt
+  weight_dir/value_net_final.pt
 
 Typical sweep layout:
 
@@ -33,7 +33,6 @@ Recommended example:
     --exp-list baseline,m_states1,m_states3,m_states5 \
     --models both \
     --summary-metrics \
-    --plot-train \
     --plot-policy-convergence \
     --plot-value \
     --plot-portfolio \
@@ -42,8 +41,9 @@ Recommended example:
 Design choices:
   - Figure/subplot titles are intentionally omitted for paper use.
   - Console print() messages identify every figure that is saved.
-  - PINN train curve uses per-pseudo-outer best loss from train_history.csv.
-  - PI-PINN train curve uses outer_history.csv eval_loss for the default total loss.
+  - The legacy train-loss view is exploratory, is produced only by an explicit
+    --plot-train, and is not a paper comparison: PINN uses per-pseudo-outer
+    best loss while PI-PINN uses outer_history.csv eval_loss by default.
   - Metrics are summarized into long, wide, and compact paper-table CSV files.
 """
 
@@ -69,6 +69,8 @@ from matplotlib.colors import TwoSlopeNorm
 
 import torch
 import torch.nn as nn
+
+from experiment_utils import parse_eval_margins, safe_concave_vww, shrink_bounds
 
 
 # =============================================================================
@@ -158,6 +160,44 @@ def cfg_get(config: Dict[str, Any], key: str, default: Any = None) -> Any:
     return default
 
 
+def read_effective_eval_config(run_dir: Path) -> Dict[str, Any]:
+    """Read training config plus a completed eval-only settings overlay.
+
+    ``config_eval.json`` is written before an eval-only pass starts, so its
+    mere presence is not enough: a failed pass must not redefine the window
+    used by the still-existing metrics.  Apply only evaluation knobs and only
+    after the eval-scoped success marker/status agree and metrics.csv is not
+    older than the eval config.
+    """
+    cfg_path = run_dir / 'config.json'
+    base = read_json(cfg_path)
+    eval_path = run_dir / 'config_eval.json'
+    status_path = run_dir / 'status_eval.json'
+    metrics_path = run_dir / 'metrics.csv'
+    if not eval_path.exists() or not (run_dir / '_SUCCESS_EVAL').exists():
+        return base
+    try:
+        if str(read_json(status_path).get('status', '')) != 'success':
+            return base
+        if metrics_path.exists() and metrics_path.stat().st_mtime + 1e-6 < eval_path.stat().st_mtime:
+            return base
+        eval_cfg = read_json(eval_path)
+        eval_args = eval_cfg.get('args', {})
+        if not isinstance(eval_args, dict):
+            return base
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return base
+
+    merged = dict(base)
+    base_args = base.get('args', {})
+    merged_args = dict(base_args) if isinstance(base_args, dict) else {}
+    for key in ('test_points', 'eval_margin', 'n_tau', 'n_x', 'w_levels'):
+        if key in eval_args:
+            merged_args[key] = eval_args[key]
+    merged['args'] = merged_args
+    return merged
+
+
 def get_first_np_scalar(npz: np.lib.npyio.NpzFile, key: str, default: Any = None) -> Any:
     if key not in npz.files:
         return default
@@ -172,7 +212,7 @@ def safe_label_for_model(model_key: str) -> str:
     if model_key == 'pinn':
         return 'PINN'
     if model_key == 'pipinn':
-        return 'PINN-PI'
+        return 'PI-PINN'
     return str(model_key)
 
 
@@ -345,7 +385,7 @@ def summary_dir(args: argparse.Namespace) -> Path:
 
 
 def train_fig_dir(args: argparse.Namespace) -> Path:
-    return common_fig_root(args) / 'train'
+    return common_fig_root(args) / 'exploratory_train'
 
 
 def save_fig(fig: plt.Figure, path: Path, args: argparse.Namespace, *, kind: str, tight: bool = True) -> None:
@@ -386,8 +426,9 @@ def load_weight_path(run: RunInfo, args: argparse.Namespace) -> Path:
     if args.weight_name:
         candidates.append(run.weight_dir / args.weight_name)
     candidates.extend([
-        run.weight_dir / 'value_net_best.pt',
+        run.weight_dir / 'value_net_final.pt',
         run.weight_dir / 'value_net_last.pt',
+        run.weight_dir / 'value_net_best.pt',
     ])
     # Also search legacy descriptive best weights if needed.
     if run.weight_dir.exists():
@@ -411,7 +452,7 @@ def load_run_objects(run: RunInfo, args: argparse.Namespace, device: torch.devic
     if not cf_path.exists():
         raise FileNotFoundError(f"Missing closed_form_ode.npz: {cf_path}")
 
-    cfg = read_json(cfg_path)
+    cfg = read_effective_eval_config(run.run_dir)
     market = np.load(market_path)
     cf = np.load(cf_path)
 
@@ -499,9 +540,7 @@ def compute_optimal_theta_nd(model: nn.Module, w: torch.Tensor, x: torch.Tensor,
     lam_x = lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', Lam_t, x)
     Gamma_Vwx = torch.einsum('ij,bj->bi', Gamma_t, V_wx)
     numerator = lam_x * V_w + Gamma_Vwx
-    V_ww_safe = torch.where(torch.abs(V_ww) < 1e-8,
-                            torch.sign(V_ww) * 1e-8 + 1e-10,
-                            V_ww)
+    V_ww_safe = safe_concave_vww(V_ww)
     theta = -numerator / V_ww_safe
     theta_norm = theta / w
 
@@ -520,12 +559,15 @@ def compute_optimal_theta_nd(model: nn.Module, w: torch.Tensor, x: torch.Tensor,
 def eval_model_on_tau_X_grid(model: nn.Module, market: np.lib.npyio.NpzFile, *,
                              w_fixed: float, dimX: int, x_fixed: np.ndarray,
                              device: torch.device, N_tau: int, N_X: int,
-                             tau_min: float, tau_max: float, chunk: int = 4096
+                             tau_min: float, tau_max: float,
+                             x_lo: Optional[np.ndarray] = None,
+                             x_hi: Optional[np.ndarray] = None,
+                             chunk: int = 4096
                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     M = int(market['xbar'].shape[0])
     N = int(market['lam0'].shape[0])
-    X_min = market['X_min']
-    X_max = market['X_max']
+    X_min = np.asarray(market['X_min'] if x_lo is None else x_lo, dtype=float)
+    X_max = np.asarray(market['X_max'] if x_hi is None else x_hi, dtype=float)
 
     tau_vals = np.linspace(tau_min, tau_max, N_tau)
     X_vals = np.linspace(X_min[dimX], X_max[dimX], N_X)
@@ -571,12 +613,14 @@ def eval_model_on_tau_X_grid(model: nn.Module, market: np.lib.npyio.NpzFile, *,
 def eval_closed_form_on_tau_X_grid(market: np.lib.npyio.NpzFile, cf: np.lib.npyio.NpzFile, *,
                                    w_fixed: float, dimX: int, x_fixed: np.ndarray,
                                    N_tau: int, N_X: int, tau_min: float, tau_max: float,
-                                   gamma: float, r: float
+                                   gamma: float, r: float,
+                                   x_lo: Optional[np.ndarray] = None,
+                                   x_hi: Optional[np.ndarray] = None,
                                    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     M = int(market['xbar'].shape[0])
     N = int(market['lam0'].shape[0])
-    X_min = market['X_min']
-    X_max = market['X_max']
+    X_min = np.asarray(market['X_min'] if x_lo is None else x_lo, dtype=float)
+    X_max = np.asarray(market['X_max'] if x_hi is None else x_hi, dtype=float)
 
     tau_vals = np.linspace(tau_min, tau_max, N_tau)
     X_vals = np.linspace(X_min[dimX], X_max[dimX], N_X)
@@ -993,6 +1037,8 @@ def group_runs_by_suffix(runs: Sequence[RunInfo]) -> Dict[str, Dict[str, RunInfo
 
 
 def plot_train_curves(runs: Sequence[RunInfo], args: argparse.Namespace) -> None:
+    print('[warn] --plot-train is an exploratory legacy diagnostic; PINN and PI-PINN '
+          'loss curves are heterogeneous and must not be used as a paper comparison.')
     grouped = group_runs_by_suffix(runs)
     ensure_dir(train_fig_dir(args))
 
@@ -1023,12 +1069,12 @@ def plot_train_curves(runs: Sequence[RunInfo], args: argparse.Namespace) -> None
             plt.close(fig)
             continue
         ax.set_xlabel('Iteration')
-        ax.set_ylabel('Loss')
+        ax.set_ylabel('Exploratory loss diagnostic (method scales differ)')
         ax.grid(True, alpha=args.grid_alpha)
         if plotted > 1 or args.force_legend:
             ax.legend()
-        path = train_fig_dir(args) / f"train_curve_{suffix}_{args.curve_model}_{args.train_loss}.{args.format}"
-        save_fig(fig, path, args, kind=f'train curve ({suffix})')
+        path = train_fig_dir(args) / f"exploratory_train_curve_{suffix}_{args.curve_model}_{args.train_loss}.{args.format}"
+        save_fig(fig, path, args, kind=f'exploratory train diagnostic ({suffix})')
 
 
 def plot_policy_convergence(runs: Sequence[RunInfo], args: argparse.Namespace) -> None:
@@ -1117,6 +1163,12 @@ def plot_heatmaps_for_run(run: RunInfo, args: argparse.Namespace, device: torch.
     r = obj['r']
     tau_max = float(args.tau_max if args.tau_max is not None else obj['tau_max'])
     tau_min = float(args.tau_min)
+    primary_margin = parse_eval_margins(str(cfg_get(obj['cfg'], 'eval_margin', '0.10')))[0]
+    X_lo, X_hi = shrink_bounds(
+        np.asarray(market['X_min'], dtype=float),
+        np.asarray(market['X_max'], dtype=float),
+        primary_margin,
+    )
 
     dimX = int(args.dim_x)
     if dimX < 0 or dimX >= M:
@@ -1128,15 +1180,17 @@ def plot_heatmaps_for_run(run: RunInfo, args: argparse.Namespace, device: torch.
     ensure_dir(save_dir)
 
     for w_test in w_levels:
-        print(f"[eval] {run.run_name}: w={w_test:.4g}, dimX={dimX}, grid=({args.n_tau},{args.n_x})")
+        print(f"[eval] {run.run_name}: w={w_test:.4g}, dimX={dimX}, "
+              f"eval_margin={primary_margin:g}, grid=({args.n_tau},{args.n_x})")
         tau_grid, X_grid, V_model, theta_model, myopic_model, hedging_model = eval_model_on_tau_X_grid(
             model, market, w_fixed=w_test, dimX=dimX, x_fixed=x_fixed, device=device,
-            N_tau=args.n_tau, N_X=args.n_x, tau_min=tau_min, tau_max=tau_max, chunk=args.chunk
+            N_tau=args.n_tau, N_X=args.n_x, tau_min=tau_min, tau_max=tau_max,
+            x_lo=X_lo, x_hi=X_hi, chunk=args.chunk
         )
         _, _, V_cf, theta_cf, myopic_cf, hedging_cf = eval_closed_form_on_tau_X_grid(
             market, cf, w_fixed=w_test, dimX=dimX, x_fixed=x_fixed,
             N_tau=args.n_tau, N_X=args.n_x, tau_min=tau_min, tau_max=tau_max,
-            gamma=gamma, r=r
+            gamma=gamma, r=r, x_lo=X_lo, x_hi=X_hi
         )
 
         w_tag = f"w{w_test:.2f}"
@@ -1185,7 +1239,7 @@ def infer_assets_states(run: RunInfo, config: Optional[Dict[str, Any]]) -> Tuple
 
 def collect_metrics(runs: Sequence[RunInfo], args: argparse.Namespace) -> List[Dict[str, Any]]:
     all_rows: List[Dict[str, Any]] = []
-    target_w = str(args.metric_w).strip().lower()
+    target_margin = str(args.metric_margin).strip().lower()
 
     for run in runs:
         metrics_path = run.run_dir / 'metrics.csv'
@@ -1193,25 +1247,28 @@ def collect_metrics(runs: Sequence[RunInfo], args: argparse.Namespace) -> List[D
         if not metrics_path.exists():
             print(f"[warn] metrics skipped; missing {metrics_path}")
             continue
-        cfg = read_json(cfg_path) if cfg_path.exists() else None
+        cfg = read_effective_eval_config(run.run_dir) if cfg_path.exists() else None
         assets, states = infer_assets_states(run, cfg)
         raw_rows = read_csv_rows(metrics_path)
 
-        # Determine w to use for compact paper tables. Long/wide summaries keep all rows unless numeric filter is requested.
-        available_w = sorted({str(r.get('w', '')).strip() for r in raw_rows if str(r.get('w', '')).strip()})
-        if target_w == 'auto':
-            selected_w = available_w[0] if available_w else ''
-        elif target_w == 'all':
-            selected_w = None
+        if target_margin == 'auto':
+            config_margins = parse_eval_margins(str(cfg_get(cfg or {}, 'eval_margin', '0.10')))
+            selected_margin = config_margins[0]
+        elif target_margin == 'all':
+            selected_margin = None
         else:
-            selected_w = str(args.metric_w)
+            selected_margin = float(args.metric_margin)
 
         for row in raw_rows:
-            w_val = str(row.get('w', '')).strip()
-            if selected_w is not None and w_val != selected_w:
-                # Let exact string fail; try numeric equality.
-                if not (abs(to_float(w_val) - to_float(selected_w)) < 1e-12):
-                    continue
+            scope = str(row.get('scope', '')).strip()
+            if scope != 'fulldim':
+                continue
+            margin = to_float(row.get('eval_margin'))
+            if math.isnan(margin):
+                continue
+            if selected_margin is not None and not math.isclose(
+                    margin, float(selected_margin), rel_tol=0.0, abs_tol=1e-12):
+                continue
             metric = row.get('metric', '')
             value = to_float(row.get('value'))
             all_rows.append({
@@ -1221,7 +1278,8 @@ def collect_metrics(runs: Sequence[RunInfo], args: argparse.Namespace) -> List[D
                 'method': run.method_label,
                 'assets': assets if assets is not None else '',
                 'states': states if states is not None else '',
-                'w': w_val,
+                'scope': scope,
+                'eval_margin': margin,
                 'metric': metric,
                 'value': value,
                 'value_sci': sci_fmt(value, args.sci_precision),
@@ -1235,7 +1293,8 @@ def make_metric_wide_rows(long_rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dic
     metric_names: List[str] = []
 
     for row in long_rows:
-        key = (row['run_name'], row['suffix'], row['model_key'], row['method'], row['assets'], row['states'], row['w'])
+        key = (row['run_name'], row['suffix'], row['model_key'], row['method'],
+               row['assets'], row['states'], row['scope'], row['eval_margin'])
         g = groups.setdefault(key, {
             'run_name': row['run_name'],
             'suffix': row['suffix'],
@@ -1243,7 +1302,8 @@ def make_metric_wide_rows(long_rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dic
             'method': row['method'],
             'assets': row['assets'],
             'states': row['states'],
-            'w': row['w'],
+            'scope': row['scope'],
+            'eval_margin': row['eval_margin'],
         })
 
         metric = str(row['metric'])
@@ -1316,7 +1376,7 @@ def make_metric_wide_rows(long_rows: Sequence[Dict[str, Any]]) -> Tuple[List[Dic
 
     rows = sorted(groups.values(), key=sort_key)
 
-    base_fields = ['run_name', 'suffix', 'model_key', 'method', 'assets', 'states', 'w']
+    base_fields = ['run_name', 'suffix', 'model_key', 'method', 'assets', 'states', 'scope', 'eval_margin']
     ordered_metric_names = sorted(metric_names, key=metric_order)
     fields = base_fields + ordered_metric_names
 
@@ -1339,7 +1399,8 @@ def make_paper_table_rows(wide_rows: Sequence[Dict[str, Any]], args: argparse.Na
             'Value_raw': v,
             'Portfolio_raw': p,
             'Run': row.get('run_name', ''),
-            'w': row.get('w', ''),
+            'scope': row.get('scope', ''),
+            'eval_margin': row.get('eval_margin', ''),
         })
 
     def sort_key(r: Dict[str, Any]):
@@ -1374,7 +1435,8 @@ def summarize_metrics(runs: Sequence[RunInfo], args: argparse.Namespace) -> None
         print('[warn] no metrics rows collected.')
         return
 
-    long_fields = ['run_name', 'suffix', 'model_key', 'method', 'assets', 'states', 'w', 'metric', 'value', 'value_sci']
+    long_fields = ['run_name', 'suffix', 'model_key', 'method', 'assets', 'states',
+                   'scope', 'eval_margin', 'metric', 'value', 'value_sci']
     long_path = out_dir / 'selected_metrics_long.csv'
     write_csv_rows(long_path, long_rows, long_fields)
     print(f"[summary] metrics long saved: {long_path}")
@@ -1385,7 +1447,8 @@ def summarize_metrics(runs: Sequence[RunInfo], args: argparse.Namespace) -> None
     print(f"[summary] metrics wide saved: {wide_path}")
 
     paper_rows = make_paper_table_rows(wide_rows, args)
-    paper_fields = ['Assets', 'States', 'Method', 'Value', 'Portfolio', 'Value_raw', 'Portfolio_raw', 'Run', 'w']
+    paper_fields = ['Assets', 'States', 'Method', 'Value', 'Portfolio', 'Value_raw',
+                    'Portfolio_raw', 'Run', 'scope', 'eval_margin']
     paper_path = out_dir / 'paper_relative_rmse_table.csv'
     write_csv_rows(paper_path, paper_rows, paper_fields)
     print(f"[summary] paper table CSV saved: {paper_path}")
@@ -1417,11 +1480,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Actions
     p.add_argument('--summary-metrics', action='store_true', help='Collect metrics.csv from selected runs.')
-    p.add_argument('--plot-train', action='store_true', help='Plot train curves using outer-iteration x-axis.')
+    p.add_argument(
+        '--plot-train',
+        action='store_true',
+        help='Exploratory legacy diagnostic only (must be requested explicitly): plot '
+             'heterogeneous PINN/PI-PINN loss curves; not a paper comparison.',
+    )
     p.add_argument('--plot-policy-convergence', action='store_true', help='Plot PI-PINN eval loss and theta_diff.')
     p.add_argument('--plot-value', action='store_true', help='Plot value-function tau-X heatmaps from saved weights.')
     p.add_argument('--plot-portfolio', action='store_true', help='Plot portfolio tau-X heatmaps from saved weights.')
-    p.add_argument('--plot-all', action='store_true', help='Enable all plot types and metrics summary.')
+    p.add_argument(
+        '--plot-all',
+        action='store_true',
+        help='Enable paper plot types and metrics summary; excludes exploratory --plot-train.',
+    )
 
     # Train/convergence curves
     p.add_argument('--curve-model', choices=['pinn', 'pipinn', 'both'], default='both')
@@ -1431,7 +1503,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Heatmap settings
     p.add_argument('--device', type=str, default='auto')
-    p.add_argument('--weight-name', type=str, default='', help='Specific weight filename; default value_net_best.pt.')
+    p.add_argument('--weight-name', type=str, default='',
+                   help='Specific weight filename; default search is final, last, then legacy best.')
     p.add_argument('--w-levels', type=str, default='0.5')
     p.add_argument('--dim-x', type=int, default=0)
     p.add_argument('--tau-min', type=float, default=0.0)
@@ -1496,10 +1569,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--single-row-fig-height', type=float, default=3.8)
 
     # Metrics summary
-    p.add_argument('--metric-w', type=str, default='auto',
-                   help='Which w to summarize from metrics.csv: auto, all, or a numeric value such as 0.5.')
-    p.add_argument('--paper-value-metric', type=str, default='RelRMSE_V')
-    p.add_argument('--paper-portfolio-metric', type=str, default='RelRMSE_theta')
+    p.add_argument('--metric-w', type=str, default='',
+                   help='Deprecated compatibility option; full-dimensional metrics have no w column.')
+    p.add_argument('--metric-margin', type=str, default='0.10',
+                   help='Full-dimensional eval_margin to summarize: 0.10 (default), auto, or all.')
+    p.add_argument('--paper-value-metric', type=str, default='RelL2_V')
+    p.add_argument('--paper-portfolio-metric', type=str, default='RelL2_theta')
     p.add_argument('--sci-precision', type=int, default=2)
     p.add_argument('--write-latex', action='store_true', help='Also write a compact LaTeX table.')
 
@@ -1512,16 +1587,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.plot_all:
         args.summary_metrics = True
-        args.plot_train = True
         args.plot_policy_convergence = True
         args.plot_value = True
         args.plot_portfolio = True
 
     # If the user runs the script with no action flags, do the cheap/default outputs.
     if not any([args.summary_metrics, args.plot_train, args.plot_policy_convergence, args.plot_value, args.plot_portfolio]):
-        print('[info] no action flags given; defaulting to --summary-metrics --plot-train --plot-policy-convergence')
+        print('[info] no action flags given; defaulting to --summary-metrics --plot-policy-convergence')
         args.summary_metrics = True
-        args.plot_train = True
         args.plot_policy_convergence = True
 
     apply_plot_style(args)

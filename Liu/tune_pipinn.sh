@@ -12,6 +12,7 @@ set -euo pipefail
 #   RERUN_STOPPED=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   SEEDS="1,2,3,4,5,6,7,8,9,10" DEVICE_LIST="cuda:0,cuda:1" bash tune_pipinn.sh /workspace/outputs/main10seed
 #   AGGREGATE=0 bash tune_pipinn.sh ...   # skip the automatic seed aggregation step
+#   STRICT_PAPER_AGGREGATION=0 SEEDS="1,2" bash tune_pipinn.sh ...  # smoke/non-paper sweep
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
@@ -41,6 +42,10 @@ PDE_STOP_PATIENCE="${PDE_STOP_PATIENCE:-20}"
 # pass seed=... explicitly are left untouched. When SEEDS is empty, behavior
 # is identical to the original single-seed script (BASE seed).
 SEEDS="${SEEDS:-}"
+# Main-paper default: a multi-seed launch is valid only for the exact seed
+# set 1..10, and a failed post-run audit makes the launcher fail.  Explicitly
+# disable this only for smoke tests or non-paper sweeps.
+STRICT_PAPER_AGGREGATION="${STRICT_PAPER_AGGREGATION:-1}"
 
 # Cap CPU thread pools: parallel workers otherwise oversubscribe cores
 # (each process would spawn nproc-sized OMP/MKL pools).
@@ -54,6 +59,30 @@ SEED_LIST=()
 if [[ -n "$SEEDS" ]]; then
   IFS=', ' read -ra SEED_LIST <<< "$SEEDS"
   echo "[info] multi-seed mode: seeds = ${SEED_LIST[*]}"
+  if [[ "$STRICT_PAPER_AGGREGATION" == "1" ]]; then
+    if (( ${#SEED_LIST[@]} != 10 )); then
+      echo "[error] paper main requires exactly 10 training seeds (1..10); got: ${SEED_LIST[*]}" >&2
+      exit 2
+    fi
+    declare -A _paper_seed_seen=()
+    for _seed in "${SEED_LIST[@]}"; do
+      if [[ ! "$_seed" =~ ^[0-9]+$ ]] || (( _seed < 1 || _seed > 10 )); then
+        echo "[error] paper main seed set must be exactly 1..10; got: ${SEED_LIST[*]}" >&2
+        exit 2
+      fi
+      if [[ -n "${_paper_seed_seen[$_seed]+x}" ]]; then
+        echo "[error] duplicate paper seed: $_seed" >&2
+        exit 2
+      fi
+      _paper_seed_seen[$_seed]=1
+    done
+    for _seed in {1..10}; do
+      if [[ -z "${_paper_seed_seen[$_seed]+x}" ]]; then
+        echo "[error] missing paper seed: $_seed" >&2
+        exit 2
+      fi
+    done
+  fi
 fi
 
 # Device worker queue.
@@ -94,8 +123,11 @@ fi
 JOB_QUEUE="$OUT_ROOT/_jobs.tsv"
 JOB_CURSOR="$OUT_ROOT/_jobs.cursor"
 JOB_LOCK="$OUT_ROOT/_jobs.lock"
+JOB_FAILURES="$OUT_ROOT/_job_failures.tsv"
+JOB_FAILURE_LOCK="$OUT_ROOT/_job_failures.lock"
 MANIFEST_LOCK="$OUT_ROOT/_manifest.lock"
 : > "$JOB_QUEUE"
+: > "$JOB_FAILURES"
 echo 0 > "$JOB_CURSOR"
 
 MANIFEST="$OUT_ROOT/_manifest.tsv"
@@ -175,10 +207,23 @@ append_manifest() {
   } 9>"$MANIFEST_LOCK"
 }
 
+append_job_failure() {
+  local tag="$1" model="$2" mode="$3" log="$4"
+  {
+    flock -x 9
+    printf "%s\t%s\t%s\t%s\n" "$tag" "$model" "$mode" "$log" >> "$JOB_FAILURES"
+  } 9>"$JOB_FAILURE_LOCK"
+}
+
 remove_run_markers() {
   local out_dir="$1"
-  rm -f "$out_dir/_DONE" "$out_dir/_SUCCESS" "$out_dir/_STOPPED_EARLY" "$out_dir/_FAILED"
-  rm -f "$out_dir/train_history.csv" "$out_dir/outer_history.csv" "$out_dir/metrics.csv" "$out_dir/status.json"
+  rm -f \
+    "$out_dir/_DONE" "$out_dir/_SUCCESS" "$out_dir/_STOPPED_EARLY" "$out_dir/_FAILED" \
+    "$out_dir/_DONE_EVAL" "$out_dir/_SUCCESS_EVAL" "$out_dir/_FAILED_EVAL"
+  # Keep CSV/status provenance here.  Once Python starts, the recorder
+  # archives the previous CSVs as *.old.<timestamp> before writing a fresh
+  # run.  If Python fails before recorder construction, the old evidence is
+  # still available and the worker's _FAILED marker prevents its reuse.
 }
 
 should_skip_run() {
@@ -191,6 +236,10 @@ should_skip_run() {
     # eval-scoped markers only.
     if [[ "$FORCE_RERUN" == "1" ]]; then
       rm -f "$out_dir/_DONE_EVAL" "$out_dir/_SUCCESS_EVAL" "$out_dir/_FAILED_EVAL"
+      return 1
+    fi
+    if [[ -f "$out_dir/_SUCCESS_EVAL" && -f "$out_dir/_FAILED_EVAL" ]]; then
+      echo "[warn] $tag has conflicting eval markers; queuing a clean eval rerun"
       return 1
     fi
     if [[ -f "$out_dir/_SUCCESS_EVAL" ]]; then
@@ -213,6 +262,20 @@ should_skip_run() {
     return 1
   fi
 
+  # Mutually exclusive terminal markers indicate an interrupted or stale
+  # rerun.  Never let an old _SUCCESS win the skip order; queue a clean
+  # attempt and let worker_loop clear the inconsistent marker set.
+  local terminal_marker_count=0 terminal_marker
+  for terminal_marker in _SUCCESS _STOPPED_EARLY _FAILED; do
+    if [[ -f "$out_dir/$terminal_marker" ]]; then
+      terminal_marker_count=$((terminal_marker_count + 1))
+    fi
+  done
+  if (( terminal_marker_count > 1 )); then
+    echo "[warn] $tag has conflicting terminal markers; queuing a clean rerun"
+    return 1
+  fi
+
   if [[ -f "$out_dir/_SUCCESS" ]]; then
     echo "[skip] $tag (success flag exists: $out_dir/_SUCCESS)"
     return 0
@@ -221,6 +284,13 @@ should_skip_run() {
   if [[ -f "$out_dir/_STOPPED_EARLY" ]]; then
     echo "[skip] $tag (stopped-early flag exists: $out_dir/_STOPPED_EARLY)"
     return 0
+  fi
+  if [[ -f "$out_dir/_FAILED" ]]; then
+    # A retained figure from an earlier successful attempt must never make a
+    # newer failed attempt look complete.  Queue it; worker_loop clears the
+    # failure marker immediately before launch.
+    echo "[retry] $tag (failed marker exists: $out_dir/_FAILED)"
+    return 1
   fi
   if [[ -f "$out_dir/_DONE" ]]; then
     echo "[skip] $tag (legacy done flag exists: $out_dir/_DONE)"
@@ -284,9 +354,19 @@ worker_loop() {
     IFS=$'\t' read -r tag model overrides out_dir weight_dir stop_flag_path log cmd <<< "$line"
     mkdir -p "$out_dir" "$weight_dir"
     if [[ "$EVAL_ONLY" == "1" ]]; then
-      rm -f "$out_dir/_FAILED_EVAL"
+      # A queued eval attempt owns only the eval-scoped markers.  Clear all
+      # mutually exclusive markers up front so an argparse/import failure
+      # cannot leave a stale success marker behind.
+      rm -f \
+        "$out_dir/_DONE_EVAL" "$out_dir/_SUCCESS_EVAL" "$out_dir/_FAILED_EVAL"
     else
-      rm -f "$out_dir/_FAILED"
+      # Do this immediately before launch as a second line of defence in
+      # addition to the recorder's marker rotation.  In particular, a
+      # failure before Python constructs the recorder must not inherit an
+      # earlier _SUCCESS marker.
+      rm -f \
+        "$out_dir/_DONE" "$out_dir/_SUCCESS" \
+        "$out_dir/_STOPPED_EARLY" "$out_dir/_FAILED"
     fi
 
     append_manifest "$tag" "$model" "$dev" "$overrides" "$log" "$out_dir" "$weight_dir"
@@ -332,9 +412,11 @@ EOF
     else
       if [[ "$EVAL_ONLY" == "1" ]]; then
         touch "$out_dir/_FAILED_EVAL"
+        append_job_failure "$tag" "$model" "eval" "$log"
         echo "[fail] $tag (eval; training markers untouched; log: $log)"
       else
         touch "$out_dir/_FAILED"
+        append_job_failure "$tag" "$model" "train" "$log"
         echo "[fail] $tag (log: $log)"
       fi
     fi
@@ -358,10 +440,22 @@ run_all_jobs() {
     pids+=("$!")
   done
 
-  local pid
+  local pid worker_failed=0
   for pid in "${pids[@]}"; do
-    wait "$pid"
+    if ! wait "$pid"; then
+      worker_failed=1
+    fi
   done
+  if (( worker_failed != 0 )) || [[ -s "$JOB_FAILURES" ]]; then
+    local n_failures
+    n_failures="$(wc -l < "$JOB_FAILURES" | tr -d ' ')"
+    if (( n_failures > 0 )); then
+      echo "[error] $n_failures queued job(s) failed; see $JOB_FAILURES" >&2
+    else
+      echo "[error] a worker process failed before recording its job; inspect $LOG_DIR" >&2
+    fi
+    return 1
+  fi
 }
 
 # ==============================
@@ -382,7 +476,7 @@ declare -A BASE_PINN=(
   [value_hidden]=256
   [value_depth]=3
   # FINAL paper config (Table 3): larger batch, longer inner solves, fewer
-  # outer blocks; lr stays 5e-4.
+  # outer blocks; lr stays 3e-4.
   [batch_size]=10000
   [lr]=3e-4
   [w_terminal]=20.0
@@ -430,6 +524,11 @@ declare -A BASE_PINN=(
   [diag_every]=1
   # 1 = E8 timing mode (all diagnostics off; wall-clock reflects core work).
   [timing_mode]=0
+  # Paper main default: evaluate and generate each run's policy figures.
+  # Set skip_figures=1 to retain metrics while suppressing only figures;
+  # set skip_eval=1 only when no post-training evaluation is wanted.
+  [skip_figures]=0
+  [skip_eval]=0
 )
 
 declare -A BASE_PIPINN=(
@@ -446,7 +545,7 @@ declare -A BASE_PIPINN=(
   [alpha_scale]=0.25
   [value_hidden]=256
   [value_depth]=3
-  # FINAL paper config (Table 3): lr stays 5e-4.
+  # FINAL paper config (Table 3): lr stays 3e-4.
   [eval_epochs]=2000
   [outer_iters]=20
   [batch_size]=10000
@@ -513,6 +612,9 @@ declare -A BASE_PIPINN=(
   [diag_points]=8192
   [diag_every]=1
   [timing_mode]=0
+  # Paper main default: evaluate and generate each run's policy figures.
+  [skip_figures]=0
+  [skip_eval]=0
   # Within-evaluation collocation resampling (inner epochs): each policy
   # evaluation redraws a fresh batch every K epochs while the POLICY FUNCTION
   # stays frozen (theta recomputed from a frozen copy of the previous
@@ -596,8 +698,14 @@ run_pinn_single() {
   local diag_points="${OVR[diag_points]:-${BASE_PINN[diag_points]}}"
   local diag_every="${OVR[diag_every]:-${BASE_PINN[diag_every]}}"
   local timing_mode="${OVR[timing_mode]:-${BASE_PINN[timing_mode]}}"
+  local skip_figures="${OVR[skip_figures]:-${BASE_PINN[skip_figures]}}"
+  local skip_eval="${OVR[skip_eval]:-${BASE_PINN[skip_eval]}}"
   local timing_flag=()
   [[ "$timing_mode" == "1" ]] && timing_flag=(--timing-mode)
+  local skip_figures_flag=()
+  [[ "$skip_figures" == "1" ]] && skip_figures_flag=(--skip-figures)
+  local skip_eval_flag=()
+  [[ "$skip_eval" == "1" ]] && skip_eval_flag=(--skip-eval)
 
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
@@ -642,7 +750,7 @@ run_pinn_single() {
     --val-points "$val_points" --val-terminal-points "$val_terminal_points" --val-every "$val_every" \
     --market-seed "$market_seed" --test-points "$test_points" --diag-points "$diag_points" --diag-every "$diag_every" \
     --output-root "$run_output_root" --weight-root "$run_weight_root" \
-    "${timing_flag[@]}" "${eval_only_flag[@]}"
+    "${timing_flag[@]}" "${skip_figures_flag[@]}" "${skip_eval_flag[@]}" "${eval_only_flag[@]}"
 }
 
 # run_pinn <tag|auto> key=val ...
@@ -733,6 +841,8 @@ run_pipinn_single() {
   local diag_points="${OVR[diag_points]:-${BASE_PIPINN[diag_points]}}"
   local diag_every="${OVR[diag_every]:-${BASE_PIPINN[diag_every]}}"
   local timing_mode="${OVR[timing_mode]:-${BASE_PIPINN[timing_mode]}}"
+  local skip_figures="${OVR[skip_figures]:-${BASE_PIPINN[skip_figures]}}"
+  local skip_eval="${OVR[skip_eval]:-${BASE_PIPINN[skip_eval]}}"
   local e3b_checkpoints="${OVR[e3b_checkpoints]:-${BASE_PIPINN[e3b_checkpoints]}}"
   local pe_resample_every="${OVR[pe_resample_every]:-${BASE_PIPINN[pe_resample_every]}}"
   local inner_best="${OVR[inner_best]:-${BASE_PIPINN[inner_best]}}"
@@ -744,6 +854,10 @@ run_pipinn_single() {
   local carry_lr_max="${OVR[carry_lr_max]:-${BASE_PIPINN[carry_lr_max]}}"
   local timing_flag=()
   [[ "$timing_mode" == "1" ]] && timing_flag=(--timing-mode)
+  local skip_figures_flag=()
+  [[ "$skip_figures" == "1" ]] && skip_figures_flag=(--skip-figures)
+  local skip_eval_flag=()
+  [[ "$skip_eval" == "1" ]] && skip_eval_flag=(--skip-eval)
   local e3b_flag=()
   [[ "$e3b_checkpoints" == "1" ]] && e3b_flag=(--e3b-checkpoints)
 
@@ -796,7 +910,7 @@ run_pipinn_single() {
     --sel-every "$sel_every" --sel-patience "$sel_patience" \
     --carry-lr-min "$carry_lr_min" --carry-lr-max "$carry_lr_max" \
     --output-root "$run_output_root" --weight-root "$run_weight_root" \
-    "${timing_flag[@]}" "${e3b_flag[@]}" "${eval_only_flag[@]}"
+    "${timing_flag[@]}" "${skip_figures_flag[@]}" "${skip_eval_flag[@]}" "${e3b_flag[@]}" "${eval_only_flag[@]}"
 }
 
 # run_pipinn <tag|auto> key=val ...
@@ -876,9 +990,22 @@ echo "[done] manifest: $MANIFEST"
 if [[ "${AGGREGATE:-1}" == "1" ]]; then
   echo ""
   echo "[aggregate] computing seed statistics (mean / std / 95% CI) ..."
-  if "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" --out-root "$OUT_ROOT"; then
+  aggregate_args=(--out-root "$OUT_ROOT")
+  if (( ${#SEED_LIST[@]} > 0 )); then
+    if [[ "$STRICT_PAPER_AGGREGATION" == "1" ]]; then
+      aggregate_args+=(--expected-seeds "1-10" --min-runs 10)
+    else
+      aggregate_args+=(--expected-seeds "$SEEDS" --min-runs "${#SEED_LIST[@]}")
+    fi
+    aggregate_args+=(--expected-n-assets 30 --expected-m-states "1,3,5" --expected-models "pinn,pipinn")
+  fi
+  if "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" "${aggregate_args[@]}"; then
     echo "[aggregate] summary written under: $OUT_ROOT/seed_summary"
   else
+    if [[ "$STRICT_PAPER_AGGREGATION" == "1" && ${#SEED_LIST[@]} -gt 0 ]]; then
+      echo "[error] paper aggregation validation failed: $OUT_ROOT" >&2
+      exit 1
+    fi
     echo "[warn] aggregation failed; run manually: $PYTHON_BIN $SCRIPT_DIR/aggregate_seeds.py --out-root $OUT_ROOT"
   fi
 fi

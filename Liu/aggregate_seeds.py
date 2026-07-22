@@ -8,7 +8,7 @@ Usage:
 The script walks OUT_ROOT for run directories (anything containing a
 config.json written by ExperimentRecorder plus a metrics.csv), groups runs
 that share every hyperparameter EXCEPT the seed (and bookkeeping-only keys),
-and writes, per (configuration, wealth level w, metric):
+and writes, per (configuration, full-dimensional evaluation margin, metric):
 
     n, mean, std (ddof=1), sem, ci95_lo, ci95_hi, seeds
 
@@ -19,7 +19,7 @@ protocol "mean +- std over seeds; 95% CIs in the supplementary material".
 Outputs (under <OUT_ROOT>/seed_summary by default):
     runs_index.csv        every run found, with status and group hash
     groups.json           group hash -> shared configuration
-    summary_long.csv      one row per (group, model_type, w, metric)
+    summary_long.csv      one row per (group, model_type, eval_margin, metric)
     summary_headline.csv  compact table of headline metrics with
                           "mean +- std" and "[ci_lo, ci_hi]" strings
 
@@ -35,6 +35,7 @@ import json
 from datetime import datetime
 import math
 import os
+import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,6 +52,8 @@ GROUP_IGNORE_KEYS = {
     "stop_flag_path",
     "eval_only",
     "skip_plots",
+    "skip_figures",
+    "skip_eval",
     "print_every",
     "print_every_outer",
     "print_every_eval",
@@ -66,13 +69,60 @@ GROUP_IGNORE_KEYS = {
 HEADLINE_METRICS = [
     "RelL2_V",
     "RelL2_theta",
-    "RelL2_myopic",
-    "RelL2_hedging",
-    "StdNRMSE_V",
-    "StdNRMSE_theta",
-    "MSE_V",
-    "MSE_theta",
 ]
+
+MARKET_HASH_KEYS = (
+    "K", "xbar", "SigmaX", "rho", "Lam", "Q", "Gamma", "k0", "lam0",
+    "X_min", "X_max", "eta", "gamma", "r", "tau_max", "W_min", "W_max",
+    "market_seed",
+)
+
+
+def parse_seed_spec(text: str) -> List[int]:
+    """Parse comma/space-separated seeds and inclusive ranges such as 1-10."""
+    out: List[int] = []
+    for token in re.split(r"[\s,]+", str(text or "").strip()):
+        if not token:
+            continue
+        match = re.fullmatch(r"(-?\d+)-(-?\d+)", token)
+        if match:
+            lo, hi = int(match.group(1)), int(match.group(2))
+            step = 1 if hi >= lo else -1
+            out.extend(range(lo, hi + step, step))
+        else:
+            out.append(int(token))
+    if len(set(out)) != len(out):
+        raise ValueError(f"duplicate seeds in --expected-seeds: {text!r}")
+    return sorted(out)
+
+
+def canonical_market_hash(path: str) -> str:
+    """Hash the economic market snapshot, excluding the training seed.
+
+    Key name, normalized dtype, shape and C-order bytes are all included so
+    arrays with the same raw bytes but different meanings cannot collide.
+    """
+    with np.load(path, allow_pickle=False) as data:
+        missing = [key for key in MARKET_HASH_KEYS if key not in data.files]
+        if missing:
+            raise ValueError(f"missing market keys {missing}")
+        digest = hashlib.sha256()
+        for key in MARKET_HASH_KEYS:
+            arr = np.asarray(data[key])
+            if arr.dtype.hasobject:
+                raise ValueError(f"object dtype is not canonical: {key}")
+            # Normalize byte order so the hash is machine-independent.
+            dtype = arr.dtype
+            if dtype.byteorder == ">" or (dtype.byteorder == "=" and not np.little_endian):
+                arr = arr.byteswap().view(dtype.newbyteorder("<"))
+            else:
+                arr = arr.astype(dtype.newbyteorder("<"), copy=False)
+            arr = np.ascontiguousarray(arr)
+            digest.update(key.encode("utf-8") + b"\0")
+            digest.update(arr.dtype.str.encode("ascii") + b"\0")
+            digest.update(json.dumps(arr.shape).encode("ascii") + b"\0")
+            digest.update(arr.tobytes(order="C"))
+        return digest.hexdigest()
 
 # Two-sided 95% t critical values (df -> t_{0.975, df}); fallback when scipy
 # is unavailable. df > 30 falls back to interpolation anchors / 1.96.
@@ -164,11 +214,18 @@ def run_updated_at(run_dir: str) -> str:
 
 
 def run_status(run_dir: str) -> str:
-    if os.path.exists(os.path.join(run_dir, "_SUCCESS")):
+    present = [
+        name for name in ("_SUCCESS", "_STOPPED_EARLY", "_FAILED")
+        if os.path.exists(os.path.join(run_dir, name))
+    ]
+    if len(present) > 1:
+        # Never let a stale success marker outrank a newer failure marker.
+        return "conflicting_markers"
+    if present == ["_SUCCESS"]:
         return "success"
-    if os.path.exists(os.path.join(run_dir, "_STOPPED_EARLY")):
+    if present == ["_STOPPED_EARLY"]:
         return "stopped_early"
-    if os.path.exists(os.path.join(run_dir, "_FAILED")):
+    if present == ["_FAILED"]:
         return "failed"
     return "unknown"
 
@@ -243,10 +300,13 @@ def load_metrics_rows(run_dir: str) -> List[Dict[str, Any]]:
                     continue
                 margin_raw = row.get("eval_margin", "")
                 margin = float(margin_raw) if str(margin_raw).strip() != "" else 0.0
+                value = float(row["value"])
+                if not math.isfinite(margin) or not math.isfinite(value):
+                    continue
                 rows.append({
                     "eval_margin": margin,
                     "metric": str(row["metric"]),
-                    "value": float(row["value"]),
+                    "value": value,
                 })
             except (KeyError, ValueError):
                 continue
@@ -262,6 +322,13 @@ def fmt(x: float, digits: int = 6) -> str:
     return f"{x:.{digits}e}"
 
 
+def as_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Aggregate per-seed metrics into mean/std/95% CI tables.")
     ap.add_argument("--out-root", type=str, required=True, help="Sweep output root (the OUT_ROOT of tune_pipinn.sh).")
@@ -269,7 +336,41 @@ def main() -> None:
     ap.add_argument("--include-stopped", action="store_true",
                     help="Also include runs marked _STOPPED_EARLY (default: success only).")
     ap.add_argument("--min-runs", type=int, default=1, help="Minimum runs per group to report (default 1).")
+    ap.add_argument(
+        "--expected-seeds", type=str, default="",
+        help="Exact successful training-seed set required per group, e.g. 1-10 or 1,2,3. "
+             "When set, missing/extra seeds and missing per-seed metrics are fatal.",
+    )
+    ap.add_argument(
+        "--strict-market-snapshots", action="store_true",
+        help="Fail unless every selected run with the same M has one canonical market hash. "
+             "Automatically enabled by --expected-seeds.",
+    )
+    ap.add_argument(
+        "--headline-margin", type=float, default=0.10,
+        help="Evaluation margin used in summary_headline.csv (default: 0.10).",
+    )
+    ap.add_argument(
+        "--expected-m-states", type=str, default="",
+        help="Optional exact dimensions across discovered groups, e.g. 1,3,5; "
+             "enforced independently of --expected-models.",
+    )
+    ap.add_argument(
+        "--expected-n-assets", type=int, default=None,
+        help="Optional exact risky-asset dimension required in every discovered group "
+             "(paper Table 3 uses 30).",
+    )
+    ap.add_argument(
+        "--expected-models", type=str, default="",
+        help="Optional exact methods across discovered groups, e.g. pinn,pipinn; "
+             "enforced independently of --expected-m-states.",
+    )
     args = ap.parse_args()
+
+    expected_seeds = set(parse_seed_spec(args.expected_seeds))
+    expected_m_states = set(parse_seed_spec(args.expected_m_states))
+    expected_models = {x.strip() for x in args.expected_models.split(",") if x.strip()}
+    strict_market = bool(args.strict_market_snapshots or expected_seeds)
 
     out_root = os.path.abspath(args.out_root)
     summary_dir = args.output or os.path.join(out_root, "seed_summary")
@@ -281,14 +382,21 @@ def main() -> None:
 
     run_dirs = find_runs(out_root)
     if not run_dirs:
-        print(f"[warn] no runs (config.json) found under {out_root}")
+        message = f"no runs (config.json) found under {out_root}"
+        if (expected_seeds or expected_m_states or expected_models
+                or args.expected_n_assets is not None or strict_market):
+            raise SystemExit(f"paper aggregation validation failed: {message}")
+        print(f"[warn] {message}")
         return
 
     runs_index_rows = []
     groups_config: Dict[str, str] = {}
-    # values[(ghash, model_type, w, metric)] -> list of (seed, value)
-    values: Dict[Tuple[str, str, float, str], List[Tuple[Any, float]]] = defaultdict(list)
+    # values[(ghash, model_type, eval_margin, metric)] ->
+    #     list of (seed, value, run_updated_at)
+    values: Dict[Tuple[str, str, float, str], List[Tuple[Any, float, str]]] = defaultdict(list)
     group_dims: Dict[str, Tuple[Any, Any]] = {}
+    market_rows: List[Dict[str, Any]] = []
+    validation_errors: List[str] = []
 
     n_used = 0
     for run_dir in run_dirs:
@@ -305,8 +413,16 @@ def main() -> None:
         raw_cfg = load_config_args_raw(run_dir) or cfg
         ghash_train, canon_train = group_key(raw_cfg)
         groups_config.setdefault(ghash_train, canon_train)
+        group_dims.setdefault(ghash_train, (raw_cfg.get("n_assets"), raw_cfg.get("m_states")))
         model_type = str(cfg.get("model_type", ""))
         seed = cfg.get("seed")
+        market_path = os.path.join(run_dir, "market_params.npz")
+        market_hash = ""
+        market_error = ""
+        try:
+            market_hash = canonical_market_hash(market_path)
+        except Exception as exc:
+            market_error = str(exc)
 
         runs_index_rows.append({
             "run_dir": os.path.relpath(run_dir, out_root),
@@ -318,30 +434,24 @@ def main() -> None:
             "m_states": cfg.get("m_states"),
             "seed": seed,
             "status": status,
-            "used": int(status in accepted_status),
+            # Set after newest-per-(training group, method, seed) selection.
+            "used": 0,
+            "market_hash": market_hash,
+            "market_error": market_error,
         })
-        if status not in accepted_status:
-            continue
-
-        rows = load_metrics_rows(run_dir)
-        if not rows:
-            print(f"[warn] no metrics.csv rows in accepted run: {run_dir}")
-            continue
-        n_used += 1
-        ts = run_updated_at(run_dir)
-        for r in rows:
-            values[(ghash, model_type, r["eval_margin"], r["metric"])].append((seed, r["value"], ts))
 
     # ---- success rates per (group, model_type), on UNIQUE SEEDS: the same
     #      seed rerun keeps only its NEWEST run's status, so a failed old
     #      attempt followed by a successful rerun counts as 1/1, not 1/2.
     #      Divergence-stop censoring is reported, never silently dropped ----
     _newest: Dict[Tuple[str, str, Any], Tuple[str, str]] = {}  # (ts, status)
+    _newest_row: Dict[Tuple[str, str, Any], Dict[str, Any]] = {}
     for row in runs_index_rows:
         k = (row["group_train"], row["model_type"], row["seed"])
         ts = row.get("updated_at", "")
         if k not in _newest or ts >= _newest[k][0]:
             _newest[k] = (ts, row["status"])
+            _newest_row[k] = row
     _cnt: Dict[Tuple[str, str], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for (g, m, _seed), (_ts, st) in _newest.items():
         _cnt[(g, m)]["n_seeds"] += 1
@@ -353,6 +463,201 @@ def main() -> None:
             _cnt[(g, m)]["n_failed"] += 1
         else:
             _cnt[(g, m)]["n_other"] += 1
+
+    # Metrics and market snapshots must come from the SAME newest selected
+    # run.  Reading every historical success first and deduplicating each
+    # metric key later can silently backfill a missing new metric from an old
+    # rerun, which makes a broken Table-3 evaluation look complete.
+    for row in _newest_row.values():
+        if row["status"] not in accepted_status:
+            continue
+        row["used"] = 1
+        run_dir = os.path.join(out_root, str(row["run_dir"]))
+        market_rows.append({
+            "run_dir": row["run_dir"],
+            "model_type": row["model_type"],
+            "n_assets": row["n_assets"],
+            "m_states": row["m_states"],
+            "seed": row["seed"],
+            "status": row["status"],
+            "market_hash": row["market_hash"],
+            "market_error": row["market_error"],
+        })
+        metric_rows = load_metrics_rows(run_dir)
+        if not metric_rows:
+            print(f"[warn] no metrics.csv rows in selected run: {run_dir}")
+            continue
+        n_used += 1
+        for metric_row in metric_rows:
+            values[(
+                row["group"], row["model_type"], metric_row["eval_margin"], metric_row["metric"]
+            )].append((row["seed"], metric_row["value"], row["updated_at"]))
+
+    if expected_seeds:
+        for (g, model_type), _counts in sorted(_cnt.items()):
+            successful = {
+                int(seed) for (gg, mm, seed), (_ts, status) in _newest.items()
+                if gg == g and mm == model_type and status == "success"
+            }
+            if successful != expected_seeds:
+                missing = sorted(expected_seeds - successful)
+                extra = sorted(successful - expected_seeds)
+                validation_errors.append(
+                    f"group={g} model={model_type}: successful seeds={sorted(successful)}, "
+                    f"expected={sorted(expected_seeds)}, missing={missing}, extra={extra}"
+                )
+
+    observed_m_states = {
+        as_int(group_dims.get(group, (None, None))[1])
+        for group, _model_type in _cnt
+    }
+    observed_n_assets = {
+        as_int(group_dims.get(group, (None, None))[0])
+        for group, _model_type in _cnt
+    }
+    observed_models = {model_type for _group, model_type in _cnt}
+
+    if args.expected_n_assets is not None:
+        if args.expected_n_assets <= 0:
+            validation_errors.append(
+                f"--expected-n-assets must be positive, got {args.expected_n_assets}"
+            )
+        elif observed_n_assets != {args.expected_n_assets}:
+            validation_errors.append(
+                f"paper groups: observed N={sorted(observed_n_assets, key=str)}, "
+                f"expected exactly={[args.expected_n_assets]}"
+            )
+
+    if expected_m_states and observed_m_states != expected_m_states:
+        validation_errors.append(
+            f"paper groups: observed M={sorted(observed_m_states, key=str)}, "
+            f"expected exactly={sorted(expected_m_states)}"
+        )
+
+    if expected_models and observed_models != expected_models:
+        validation_errors.append(
+            f"paper groups: observed models={sorted(observed_models)}, "
+            f"expected exactly={sorted(expected_models)}"
+        )
+
+    if expected_m_states and expected_models:
+        expected_pairs = {
+            (model_type, m_states)
+            for model_type in expected_models
+            for m_states in expected_m_states
+        }
+        observed_pairs = {
+            (model_type, as_int(group_dims.get(group, (None, None))[1]))
+            for group, model_type in _cnt
+        }
+        if observed_pairs != expected_pairs:
+            validation_errors.append(
+                f"paper groups: observed method/M={sorted(observed_pairs, key=str)}, "
+                f"expected exactly={sorted(expected_pairs, key=str)}"
+            )
+        for m_states in sorted(expected_m_states):
+            for model_type in sorted(expected_models):
+                matching = [
+                    g for (g, model) in _cnt
+                    if model == model_type and as_int(group_dims.get(g, (None, None))[1]) == m_states
+                ]
+                if len(matching) != 1:
+                    validation_errors.append(
+                        f"expected exactly one group for model={model_type}, M={m_states}; "
+                        f"found {matching}"
+                    )
+
+    if strict_market:
+        # Check only the newest selected run for each (configuration, method,
+        # seed); archived reruns must not override the same deduplication rule
+        # used for metrics.  Group by M (not by N,M): the paper requires one
+        # identical market snapshot across both methods and all seeds at a
+        # given state dimension, and the hash itself also detects a changed N.
+        market_by_m: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+        for row in market_rows:
+            if row["status"] == "success":
+                market_by_m[row.get("m_states")].append(row)
+        for m_states, rows in sorted(market_by_m.items(), key=lambda item: str(item[0])):
+            errors = [r for r in rows if r["market_error"] or not r["market_hash"]]
+            hashes = {r["market_hash"] for r in rows if r["market_hash"]}
+            if errors:
+                validation_errors.append(
+                    f"market M={m_states}: {len(errors)} selected run(s) have missing/invalid snapshots"
+                )
+            if len(hashes) != 1:
+                validation_errors.append(
+                    f"market M={m_states}: expected one canonical hash, found {sorted(hashes)}"
+                )
+
+    if expected_seeds:
+        for (ghash, model_type, eval_margin, metric), pairs in sorted(values.items()):
+            metric_seeds = {int(seed) for seed, _value, _ts in pairs}
+            if metric_seeds != expected_seeds:
+                validation_errors.append(
+                    f"metric group={ghash} model={model_type} margin={eval_margin:g} "
+                    f"metric={metric}: seeds={sorted(metric_seeds)}, expected={sorted(expected_seeds)}"
+                )
+
+        # Existing metric keys alone are not sufficient validation: if a
+        # headline metric (or the entire 0.10 window) is absent everywhere,
+        # there is no key to inspect above.  Require the complete Table-3
+        # pair explicitly for each selected paper (method, M) group.
+        if expected_m_states and expected_models:
+            targets = [
+                (model_type, m_states)
+                for m_states in sorted(expected_m_states)
+                for model_type in sorted(expected_models)
+            ]
+        else:
+            targets = sorted({
+                (model_type, as_int(group_dims.get(group, (None, None))[1]))
+                for group, model_type in _cnt
+            }, key=str)
+
+        for model_type, m_states in targets:
+            candidate_groups = {
+                ghash for (ghash, model, _margin, _metric) in values
+                if model == model_type
+                and as_int(group_dims.get(ghash, (None, None))[1]) == m_states
+            }
+            if len(candidate_groups) != 1:
+                validation_errors.append(
+                    f"Table 3 model={model_type}, M={m_states}: expected exactly one metric group, "
+                    f"found {sorted(candidate_groups)}"
+                )
+                continue
+            ghash = next(iter(candidate_groups))
+            for metric in HEADLINE_METRICS:
+                matching_pairs = [
+                    pairs for (group, model, margin, name), pairs in values.items()
+                    if group == ghash and model == model_type and name == metric
+                    and math.isclose(float(margin), float(args.headline_margin),
+                                     rel_tol=0.0, abs_tol=1e-12)
+                ]
+                if len(matching_pairs) != 1:
+                    validation_errors.append(
+                        f"Table 3 group={ghash} model={model_type}, M={m_states}: "
+                        f"missing/ambiguous metric={metric} at eval_margin={args.headline_margin:g}"
+                    )
+                    continue
+                metric_seeds = {int(seed) for seed, _value, _ts in matching_pairs[0]}
+                if metric_seeds != expected_seeds:
+                    validation_errors.append(
+                        f"Table 3 group={ghash} model={model_type}, M={m_states}, metric={metric}: "
+                        f"seeds={sorted(metric_seeds)}, expected={sorted(expected_seeds)}"
+                    )
+
+    error_path = os.path.join(summary_dir, "validation_errors.txt")
+    if validation_errors:
+        with open(error_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(validation_errors) + "\n")
+        for msg in validation_errors[:25]:
+            print(f"[validation error] {msg}")
+        if len(validation_errors) > 25:
+            print(f"[validation error] ... {len(validation_errors) - 25} more; see {error_path}")
+        raise SystemExit(f"paper aggregation validation failed; see {error_path}")
+    if os.path.exists(error_path):
+        os.remove(error_path)
     sr_path = os.path.join(summary_dir, "success_rates.csv")
     with open(sr_path, "w", encoding="utf-8", newline="") as f:
         wtr = csv.DictWriter(f, fieldnames=["group", "model_type", "n_seeds", "n_success",
@@ -371,9 +676,19 @@ def main() -> None:
     idx_path = os.path.join(summary_dir, "runs_index.csv")
     with open(idx_path, "w", encoding="utf-8", newline="") as f:
         wtr = csv.DictWriter(f, fieldnames=[
-            "run_dir", "updated_at", "group_train", "group", "model_type", "n_assets", "m_states", "seed", "status", "used"])
+            "run_dir", "updated_at", "group_train", "group", "model_type", "n_assets", "m_states", "seed", "status", "used",
+            "market_hash", "market_error"])
         wtr.writeheader()
         for row in runs_index_rows:
+            wtr.writerow(row)
+
+    market_path = os.path.join(summary_dir, "market_hashes.csv")
+    with open(market_path, "w", encoding="utf-8", newline="") as f:
+        fields = ["run_dir", "model_type", "n_assets", "m_states", "seed", "status",
+                  "market_hash", "market_error"]
+        wtr = csv.DictWriter(f, fieldnames=fields)
+        wtr.writeheader()
+        for row in market_rows:
             wtr.writerow(row)
 
     # ---- groups.json ----
@@ -414,7 +729,10 @@ def main() -> None:
             "mean": fmt(mean), "std": fmt(std), "sem": fmt(sem),
             "ci95_lo": fmt(ci_lo), "ci95_hi": fmt(ci_hi),
             "t_crit": "" if math.isnan(tc) else f"{tc:.4f}",
-            "seeds": ";".join(str(s) for s in sorted(by_seed, key=lambda z: (str(z)))),
+            "seeds": ";".join(str(s) for s in sorted(
+                by_seed,
+                key=lambda z: (as_int(z) is None, as_int(z) if as_int(z) is not None else str(z)),
+            )),
         })
     with open(long_path, "w", encoding="utf-8", newline="") as f:
         wtr = csv.DictWriter(f, fieldnames=long_fields)
@@ -432,6 +750,9 @@ def main() -> None:
         for row in long_rows:
             if row["metric"] not in HEADLINE_METRICS:
                 continue
+            if not math.isclose(float(row["eval_margin"]), float(args.headline_margin),
+                                rel_tol=0.0, abs_tol=1e-12):
+                continue
             mean_s, std_s = row["mean"], row["std"]
             pm = f"{mean_s} +- {std_s}" if std_s else mean_s
             ci = f"[{row['ci95_lo']}, {row['ci95_hi']}]" if row["ci95_lo"] else ""
@@ -447,6 +768,7 @@ def main() -> None:
     print(f"[aggregate] runs found: {len(runs_index_rows)} | used: {n_used} | groups: {n_groups}")
     print(f"[aggregate] wrote: {idx_path}")
     print(f"[aggregate] wrote: {os.path.join(summary_dir, 'groups.json')}")
+    print(f"[aggregate] wrote: {market_path}")
     print(f"[aggregate] wrote: {long_path}")
     print(f"[aggregate] wrote: {head_path}")
 
