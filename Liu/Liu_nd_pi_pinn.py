@@ -63,18 +63,34 @@ from joint_market_setup_dirichlet import generate_joint_market_params, JointMark
 from experiment_utils import (
     add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
-    parse_eval_margins, shrink_bounds, pres_from_mse,
+    parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
 )
 
 
 # =============================================================================
 # 0) CLI + Reproducibility + Device
 # =============================================================================
+def positive_finite_float(raw):
+    """Argparse type for strictly positive finite floating-point values."""
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError("must be finite and > 0")
+    return value
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Liu ND PIPINN experiment runner")
     add_common_experiment_args(parser, model_type_default="pipinn")
 
     parser.add_argument("--theta-init-method", type=str, default="zero", choices=["myopic", "zero", "closed_form"])
+    parser.add_argument(
+        "--theta-init-scale",
+        type=positive_finite_float,
+        default=1.0,
+        help=("Positive scale in theta_0 = scale * theta_init(method), applied "
+              "before the optional componentwise clip. Use 0.5 and 1.5 for "
+              "the fractional-myopic contraction pilot."),
+    )
     parser.add_argument("--theta-clip-abs", type=none_or_float, default=3.0)
     # Previously hardcoded at the solver call site; exposed so bash overrides take effect.
     # LR schedule modes:
@@ -632,11 +648,10 @@ def hjb_residual_nd(model, w, x, tau, M, N, gamma, r, K_t, k0_t, Q_t, Gamma_t, l
     combined = lam_x * V_w + Gamma_Vwx  # (batch, N)
     numerator = torch.sum(combined ** 2, dim=1, keepdim=True)  # (batch, 1)
     
-    # denominator = 2 V_ww (should be negative for concave V)
-    denominator = 2.0 * V_ww
-    # denominator = 2 V_ww must be negative (concavity); clamp from above.
-    denominator_safe = torch.clamp(denominator, max=-1e-8)
-    term5 = -numerator / denominator_safe
+    # Guard V_ww itself so this path uses the same effective threshold as
+    # control extraction (rather than clamping 2*V_ww at a different one).
+    V_ww_safe = safe_concave_vww(V_ww)
+    term5 = -numerator / (2.0 * V_ww_safe)
     
     residual = term1 + term2 + term3 + term4 + term5
     
@@ -681,7 +696,7 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
     # maximizer, so clamp from ABOVE at -1e-8. (The previous
     # sign(V_ww)*1e-8 + 1e-10 form gave +1e-10 at V_ww == 0: wrong sign and
     # 100x smaller than intended, letting the control blow up.)
-    V_ww_safe = torch.clamp(V_ww, max=-1e-8)
+    V_ww_safe = safe_concave_vww(V_ww)
     theta = -numerator / V_ww_safe  # (batch, N)
     theta_norm = theta / w  # (batch, N)
     
@@ -794,7 +809,7 @@ def compute_theta_from_foc_nd(
     # maximizer, so clamp from ABOVE at -1e-8. (The previous
     # sign(V_ww)*1e-8 + 1e-10 form gave +1e-10 at V_ww == 0: wrong sign and
     # 100x smaller than intended, letting the control blow up.)
-    V_ww_safe = torch.clamp(V_ww, max=-1e-8)
+    V_ww_safe = safe_concave_vww(V_ww)
     theta = -numerator / V_ww_safe                                      # (batch,N)
 
     if theta_clip_abs is not None:
@@ -837,6 +852,7 @@ class PIPINN_KimOmbergND:
         self.Lam_t = Lam_t
 
         self.theta_clip_abs = theta_clip_abs
+        self.theta_init_scale = 1.0
 
         self.value_net = ValueNetND(M=M, hidden=value_hidden, depth=value_depth).to(device)
         self.initial_lr = lr
@@ -988,6 +1004,10 @@ class PIPINN_KimOmbergND:
         else:
             raise ValueError(f"Unknown theta init method: {method}")
 
+        # Pilot perturbation.  With method="myopic" and clipping disabled this
+        # is exactly theta_0 = a * theta_myopic.  Keep the clip outermost so a
+        # finite clip has the explicit interpretation clip(a * theta_init).
+        theta = theta * self.theta_init_scale
         if self.theta_clip_abs is not None:
             theta = torch.clamp(theta, -float(self.theta_clip_abs), float(self.theta_clip_abs))
         return theta
@@ -1390,6 +1410,7 @@ class PIPINN_KimOmbergND:
         w_shape=1.0,
         w_rra=0.0,
         theta_init_method="myopic",
+        theta_init_scale=1.0,
         print_every_outer=5,
         print_every_eval=200,
         verbose_detail=False,
@@ -1418,7 +1439,8 @@ class PIPINN_KimOmbergND:
         print(f"  outer_iters   : {outer_iters}")
         print(f"  eval_epochs   : {eval_epochs}")
         print(f"  batch_size    : {batch_size}")
-        print(f"  θ init        : {theta_init_method}")
+        self.theta_init_scale = positive_finite_float(theta_init_scale)
+        print(f"  θ init        : {theta_init_method} (scale={self.theta_init_scale:g})")
         print(f"  θ clip abs    : {self.theta_clip_abs}")
         print(f"  init LR       : {self.initial_lr:.2e}")
         print(f"  lr schedule   : {self.lr_schedule} (adam_reset={self.adam_reset}, patience={self.scheduler_patience})")
@@ -1517,7 +1539,9 @@ class PIPINN_KimOmbergND:
             "sel_best_pres", "sel_best_epoch", "sel_best_lr",
             "lr_end_before_restore", "lr_best_checkpoint", "lr_after_restore", "lr_carried_next",
             "sel_checks", "sel_stopped", "sel_restored",
-            "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_theta",
+            "e_V_sup", "e_bundle_sup", "e_Xev",
+            "e_Vw_sup", "e_Vww_sup", "e_Vwx_sup",
+            "diag_RelL2_V", "diag_RelL2_theta",
             "m_ww", "M_num", "guard_frac_ev",
             "lam_min_sigma_frozen", "lam_max_sigma_frozen", "clip_frac_frozen",
             "lr", "best_eval_loss", "bad_count", "stop_active", "stop_is_bad",
@@ -1622,30 +1646,28 @@ class PIPINN_KimOmbergND:
                 theta_sel = theta_sel.detach()
                 sel_fn = lambda: self.evaluate_heldout_pres(theta_sel, sel_set)
 
-                # Ellipticity of the FROZEN policy alpha_n on Q_col: reuse
-                # theta_val (already computed on the held-out points, which
-                # sample the FULL collocation window) -- no extra autograd.
-                # Cost control: only a FIXED Q_col subsample (first
-                # diag_points held-out points) and only on the diag schedule;
-                # iteration 1 (initial-policy nondegeneracy) and the final
-                # iteration always run.
-                _do_frozen_diag = (
-                    diag_points and diag_points > 0 and not timing_mode
-                    and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
-                )
-                if _do_frozen_diag:
-                    _tv = theta_val[: int(diag_points)].cpu().numpy()
-                    _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
-                    frozen_lam_min = float(np.min(_lmin))
-                    frozen_lam_max = float(np.max(_lmax))
-                    if self.theta_clip_abs is not None:
-                        _c = float(self.theta_clip_abs)
-                        frozen_clip_frac = float(np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1)))
-                    if it == 1:
-                        results["theta0_lam_min_sigma"] = frozen_lam_min
-                        results["theta0_lam_max_sigma"] = frozen_lam_max
-                        print(f"  [init policy] lam(Sigma^theta0) on Q_col subsample: "
-                              f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
+            # Empirical ellipticity of the FROZEN policy alpha_n on a fixed
+            # Q_col subsample.  This diagnostic depends on the audit set, not
+            # on whether held-out inner-best selection is enabled.
+            _do_frozen_diag = (
+                val_set is not None
+                and diag_points and diag_points > 0
+                and not timing_mode
+                and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
+            )
+            if _do_frozen_diag:
+                _tv = theta_val[: int(diag_points)].cpu().numpy()
+                _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
+                frozen_lam_min = float(np.min(_lmin))
+                frozen_lam_max = float(np.max(_lmax))
+                if self.theta_clip_abs is not None:
+                    _c = float(self.theta_clip_abs)
+                    frozen_clip_frac = float(np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1)))
+                if it == 1:
+                    results["theta0_lam_min_sigma"] = frozen_lam_min
+                    results["theta0_lam_max_sigma"] = frozen_lam_max
+                    print(f"  [init policy] empirical lam(Sigma^theta0) on Q_col subsample: "
+                          f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
 
             # LR protocol for this outer iteration (inner_plateau: reset).
             self.prepare_optimizer_for_outer()
@@ -1680,7 +1702,9 @@ class PIPINN_KimOmbergND:
             # Fixed-set diagnostics for iterate v~_it: e_n components (E3-a)
             # and the stability margins (E1-b/c analogues).
             diag_res = {}
-            if diag is not None and (diag_every <= 1 or it % diag_every == 0 or it == 1):
+            if diag is not None and (
+                diag_every <= 1 or it == 1 or it % diag_every == 0 or it == outer_iters
+            ):
                 diag_res = eval_diag_metrics(
                     self.value_net, diag, self.M, self.N, self.gamma,
                     self.Gamma_t, self.lam0_t, self.Lam_t,
@@ -1837,6 +1861,9 @@ class PIPINN_KimOmbergND:
                     "sel_restored": eval_info.get("sel_restored", ""),
                     "e_V_sup": diag_res.get("e_V_sup", ""),
                     "e_bundle_sup": diag_res.get("e_bundle_sup", ""),
+                    "e_Vw_sup": diag_res.get("e_Vw_sup", ""),
+                    "e_Vww_sup": diag_res.get("e_Vww_sup", ""),
+                    "e_Vwx_sup": diag_res.get("e_Vwx_sup", ""),
                     "e_Xev": diag_res.get("e_Xev", ""),
                     "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
                     "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
@@ -2600,10 +2627,13 @@ def eval_diag_metrics(model, diag, M, N, gamma,
         (Vwx_m - diag["Vwx_cf"]),
     ], axis=1)
     e_D = float(np.max(np.linalg.norm(bundle_err, axis=1)))
+    e_Vw_sup = float(np.max(np.abs(Vw_m - diag["Vw_cf"])))
+    e_Vww_sup = float(np.max(np.abs(Vww_m - diag["Vww_cf"])))
+    e_Vwx_sup = float(np.max(np.linalg.norm(Vwx_m - diag["Vwx_cf"], axis=1)))
 
     # Stability margins (model side)
     m_ww = float(np.min(-Vww_m))
-    guard_frac = float(np.mean(Vww_m > -1e-8))
+    guard_frac = float(np.mean(Vww_m > -VWW_GUARD))
     lam_x = lam0_np[None, :] + diag["x_np"] @ Lam_np.T            # (P, N)
     numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
     M_num = float(np.max(np.linalg.norm(numer, axis=1)))
@@ -2616,7 +2646,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     # side uses the exact (negative) V_ww*.
     rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
                      / max(np.linalg.norm(diag["V_cf"]), 1e-300))
-    theta_hat = -numer / np.minimum(Vww_m, -1e-8)[:, None]
+    theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
     numer_cf = lam_x * diag["Vw_cf"][:, None] + diag["Vwx_cf"] @ Gamma_np.T
     theta_cf = -numer_cf / diag["Vww_cf"][:, None]
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
@@ -2624,6 +2654,7 @@ def eval_diag_metrics(model, diag, M, N, gamma,
 
     return {
         "e_V_sup": e_V, "e_bundle_sup": e_D, "e_Xev": e_V + e_D,
+        "e_Vw_sup": e_Vw_sup, "e_Vww_sup": e_Vww_sup, "e_Vwx_sup": e_Vwx_sup,
         "diag_RelL2_V": rel_l2_V, "diag_RelL2_theta": rel_l2_theta,
         "m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac,
     }
@@ -2747,6 +2778,7 @@ w_shape         = ARGS.w_shape      # monotonicity/concavity penalty weight
 w_rra           = ARGS.w_rra        # CRRA homogeneity penalty weight (0 disables)
 
 theta_init_method = ARGS.theta_init_method  # {"myopic", "zero", "closed_form"}
+theta_init_scale  = ARGS.theta_init_scale   # positive; applied before optional clip
 theta_clip_abs    = ARGS.theta_clip_abs       # None -> no clamp, else componentwise |θ_i| <= clip
 
 print_every_outer = ARGS.print_every_outer
@@ -2763,6 +2795,7 @@ if __name__ == "__main__":
         # Evaluation is unrelated to training-divergence monitoring: no
         # "running" status on the TRAINING status file, no stopper, and the
         # shared stop flag is ignored entirely.
+        recorder.prepare_eval_run()
         recorder.write_status_eval("running")
         stopper = None
     else:
@@ -2829,6 +2862,7 @@ if __name__ == "__main__":
             w_shape=w_shape,
             w_rra=w_rra,
             theta_init_method=theta_init_method,
+            theta_init_scale=theta_init_scale,
             print_every_outer=print_every_outer,
             print_every_eval=print_every_eval,
             verbose_detail=verbose_detail,
@@ -2883,7 +2917,7 @@ if __name__ == "__main__":
     print(f"  initial lr       : {lr}")
     print(f"  T.C weight       : {w_terminal}")
     print(f"  shape weight     : {w_shape}")
-    print(f"  theta init       : {theta_init_method}")
+    print(f"  theta init       : {theta_init_method} (scale={theta_init_scale:g})")
     print(f"  theta clip abs   : {theta_clip_abs}")
     print(f"  Seed             : {SEED}")
     print(f"Elapsed time       : {h:02d}:{m:02d}:{s:05.2f}")
