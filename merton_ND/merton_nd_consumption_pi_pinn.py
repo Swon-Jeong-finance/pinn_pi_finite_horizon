@@ -107,8 +107,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--w-max", type=float, default=2.0)
     # Control bounds (PI-PINN-specific).  The canonical symmetric interface
     # mirrors Liu's theta_clip_abs: 2.0 means [-2,2], ``none`` is genuinely
-    # unconstrained.
+    # unconstrained for the portfolio coordinate.
     p.add_argument("--pi-clip-abs", type=mxu.none_or_float, default=2.0)
+    p.add_argument(
+        "--policy-bounds-mode", type=str, default="stabilized",
+        choices=["stabilized", "none"],
+        help=(
+            "stabilized applies the recorded portfolio/kappa/consumption projections; "
+            "none disables every finite action projection (FOC sign guards remain)."
+        ),
+    )
     p.add_argument("--kappa-max-bound", type=float, default=3.0,
                    help="Upper bound on kappa = c/W.")
     p.add_argument("--utility-cap", type=float, default=1e3,
@@ -217,6 +225,16 @@ if ARGS.diag_points < 0 or ARGS.diag_every < 1:
     raise ValueError("require --diag-points >= 0 and --diag-every >= 1")
 if ARGS.eval_epochs < 0 or ARGS.outer_iters < 1 or ARGS.batch_size < 1:
     raise ValueError("require eval_epochs >= 0, outer_iters >= 1, and batch_size >= 1")
+if ARGS.e3b_checkpoints and ARGS.timing_mode:
+    raise ValueError("--e3b-checkpoints is incompatible with --timing-mode")
+if not math.isfinite(ARGS.utility_cap) or ARGS.utility_cap <= 0.0:
+    raise ValueError("--utility-cap must be finite and positive")
+if (ARGS.policy_bounds_mode == "stabilized" and
+        (not math.isfinite(ARGS.kappa_max_bound) or ARGS.kappa_max_bound <= 0.0)):
+    raise ValueError("--kappa-max-bound must be finite and positive")
+if ARGS.pi_clip_abs is not None and (
+        not math.isfinite(ARGS.pi_clip_abs) or ARGS.pi_clip_abs <= 0.0):
+    raise ValueError("--pi-clip-abs must be finite and positive, or none")
 
 # =============================================================================
 # 0) Reproducibility + Device
@@ -304,27 +322,94 @@ nu = rho_discount / gamma_risk - (1.0 - gamma_risk) * (
     Theta / (2.0 * (gamma_risk**2)) + r_rate / gamma_risk
 )
 
-# Symmetric componentwise portfolio safety bound.  None means that the raw
-# FOC control is returned without a projection.
-pi_clip_abs = ARGS.pi_clip_abs
+# A single audit switch can remove every finite action projection.  The
+# one-sided derivative guards remain part of G and their activation continues
+# to be recorded separately.
+policy_bounds_mode = str(ARGS.policy_bounds_mode)
+pi_clip_abs = None if policy_bounds_mode == "none" else ARGS.pi_clip_abs
 pi_min_bound = -float(pi_clip_abs) if pi_clip_abs is not None else None
 pi_max_bound = float(pi_clip_abs) if pi_clip_abs is not None else None
 
 # Consumption bounds: use kappa=c/W bounds to avoid CRRA blow-up at tiny c
 M_utility_cap = float(ARGS.utility_cap)
 c_floor = ((gamma_risk - 1.0) * M_utility_cap) ** (-1.0 / (gamma_risk - 1.0))
-kappa_min_bound = c_floor / x_min
-kappa_max_bound = float(ARGS.kappa_max_bound)
+kappa_min_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else c_floor / x_min
+)
+kappa_max_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else float(ARGS.kappa_max_bound)
+)
 
 # Optional level clamp for c (mainly for printing / extra safety)
-c_min_bound = c_floor
-c_max_bound = x_max
+c_min_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else c_floor
+)
+c_max_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else x_max
+)
+
+
+def _clamp_optional(
+    value: torch.Tensor,
+    minimum: Optional[float],
+    maximum: Optional[float],
+) -> torch.Tensor:
+    """Apply only the finite action bounds that are actually configured."""
+    if minimum is None and maximum is None:
+        return value
+    if minimum is None:
+        return torch.clamp(value, max=float(maximum))
+    if maximum is None:
+        return torch.clamp(value, min=float(minimum))
+    return torch.clamp(value, min=float(minimum), max=float(maximum))
 
 # Torch constants
 mu_excess = torch.tensor(mu_excess_np, device=device, dtype=torch.float32)          # (N,)
 Sigma = torch.tensor(Sigma_np, device=device, dtype=torch.float32)                 # (N,N)
 Sigma_inv_mu = torch.tensor(Sigma_inv_mu_np, device=device, dtype=torch.float32)   # (N,)
 pi_star = torch.tensor(pi_star_np, device=device, dtype=torch.float32)             # (N,)
+
+# Machine-readable trainer contract consumed by the exact-map evaluator.  Keep
+# this description literal: the current G implementation clamps both V_y and
+# V_y-V_yy from below, so it is deliberately not labelled as an unguarded or
+# log-concavity-only map.
+TRAINER_METADATA = {
+    "trainer_protocol": "merton-pipinn-heldout-selection-v1",
+    "trainer_protocol_version": 1,
+    "inner_selection_restore_contract": "model-plus-optimizer-when-enabled",
+    "checkpoint_timing_contract": "post-policy-evaluation-after-optional-heldout-restore",
+    "trainer_source": "merton_ND/merton_nd_consumption_pi_pinn.py",
+    "trainer_source_marker": "merton-pipinn-logw-trainer-one-sided-v1",
+    "network_time_coordinate": "t",
+    "network_input_order": "t,y",
+    "network_input_transform": "identity",
+    "network_activation": "tanh",
+    "activation": "tanh",
+    "network_dtype": "float32",
+    "policy_guard_mode": "trainer-one-sided",
+    "policy_guard_version": "merton-logw-v1",
+    "policy_guard_eps": 1e-8,
+    "policy_bounds_mode": policy_bounds_mode,
+    "policy_numerator_expression": "V_y",
+    "policy_numerator_guard": "clamp-min-eps",
+    "policy_numerator_guard_eps": 1e-8,
+    "policy_denominator_expression": "V_y-V_yy",
+    "policy_denominator_coordinate": "log-wealth",
+    "policy_denominator_guard": "clamp-min-eps",
+    "policy_denominator_guard_eps": 1e-8,
+    # Back-compatible scalar names used by the exact-map PolicySpec.
+    "vw_guard": 1e-8,
+    "denominator_guard": 1e-8,
+    # Resolved bounds, rather than only the CLI inputs from which they arose.
+    "policy_pi_min": pi_min_bound,
+    "policy_pi_max": pi_max_bound,
+    "policy_kappa_min": kappa_min_bound,
+    "policy_kappa_max": kappa_max_bound,
+    "policy_c_min": c_min_bound,
+    "policy_c_max": c_max_bound,
+    "eval_margin_coordinate": "y",
+}
+TRAINER_METADATA["trainer_source_sha256"] = mxu.sha256_file(os.path.abspath(__file__))
 
 print(f"\n{'='*70}")
 print("Multi-Asset Merton (with Consumption) - PI-PINN (FOC) [log W]")
@@ -334,9 +419,10 @@ print(f"  gamma={gamma_risk}, rho={rho_discount}, r={r_rate}, epsilon={epsilon}"
 print(f"  T={T_FINAL}, W∈[{x_min},{x_max}] -> y∈[{y_min:.3f},{y_max:.3f}]")
 print(f"  Theta = mu^T Sigma^{-1} mu = {Theta:.6f}")
 print(f"  nu = {nu:.6f}")
+print(f"  policy bounds mode: {policy_bounds_mode}")
 print(f"  pi clip abs: {pi_clip_abs}"
       + (f" (componentwise [{pi_min_bound},{pi_max_bound}])" if pi_clip_abs is not None else " (unconstrained)"))
-print(f"  kappa=c/W bounds: [{kappa_min_bound:.4g},{kappa_max_bound}]")
+print(f"  kappa=c/W bounds: [{kappa_min_bound},{kappa_max_bound}]")
 print(f"  ||pi*||_2 = {np.linalg.norm(pi_star_np):.4f}, max|pi*_i|={np.max(np.abs(pi_star_np)):.4f}")
 print(f"  cond(Sigma_safe) = {market_params['cond_Sigma_safe']:.2f}, max|rho_ij|={market_params['max_abs_rho']:.3f}")
 print(f"{'='*70}\n")
@@ -426,8 +512,10 @@ def V_terminal_from_y(y: torch.Tensor) -> torch.Tensor:
 
 
 def U_consumption(c: torch.Tensor) -> torch.Tensor:
-    c_safe = torch.clamp(c, min=1e-8)
-    return c_safe.pow(1.0 - gamma_risk) / (1.0 - gamma_risk)
+    # Every implemented initialization/greedy path already returns c > 0.
+    # An additional utility-only floor would silently change the frozen PDE
+    # in policy_bounds_mode=none and break parity with the exact-map solver.
+    return c.pow(1.0 - gamma_risk) / (1.0 - gamma_risk)
 
 
 # =============================================================================
@@ -451,10 +539,10 @@ def compute_c_from_foc_log(
     V_y: torch.Tensor,
     y: torch.Tensor,
     eps: float = 1e-8,
-    kappa_min: float = kappa_min_bound,
-    kappa_max: float = kappa_max_bound,
-    c_min: float = c_min_bound,
-    c_max: float = c_max_bound,
+    kappa_min: Optional[float] = kappa_min_bound,
+    kappa_max: Optional[float] = kappa_max_bound,
+    c_min: Optional[float] = c_min_bound,
+    c_max: Optional[float] = c_max_bound,
 ) -> torch.Tensor:
     """c* from U'(c)=V_W, with V_W = V_y/W and W=exp(y)."""
     W = torch.exp(y)
@@ -463,9 +551,9 @@ def compute_c_from_foc_log(
     c_raw = V_w_safe.pow(-1.0 / gamma_risk)
 
     kappa_raw = c_raw / W
-    kappa = torch.clamp(kappa_raw, min=kappa_min, max=kappa_max)
+    kappa = _clamp_optional(kappa_raw, kappa_min, kappa_max)
     c_new = kappa * W
-    return torch.clamp(c_new, min=c_min, max=c_max)
+    return _clamp_optional(c_new, c_min, c_max)
 
 
 def compute_pi_from_foc_log_multi(
@@ -549,7 +637,7 @@ def build_validation_set(
 
 
 def build_diag_set(n_points: int, margin: float) -> Dict[str, torch.Tensor]:
-    """Fixed dense tensor grid on Q_ev; shrink log wealth, never time."""
+    """Fixed complete tensor grid on Q_ev; shrink log wealth, never time."""
     n_points = max(4, int(n_points))
     n_t = max(2, int(round(math.sqrt(n_points))))
     n_y = max(2, int(math.ceil(n_points / n_t)))
@@ -557,8 +645,8 @@ def build_diag_set(n_points: int, margin: float) -> Dict[str, torch.Tensor]:
     t_axis = np.linspace(t_min, t_max - 1e-3, n_t, dtype=np.float64)
     y_axis = np.linspace(y_lo, y_hi, n_y, dtype=np.float64)
     tt, yy = np.meshgrid(t_axis, y_axis, indexing="ij")
-    t = torch.tensor(tt.reshape(-1, 1)[:n_points], device=device, dtype=torch.float32)
-    y = torch.tensor(yy.reshape(-1, 1)[:n_points], device=device, dtype=torch.float32)
+    t = torch.tensor(tt.reshape(-1, 1), device=device, dtype=torch.float32)
+    y = torch.tensor(yy.reshape(-1, 1), device=device, dtype=torch.float32)
     return {"t": t, "y": y, "margin": float(margin)}
 
 
@@ -597,14 +685,14 @@ def _consumption_clip_fractions(comp: Dict[str, torch.Tensor]) -> Dict[str, floa
     kappa_raw = comp["kappa_raw"]
     c_level_raw = comp["c_level_raw"]
     return {
-        "clip_frac_kappa_low": float(
-            (kappa_raw <= kappa_min_bound + 1e-7).float().mean().item()),
-        "clip_frac_kappa_high": float(
-            (kappa_raw >= kappa_max_bound - 1e-7).float().mean().item()),
-        "clip_frac_c_level_low": float(
-            (c_level_raw <= c_min_bound + 1e-7).float().mean().item()),
-        "clip_frac_c_level_high": float(
-            (c_level_raw >= c_max_bound - 1e-7).float().mean().item()),
+        "clip_frac_kappa_low": (0.0 if kappa_min_bound is None else float(
+            (kappa_raw <= float(kappa_min_bound) + 1e-7).float().mean().item())),
+        "clip_frac_kappa_high": (0.0 if kappa_max_bound is None else float(
+            (kappa_raw >= float(kappa_max_bound) - 1e-7).float().mean().item())),
+        "clip_frac_c_level_low": (0.0 if c_min_bound is None else float(
+            (c_level_raw <= float(c_min_bound) + 1e-7).float().mean().item())),
+        "clip_frac_c_level_high": (0.0 if c_max_bound is None else float(
+            (c_level_raw >= float(c_max_bound) - 1e-7).float().mean().item())),
     }
 
 
@@ -627,9 +715,9 @@ def eval_diag_metrics(value_net: nn.Module, diag: Dict[str, torch.Tensor]) -> Di
     V_w_safe = torch.clamp(V_w, min=1e-8)
     c_raw = V_w_safe.pow(-1.0 / gamma_risk)
     kappa_raw = c_raw / W
-    kappa = torch.clamp(kappa_raw, min=kappa_min_bound, max=kappa_max_bound)
+    kappa = _clamp_optional(kappa_raw, kappa_min_bound, kappa_max_bound)
     c_level_raw = kappa * W
-    c_eval = torch.clamp(c_level_raw, min=c_min_bound, max=c_max_bound)
+    c_eval = _clamp_optional(c_level_raw, c_min_bound, c_max_bound)
 
     t_np = t.detach().cpu().numpy()
     W_np = W.detach().cpu().numpy()
@@ -646,6 +734,8 @@ def eval_diag_metrics(value_net: nn.Module, diag: Dict[str, torch.Tensor]) -> Di
     bundle_delta = np.sqrt((Vw_np - Vw_cf) ** 2 + (Vww_np - Vww_cf) ** 2)
     e_D = float(np.max(bundle_delta))
     a = _diffusion_variance(pi_eval)
+    pi_l2 = torch.linalg.vector_norm(pi_eval, dim=1)
+    chi_eval = c_eval / W
     out = {
         "e_V_sup": e_V,
         "e_bundle_sup": e_D,
@@ -656,6 +746,15 @@ def eval_diag_metrics(value_net: nn.Module, diag: Dict[str, torch.Tensor]) -> Di
         "m_Vw": float(V_w.min().item()),
         "m_minus_Vww": float((-V_ww).min().item()),
         "m_curvature_y": float(d.min().item()),
+        "m_y": float(V_y.min().item()),
+        "M_y": float(V_y.max().item()),
+        "m_c": float(d.min().item()),
+        "pi_component_min_greedy": float(pi_eval.min().item()),
+        "pi_component_max_greedy": float(pi_eval.max().item()),
+        "pi_l2_min_greedy": float(pi_l2.min().item()),
+        "pi_l2_max_greedy": float(pi_l2.max().item()),
+        "chi_min_greedy": float(chi_eval.min().item()),
+        "chi_max_greedy": float(chi_eval.max().item()),
         "guard_frac_Vw": float((V_w <= 1e-8).float().mean().item()),
         "guard_frac_curvature": float((d <= 1e-8).float().mean().item()),
         "clip_frac_pi_greedy": _clip_fraction_pi(pi_raw),
@@ -682,8 +781,8 @@ class PIPINN_MultiAsset_Consumption_LogW:
         scheduler_factor: float = 0.5,
         scheduler_min_lr: float = 1e-6,
         clip_abs: Optional[float] = pi_clip_abs,
-        c_min: float = c_min_bound,
-        c_max: float = c_max_bound,
+        c_min: Optional[float] = c_min_bound,
+        c_max: Optional[float] = c_max_bound,
         lr_schedule: str = "carry_plateau",
         adam_reset: str = "keep",
         carry_lr_min: float = 1e-5,
@@ -771,17 +870,27 @@ class PIPINN_MultiAsset_Consumption_LogW:
         n = t.shape[0]
         W = torch.exp(y.detach())
         if method == "zero":
-            c_raw = torch.full((n, 1), self.c_min, device=self.device)
+            # Consumption must stay positive even without artificial box
+            # bounds; this is an admissibility/numerical guard, not a level
+            # projection.
+            floor = 1e-8 if self.c_min is None else float(self.c_min)
+            c_raw = torch.full((n, 1), floor, device=self.device)
         elif method == "proportional":
             c_raw = rho_discount * W
         elif method == "random":
-            c_raw = self.c_min + torch.rand(n, 1, device=self.device) * (self.c_max - self.c_min)
+            if self.c_min is None or self.c_max is None:
+                c_raw = rho_discount * W * (
+                    0.5 + torch.rand(n, 1, device=self.device))
+            else:
+                c_raw = float(self.c_min) + torch.rand(
+                    n, 1, device=self.device) * (
+                        float(self.c_max) - float(self.c_min))
         else:
             raise ValueError(f"Unknown c init method: {method}")
         kappa_raw = c_raw / W
-        kappa = torch.clamp(kappa_raw, min=kappa_min_bound, max=kappa_max_bound)
+        kappa = _clamp_optional(kappa_raw, kappa_min_bound, kappa_max_bound)
         c_level_raw = kappa * W
-        c = torch.clamp(c_level_raw, self.c_min, self.c_max)
+        c = _clamp_optional(c_level_raw, self.c_min, self.c_max)
         if return_components:
             return c, {
                 "c_raw": c_raw.detach(),
@@ -821,9 +930,9 @@ class PIPINN_MultiAsset_Consumption_LogW:
         V_w_safe = torch.clamp(V_w, min=1e-8)
         c_raw = V_w_safe.pow(-1.0 / gamma_risk)
         kappa_raw = c_raw / W
-        kappa = torch.clamp(kappa_raw, min=kappa_min_bound, max=kappa_max_bound)
+        kappa = _clamp_optional(kappa_raw, kappa_min_bound, kappa_max_bound)
         c_level_raw = kappa * W
-        c = torch.clamp(c_level_raw, min=self.c_min, max=self.c_max)
+        c = _clamp_optional(c_level_raw, self.c_min, self.c_max)
         pi_raw = compute_pi_from_foc_log_multi(V_y, V_yy, Sigma_inv_mu, return_raw=True)
         pi = pi_raw if self.clip_abs is None else torch.clamp(
             pi_raw, -float(self.clip_abs), float(self.clip_abs))
@@ -1205,8 +1314,130 @@ class PIPINN_MultiAsset_Consumption_LogW:
         last_model_path = os.path.join(weight_dir, "value_net_last.pt")
         final_model_path = os.path.join(weight_dir, "value_net_final.pt")
         iterate_dir = os.path.join(weight_dir, "iterates")
+        manifest_path = os.path.join(weight_dir, "checkpoint_manifest.json")
         if e3b_checkpoints or save_iterate_every > 0:
             os.makedirs(iterate_dir, exist_ok=True)
+
+        checkpoint_records: Dict[int, Dict] = {}
+        checkpoint_manifest = {
+            "schema_version": 1,
+            "created_at": mxu.now_iso(),
+            "updated_at": mxu.now_iso(),
+            "status": "running",
+            "trainer_protocol": TRAINER_METADATA["trainer_protocol"],
+            "trainer_protocol_version": TRAINER_METADATA["trainer_protocol_version"],
+            "trainer_source_marker": TRAINER_METADATA["trainer_source_marker"],
+            "trainer_source_sha256": TRAINER_METADATA["trainer_source_sha256"],
+            "policy_guard_mode": TRAINER_METADATA["policy_guard_mode"],
+            "policy_guard_version": TRAINER_METADATA["policy_guard_version"],
+            "policy_bounds_mode": TRAINER_METADATA["policy_bounds_mode"],
+            "resolved_policy_bounds": {
+                "portfolio_min": pi_min_bound,
+                "portfolio_max": pi_max_bound,
+                "kappa_min": kappa_min_bound,
+                "kappa_max": kappa_max_bound,
+                "consumption_min": c_min_bound,
+                "consumption_max": c_max_bound,
+            },
+            "policy_numerator_guard_eps": TRAINER_METADATA[
+                "policy_numerator_guard_eps"
+            ],
+            "policy_denominator_guard_eps": TRAINER_METADATA[
+                "policy_denominator_guard_eps"
+            ],
+            "inner_selection_restore_contract": TRAINER_METADATA[
+                "inner_selection_restore_contract"
+            ],
+            "checkpoint_timing_contract": TRAINER_METADATA[
+                "checkpoint_timing_contract"
+            ],
+            "requested_outer_iters": int(outer_iters),
+            "checkpoint_policy": {
+                "e3b_checkpoints": bool(e3b_checkpoints),
+                "save_iterate_every": int(save_iterate_every),
+                "timing_mode": bool(timing_mode),
+            },
+            "resolved_training_protocol": {
+                "inner_best_restore": bool(inner_best_restore),
+                "inner_selection": (
+                    "heldout-residual" if inner_best_restore else "disabled"
+                ),
+                "inner_restore": (
+                    "model-plus-optimizer"
+                    if inner_best_restore else "final-inner-iterate"
+                ),
+                "checkpoint_timing": (
+                    "post-policy-evaluation-after-optional-heldout-restore"
+                ),
+            },
+            "indexing": {
+                "checkpoint_outer_index_base": 1,
+                "source_iter_offset_from_checkpoint_outer": -1,
+                "target_policy_iter_offset_from_checkpoint_outer": 0,
+                "description": (
+                    "outer 1 evaluates the initial policy and produces value iterate 0; "
+                    "value_net_iterNNNN therefore has exact-map source_iter NNNN-1 "
+                    "and target_policy_iter NNNN"
+                ),
+            },
+            "state_hash": {
+                "algorithm": "sha256",
+                "representation": "canonical-sorted-state-dict-tensors",
+                "note": "file_sha256 is not used to decide model-state equality",
+            },
+            "checkpoints": [],
+        }
+
+        def snapshot_value_state() -> Dict[str, torch.Tensor]:
+            return {
+                key: tensor.detach().cpu().clone()
+                for key, tensor in self.value_net.state_dict().items()
+            }
+
+        def relative_weight_path(path: str) -> str:
+            return os.path.relpath(path, weight_dir)
+
+        def write_checkpoint_manifest(status: Optional[str] = None) -> None:
+            if status is not None:
+                checkpoint_manifest["status"] = status
+            checkpoint_manifest["updated_at"] = mxu.now_iso()
+            checkpoint_manifest["checkpoints"] = [
+                checkpoint_records[key] for key in sorted(checkpoint_records)
+            ]
+            mxu.save_json_atomic(manifest_path, checkpoint_manifest)
+
+        def save_iterate_checkpoint(
+            outer_iter: int,
+            reason: str,
+            state: Optional[Dict[str, torch.Tensor]] = None,
+            *,
+            update_manifest: bool = True,
+        ) -> Dict:
+            outer_iter = int(outer_iter)
+            state = snapshot_value_state() if state is None else state
+            path = os.path.join(iterate_dir, f"value_net_iter{outer_iter:04d}.pt")
+            torch.save(state, path)
+            previous = checkpoint_records.get(outer_iter, {})
+            reasons = list(previous.get("reasons", []))
+            if reason not in reasons:
+                reasons.append(reason)
+            record = {
+                "checkpoint_outer_iter": outer_iter,
+                "source_iter": outer_iter - 1,
+                "target_policy_iter": outer_iter,
+                "path": relative_weight_path(path),
+                "reasons": reasons,
+                "state_sha256": mxu.canonical_state_dict_sha256(state),
+                "file_sha256": mxu.sha256_file(path),
+            }
+            checkpoint_records[outer_iter] = record
+            if update_manifest:
+                write_checkpoint_manifest()
+            return record
+
+        # Written before the first outer iteration so a failed/interrupted run
+        # cannot be mistaken for a completed trajectory.
+        write_checkpoint_manifest()
 
         val_set = None
         if val_points > 0 and not (timing_mode and pres_target is None):
@@ -1220,8 +1451,8 @@ class PIPINN_MultiAsset_Consumption_LogW:
         diag_col = None
         if diag_points > 0 and not timing_mode:
             diag = build_diag_set(diag_points, diag_margin)
-            diag_col = build_validation_set(
-                diag_points, 1, self.device, int(val_seed) + 104729)
+            # E1 ellipticity uses a fixed dense tensor grid on all Q_col.
+            diag_col = build_diag_set(diag_points, 0.0)
 
         # initial sample
         t_colloc, y_colloc = sample_interior(batch_size, self.device)
@@ -1331,11 +1562,48 @@ class PIPINN_MultiAsset_Consumption_LogW:
             results["eval_loss"].append(last_eval_loss)
             results["eta_loss"].append(eval_loss_hist[-1]["eta"])
 
-            # policy improvement for metrics
-            c_new, pi_new = self.policy_improvement(t_colloc, y_colloc)
+            # Figure-1 control trajectories use one fixed Q_ev grid across
+            # every outer iteration and every training seed.  The frozen
+            # policy is exactly the alpha_n used in this outer's linear PDE;
+            # the current network generates alpha_{n+1}.
+            if diag is not None:
+                metric_t, metric_y = diag["t"], diag["y"]
+                if policy_source is None:
+                    c_frozen_metric, pi_frozen_metric, frozen_metric_comp = (
+                        self.initialize_policy(
+                            metric_t, metric_y, pi_init_method,
+                            pi_init_scale, c_init_method
+                        )
+                    )
+                else:
+                    c_frozen_metric, pi_frozen_metric, frozen_metric_comp = (
+                        self._policy_components(
+                            metric_t, metric_y, net=policy_source
+                        )
+                    )
+                c_new, pi_new = self.policy_improvement_chunked(
+                    metric_t, metric_y)
+                control_metric_scope = "fixed_qev"
+            else:
+                metric_t, metric_y = t_colloc, y_colloc
+                if policy_source is None:
+                    c_frozen_metric, pi_frozen_metric, frozen_metric_comp = (
+                        self.initialize_policy(
+                            metric_t, metric_y, pi_init_method,
+                            pi_init_scale, c_init_method
+                        )
+                    )
+                else:
+                    c_frozen_metric, pi_frozen_metric, frozen_metric_comp = (
+                        self._policy_components(
+                            metric_t, metric_y, net=policy_source
+                        )
+                    )
+                c_new, pi_new = self.policy_improvement(t_colloc, y_colloc)
+                control_metric_scope = "training_batch_fallback"
 
-            c_diff = ((c_new - c_n) ** 2).mean().item()
-            pi_diff = ((pi_new - pi_n) ** 2).mean().item()
+            c_diff = ((c_new - c_frozen_metric) ** 2).mean().item()
+            pi_diff = ((pi_new - pi_frozen_metric) ** 2).mean().item()
             results["c_diff"].append(c_diff)
             results["pi_diff"].append(pi_diff)
 
@@ -1345,8 +1613,8 @@ class PIPINN_MultiAsset_Consumption_LogW:
             results["pi_vs_closed_form"].append(pi_vs_cf)
 
             # closed form c
-            t_np = t_colloc.detach().cpu().numpy()
-            W_np = np.exp(y_colloc.detach().cpu().numpy())
+            t_np = metric_t.detach().cpu().numpy()
+            W_np = np.exp(metric_y.detach().cpu().numpy())
             c_star_np = closed_form_c(t_np, W_np)
             c_star = torch.tensor(c_star_np, device=self.device, dtype=torch.float32)
             c_vs_cf = ((c_new - c_star) ** 2).mean().item()
@@ -1356,6 +1624,17 @@ class PIPINN_MultiAsset_Consumption_LogW:
             results["pi_std"].append(pi_new.std().item())
             results["c_mean"].append(c_new.mean().item())
             results["c_std"].append(c_new.std().item())
+
+            frozen_pi_l2 = torch.linalg.vector_norm(pi_frozen_metric, dim=1)
+            frozen_chi = c_frozen_metric / torch.exp(metric_y)
+            frozen_control_ranges = {
+                "pi_component_min_frozen": float(pi_frozen_metric.min().item()),
+                "pi_component_max_frozen": float(pi_frozen_metric.max().item()),
+                "pi_l2_min_frozen": float(frozen_pi_l2.min().item()),
+                "pi_l2_max_frozen": float(frozen_pi_l2.max().item()),
+                "chi_min_frozen": float(frozen_chi.min().item()),
+                "chi_max_frozen": float(frozen_chi.max().item()),
+            }
 
             cur_lr = self.optimizer.param_groups[0]["lr"]
             results["lr"].append(cur_lr)
@@ -1381,31 +1660,32 @@ class PIPINN_MultiAsset_Consumption_LogW:
             # Q_col set for every outer iteration/training seed. This keeps
             # changes in the recorded range attributable to the policy, not
             # to a changing diagnostic sample.
-            frozen_var_min = frozen_var_max = frozen_clip = ""
-            frozen_c_clip = {
-                "clip_frac_kappa_low": "", "clip_frac_kappa_high": "",
-                "clip_frac_c_level_low": "", "clip_frac_c_level_high": "",
-            }
+            # Projection activation is reported on the same fixed Q_ev grid
+            # as the E1 control ranges. Q_col below is reserved for the
+            # uniform-ellipticity range required by the supplement.
+            frozen_clip = _clip_fraction_pi(frozen_metric_comp["pi_raw"])
+            frozen_c_clip = _consumption_clip_fractions(frozen_metric_comp)
+            frozen_var_min = frozen_var_max = ""
             if diag_col is not None:
                 if policy_source is None:
-                    _, pi_diag_frozen, frozen_diag_comp = self.initialize_policy(
-                        diag_col["t_int"], diag_col["y_int"],
+                    _, pi_diag_frozen, _ = self.initialize_policy(
+                        diag_col["t"], diag_col["y"],
                         pi_init_method, pi_init_scale, c_init_method)
                 else:
-                    _, pi_diag_frozen, frozen_diag_comp = self._policy_components(
-                        diag_col["t_int"], diag_col["y_int"], net=policy_source)
+                    _, pi_diag_frozen, _ = self._policy_components(
+                        diag_col["t"], diag_col["y"], net=policy_source)
                 variance = _diffusion_variance(pi_diag_frozen)
                 frozen_var_min = float(variance.min().item())
                 frozen_var_max = float(variance.max().item())
-                frozen_clip = _clip_fraction_pi(frozen_diag_comp["pi_raw"])
-                frozen_c_clip = _consumption_clip_fractions(frozen_diag_comp)
 
             save_this = ((e3b_checkpoints and (it <= 10 or it % 10 == 0))
                          or (not e3b_checkpoints and save_iterate_every > 0
                              and it % save_iterate_every == 0))
             if save_this and not timing_mode:
-                torch.save(self.value_net.state_dict(),
-                           os.path.join(iterate_dir, f"value_net_iter{it:04d}.pt"))
+                save_iterate_checkpoint(
+                    it,
+                    "e3b-schedule" if e3b_checkpoints else "periodic-schedule",
+                )
 
             last = eval_loss_hist[-1]
             outer_row = {
@@ -1435,6 +1715,8 @@ class PIPINN_MultiAsset_Consumption_LogW:
                 "lr_carried_next": eval_info["lr_carried_next"],
                 "pi_diff": pi_diff, "c_diff": c_diff,
                 "pi_vs_closed_form": pi_vs_cf, "c_vs_closed_form": c_vs_cf,
+                "control_metric_scope": control_metric_scope,
+                "control_metric_points": int(metric_t.shape[0]),
                 "diffusion_var_min_frozen": frozen_var_min,
                 "diffusion_var_max_frozen": frozen_var_max,
                 "clip_frac_pi_frozen": frozen_clip,
@@ -1445,6 +1727,7 @@ class PIPINN_MultiAsset_Consumption_LogW:
                 "lr": cur_lr,
             }
             outer_row.update(diag_res)
+            outer_row.update(frozen_control_ranges)
             results["outer_rows"].append(outer_row)
 
             if verbose:
@@ -1473,20 +1756,85 @@ class PIPINN_MultiAsset_Consumption_LogW:
         results["pres_max"] = max(results["val_pres"]) if results["val_pres"] else None
         results["total_inner_steps"] = int(sum(results["inner_epochs_used"]))
         results["all_targets_reached"] = bool(results["target_flags"]) and all(results["target_flags"])
+        final_state = None
+        final_it = 0
+        final_state_sha256 = None
+        final_file_sha256 = None
+        last_file_sha256 = None
+        final_iterate_record = None
         if results["outer_rows"]:
-            torch.save(self.value_net.state_dict(), final_model_path)
-            torch.save(self.value_net.state_dict(), last_model_path)
+            final_it = int(results["outer_rows"][-1]["outer_iter"])
+            final_state = snapshot_value_state()
+            final_state_sha256 = mxu.canonical_state_dict_sha256(final_state)
+            torch.save(final_state, final_model_path)
+            torch.save(final_state, last_model_path)
+            final_file_sha256 = mxu.sha256_file(final_model_path)
+            last_file_sha256 = mxu.sha256_file(last_model_path)
         if best_diag_state is not None and not timing_mode:
             torch.save(best_diag_state, best_model_path)
             print(
                 f"Saved diagnostic best held-out state: outer={best_iter}, "
                 f"score={best_eval_loss:.3e} -> {best_model_path}")
-        if e3b_checkpoints and results["outer_rows"]:
-            final_it = int(results["outer_rows"][-1]["outer_iter"])
-            torch.save(self.value_net.state_dict(),
-                       os.path.join(iterate_dir, f"value_net_iter{final_it:04d}.pt"))
+        if (e3b_checkpoints or save_iterate_every > 0) and final_state is not None:
+            # The official final state is always present in an enabled iterate
+            # schedule, even when the requested period does not divide the
+            # number of completed outer iterations.
+            final_iterate_record = save_iterate_checkpoint(
+                final_it, "official-final", final_state, update_manifest=False)
         if results["outer_rows"]:
             print(f"\nSaved official FINAL iterate: {final_model_path}")
+
+        if final_state is not None:
+            final_artifacts = {
+                "final": {
+                    "path": relative_weight_path(final_model_path),
+                    "state_sha256": final_state_sha256,
+                    "file_sha256": final_file_sha256,
+                },
+                "last": {
+                    "path": relative_weight_path(last_model_path),
+                    "state_sha256": final_state_sha256,
+                    "file_sha256": last_file_sha256,
+                },
+            }
+            if final_iterate_record is not None:
+                final_artifacts["iterate"] = {
+                    "path": final_iterate_record["path"],
+                    "state_sha256": final_iterate_record["state_sha256"],
+                    "file_sha256": final_iterate_record["file_sha256"],
+                }
+            checkpoint_manifest["official_final"] = {
+                "outer_iter": final_it,
+                "state_sha256": final_state_sha256,
+                "artifacts": final_artifacts,
+            }
+            manifest_status = (
+                "stopped_early" if results.get("stopped_early", False) else "complete"
+            )
+        else:
+            manifest_status = (
+                "stopped_early" if results.get("stopped_early", False)
+                else "no_completed_outer"
+            )
+        checkpoint_manifest["completed_outer_iters"] = len(results["outer_rows"])
+        write_checkpoint_manifest(manifest_status)
+
+        results["checkpoint_provenance"] = {
+            "checkpoint_manifest_path": manifest_path,
+            "checkpoint_manifest_sha256": mxu.sha256_file(manifest_path),
+            "checkpoint_manifest_schema_version": checkpoint_manifest["schema_version"],
+            "final_outer_iter": final_it,
+            "final_checkpoint_state_sha256": final_state_sha256,
+            "final_checkpoint_file_sha256": final_file_sha256,
+            "last_checkpoint_state_sha256": final_state_sha256,
+            "last_checkpoint_file_sha256": last_file_sha256,
+            "final_iterate_state_sha256": (
+                final_iterate_record["state_sha256"] if final_iterate_record is not None else None
+            ),
+            "final_iterate_file_sha256": (
+                final_iterate_record["file_sha256"] if final_iterate_record is not None else None
+            ),
+        }
 
         return results
 
@@ -1787,14 +2135,31 @@ def main():
     if ARGS.pi_clip_abs is not None and ARGS.pi_clip_abs <= 0.0:
         raise ValueError("--pi-clip-abs must be positive or none")
 
+    stopper = None
+    if not ARGS.eval_only and ARGS.pde_stop_threshold is not None:
+        stopper = mxu.PDEEarlyStopper(
+            threshold=float(ARGS.pde_stop_threshold),
+            start_outer=int(ARGS.pde_stop_start_outer),
+            patience=int(ARGS.pde_stop_patience),
+            stop_flag_path=str(ARGS.stop_flag_path or ""), recorder=recorder,
+            run_tag=ARGS.run_tag, model_type=ARGS.model_type)
+        if stopper.shared_stop_exists():
+            # A pre-existing shared flag means no new training attempt.  Check
+            # it before rotating any same-tag checkpoints from an older run.
+            info = stopper.mark_from_existing_flag(outer_iter=0, pde_loss=None)
+            print(f"[early-stop] shared stop flag already exists; skipping run: {info}")
+            return
+
     if ARGS.eval_only:
-        recorder.save_config_eval()
+        recorder.save_config_eval(extra=TRAINER_METADATA)
     else:
-        recorder.save_config()
         recorder.rotate_training_logs()
+        recorder.rotate_training_checkpoints()
+        recorder.save_config(extra=TRAINER_METADATA)
         recorder.save_market_snapshot(
             mu_excess=mu_excess_np, Sigma_safe=Sigma_np, chol=chol_Sigma_np,
-            pi_star=pi_star_np, Theta=np.array([Theta]), nu=np.array([nu]),
+            Sigma_inv_mu=Sigma_inv_mu_np, pi_star=pi_star_np,
+            Theta=np.array([Theta]), nu=np.array([nu]),
             gamma=np.array([gamma_risk]), r=np.array([r_rate]),
             rho_discount=np.array([rho_discount]), epsilon=np.array([epsilon]),
             T=np.array([T_FINAL]), w_min=np.array([x_min]), w_max=np.array([x_max]),
@@ -1825,24 +2190,14 @@ def main():
             carry_lr_max=float(ARGS.carry_lr_max),
             device=device,
         )
-
-        stopper = None
-        if not ARGS.eval_only and ARGS.pde_stop_threshold is not None:
-            stopper = mxu.PDEEarlyStopper(
-                threshold=float(ARGS.pde_stop_threshold),
-                start_outer=int(ARGS.pde_stop_start_outer),
-                patience=int(ARGS.pde_stop_patience),
-                stop_flag_path=str(ARGS.stop_flag_path or ""), recorder=recorder,
-                run_tag=ARGS.run_tag, model_type=ARGS.model_type)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         results = None
         loaded_weight_path = None
+        train_gpu_peak = None
         if not ARGS.eval_only:
             recorder.write_status("running")
-            if stopper is not None and stopper.shared_stop_exists():
-                info = stopper.mark_from_existing_flag(outer_iter=0, pde_loss=None)
-                print(f"[early-stop] shared stop flag already exists; skipping run: {info}")
-                return
             results = solver.run_policy_iteration(
                 outer_iters=int(ARGS.outer_iters),
                 eval_epochs=int(ARGS.eval_epochs),
@@ -1877,6 +2232,10 @@ def main():
                 weight_dir=weight_dir, recorder=recorder, stopper=stopper,
             )
             elapsed = time.time() - start
+            if device.type == "cuda":
+                train_gpu_peak = int(torch.cuda.max_memory_allocated(device))
+                # Evaluation receives its own peak-memory measurement.
+                torch.cuda.reset_peak_memory_stats(device)
             h = int(elapsed // 3600); m = int((elapsed % 3600) // 60); s = elapsed % 60
             print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
 
@@ -1893,8 +2252,15 @@ def main():
                     "sel_best_pres", "sel_best_epoch", "sel_best_lr", "sel_checks", "sel_stopped",
                     "sel_restored", "lr_end_before_restore", "lr_best_checkpoint", "lr_after_restore",
                     "lr_carried_next", "pi_diff", "c_diff", "pi_vs_closed_form", "c_vs_closed_form",
+                    "control_metric_scope", "control_metric_points",
                     "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_pi",
-                    "diag_RelL2_c", "m_Vw", "m_minus_Vww", "m_curvature_y", "guard_frac_Vw",
+                    "diag_RelL2_c", "m_Vw", "m_minus_Vww", "m_curvature_y",
+                    "m_y", "M_y", "m_c", "pi_component_min_greedy",
+                    "pi_component_max_greedy", "pi_l2_min_greedy", "pi_l2_max_greedy",
+                    "chi_min_greedy", "chi_max_greedy",
+                    "pi_component_min_frozen", "pi_component_max_frozen",
+                    "pi_l2_min_frozen", "pi_l2_max_frozen",
+                    "chi_min_frozen", "chi_max_frozen", "guard_frac_Vw",
                     "guard_frac_curvature", "clip_frac_pi_greedy", "clip_frac_kappa_low",
                     "clip_frac_kappa_high", "clip_frac_c_level_low", "clip_frac_c_level_high",
                     "diffusion_var_min_greedy", "diffusion_var_max_greedy",
@@ -1906,6 +2272,9 @@ def main():
                 recorder.write_status(
                     "stopped_early", elapsed_sec=elapsed,
                     final_weight_path=os.path.join(weight_dir, "value_net_final.pt"),
+                    train_gpu_peak_mem_bytes=train_gpu_peak,
+                    policy_bounds_mode=policy_bounds_mode,
+                    **results.get("checkpoint_provenance", {}),
                     **results.get("stop_info", {}))
                 print("[early-stop] training stopped; evaluation and success marker skipped.")
                 return
@@ -1927,6 +2296,10 @@ def main():
             solver.value_net.load_state_dict(torch.load(load_path, map_location=device))
             loaded_weight_path = load_path
             print(f"[eval-only] loaded {load_path}")
+            if device.type == "cuda":
+                # Exclude model construction/checkpoint loading from the
+                # evaluation-only peak, matching the direct PINN protocol.
+                torch.cuda.reset_peak_memory_stats(device)
 
         margins = mxu.parse_eval_margins(ARGS.eval_margin)
         if ARGS.skip_eval:
@@ -1939,12 +2312,20 @@ def main():
                 recorder.mark_success(
                     elapsed_sec=elapsed, final_weight_path=final_path, skipped_eval=True,
                     best_weight_path=os.path.join(weight_dir, "value_net_best_diag.pt"),
+                    outer_iters=len(results["outer_rows"]),
                     total_optimizer_steps=results["total_optimizer_steps"],
                     total_inner_steps=results["total_inner_steps"],
                     pres_target=ARGS.pres_target, pres_max=results["pres_max"],
                     any_target_reached=bool(results["target_reached"]),
                     target_reached=bool(results["all_targets_reached"]),
-                    target_reached_semantics="all_outer_training_validation_crossings")
+                    target_reached_semantics="all_outer_training_validation_crossings",
+                    train_gpu_peak_mem_bytes=train_gpu_peak,
+                    policy_bounds_mode=policy_bounds_mode,
+                    policy_pi_min=pi_min_bound, policy_pi_max=pi_max_bound,
+                    policy_kappa_min=kappa_min_bound,
+                    policy_kappa_max=kappa_max_bound,
+                    policy_c_min=c_min_bound, policy_c_max=c_max_bound,
+                    **results.get("checkpoint_provenance", {}))
             return
 
         # Full random test if requested; test_points=0 is the deterministic
@@ -1996,6 +2377,10 @@ def main():
                 tt, ww, V_pinn, c_pinn, pi_norm,
                 save_path=os.path.join(out_dir, "plots", "comparison_heatmap.png"), show=False)
 
+        eval_gpu_peak = None
+        if device.type == "cuda":
+            eval_gpu_peak = int(torch.cuda.max_memory_allocated(device))
+
         if ARGS.eval_only:
             if os.path.exists(recorder.metrics_csv):
                 backup_path = metrics_final_path + ".bak_train"
@@ -2005,7 +2390,8 @@ def main():
                 recorder.metrics_csv = metrics_final_path
             recorder.mark_success_eval(
                 elapsed_sec=elapsed, primary_margin=margins[0],
-                loaded_weight_path=loaded_weight_path)
+                loaded_weight_path=loaded_weight_path,
+                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins)
         else:
             first_outer = results["outer_rows"][0] if results["outer_rows"] else {}
             recorder.mark_success(
@@ -2020,8 +2406,16 @@ def main():
                 target_reached_semantics="all_outer_training_validation_crossings",
                 pi_init_scale=float(ARGS.pi_init_scale),
                 pi_clip_abs=pi_clip_abs,
+                policy_bounds_mode=policy_bounds_mode,
+                policy_pi_min=pi_min_bound, policy_pi_max=pi_max_bound,
+                policy_kappa_min=kappa_min_bound,
+                policy_kappa_max=kappa_max_bound,
+                policy_c_min=c_min_bound, policy_c_max=c_max_bound,
                 diffusion_var_min_init=first_outer.get("diffusion_var_min_frozen", ""),
-                diffusion_var_max_init=first_outer.get("diffusion_var_max_frozen", ""))
+                diffusion_var_max_init=first_outer.get("diffusion_var_max_frozen", ""),
+                train_gpu_peak_mem_bytes=train_gpu_peak,
+                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins,
+                **results.get("checkpoint_provenance", {}))
         print("\nDone.")
     except Exception as exc:
         if ARGS.eval_only:

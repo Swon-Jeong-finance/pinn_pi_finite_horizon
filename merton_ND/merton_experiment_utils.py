@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import socket
 import time
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -58,6 +59,46 @@ def save_json(path: str, data: Dict[str, Any]) -> None:
     ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True, default=json_default)
+
+
+def save_json_atomic(path: str, data: Dict[str, Any]) -> None:
+    """Atomically replace a JSON artifact after writing it completely."""
+    ensure_dir(os.path.dirname(path))
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True, default=json_default)
+    os.replace(tmp_path, path)
+
+
+def sha256_file(path: str) -> str:
+    """Hash file bytes for corruption detection (not model-state identity)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_state_dict_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Hash tensor content independently of ``torch.save`` container bytes.
+
+    PyTorch's serialization container is not the identity of a model state:
+    independently saving the same tensors need not be assumed to yield the
+    same file bytes.  This digest uses sorted tensor names, dtype, shape, and
+    contiguous numerical bytes, matching the canonical-array convention used
+    by the exact-map post-processor.
+    """
+    digest = hashlib.sha256()
+    for name in sorted(state_dict):
+        tensor = state_dict[name]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"state_dict entry {name!r} is not a tensor")
+        value = np.ascontiguousarray(tensor.detach().cpu().numpy())
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(str(value.dtype).encode("ascii") + b"\0")
+        digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
+        digest.update(value.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def append_csv_rows(path: str, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
@@ -177,6 +218,32 @@ class ExperimentRecorder:
                 os.replace(path, dst)
                 print(f"[recorder] previous log archived: {os.path.basename(path)} "
                       f"-> {os.path.basename(dst)}")
+
+    def rotate_training_checkpoints(self) -> None:
+        """Archive checkpoint artifacts before a new same-tag training run.
+
+        Exact-map checkpoint discovery is filename based.  Leaving an older
+        ``iterates/`` directory in place can silently mix two trajectories
+        when a forced rerun stops earlier or changes its save schedule.  A
+        timestamped rename preserves the old artifacts while guaranteeing
+        that the new manifest describes only the new run.
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        names = (
+            "iterates",
+            "checkpoint_manifest.json",
+            "value_net_final.pt",
+            "value_net_last.pt",
+            "value_net_best_diag.pt",
+        )
+        for name in names:
+            path = os.path.join(self.weight_dir, name)
+            if not os.path.exists(path):
+                continue
+            dst = f"{path}.old.{stamp}"
+            os.replace(path, dst)
+            print(f"[recorder] previous checkpoint artifact archived: {name} "
+                  f"-> {os.path.basename(dst)}")
 
     def save_config(self, extra: Optional[Dict[str, Any]] = None) -> None:
         data = {

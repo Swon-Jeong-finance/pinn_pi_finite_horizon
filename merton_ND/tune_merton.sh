@@ -11,7 +11,9 @@ set -euo pipefail
 # Examples:
 #   DEVICE_LIST="cuda:0,cuda:1" bash tune_merton.sh outputs_merton/run 2
 #   SEEDS="1,2" N_ASSETS_LIST="10" DEVICE_LIST="cuda:0,cuda:1" bash tune_merton.sh out 2
-#   PIPINN_OVERRIDES="theta_init_scale=0.5 pi_clip_abs=none" bash tune_merton.sh out
+#   PINN_OVERRIDES="policy_bounds_mode=none" PIPINN_OVERRIDES="policy_bounds_mode=none" \
+#     bash tune_merton.sh out  # no finite action boxes in either method
+#   PIPINN_OVERRIDES="e3b_checkpoints=1" bash tune_merton.sh out  # exact-map trajectory
 #   AGGREGATE=0 bash tune_merton.sh ...        # skip the seed-aggregation step
 #   FORCE_RERUN=1 bash tune_merton.sh ...      # ignore previous _SUCCESS
 #   EVAL_ONLY=1 bash tune_merton.sh ...        # re-evaluate from saved weights
@@ -30,7 +32,8 @@ EVAL_ONLY="${EVAL_ONLY:-0}"          # 1: skip training, re-evaluate from weight
 ALLOW_LEGACY_BEST_EVAL="${ALLOW_LEGACY_BEST_EVAL:-0}"  # eval-only diagnostic/legacy fallback
 AGGREGATE="${AGGREGATE:-1}"          # 1: run aggregate_seeds after the sweep
 
-# Paper sweep defaults: N={10,50}, methods={PINN,PI-PINN}, seeds=1,...,10.
+# Paper sweep defaults: N={10,50}, methods={PINN,PI-PINN}, and ten fixed
+# training seeds {1,2,3,5,7,11,17,23,42,101}.
 # When SEEDS is set, every run_* call WITHOUT an explicit
 # seed=... override expands into one job per seed (seed goes into the tag, so
 # each seed gets its own output/weight dir). market_seed stays fixed so all
@@ -132,7 +135,7 @@ declare -A BASE_PINN=(
   [mu_noise_rel]=0.02
   [value_hidden]=256
   [value_depth]=3
-  [batch_size]=5000
+  [batch_size]=10000
   [terminal_frac]=0.25
   [lr]=5e-4
   [outer_iters]=20
@@ -142,10 +145,24 @@ declare -A BASE_PINN=(
   [scheduler_factor]=0.5
   [scheduler_min_lr]=1e-8
   [lr_schedule]=plateau
+  # Direct nonlinear-HJB guard. Use PINN_OVERRIDES or an explicit run_pinn
+  # override for comparisons with the historical abs/hard continuations.
+  [hjb_guard_mode]=softplus
+  [hjb_vy_guard_eps]=1e-8
+  [hjb_denom_guard_eps]=1e-8
+  [hjb_vy_guard_tau]=0.05
+  [hjb_denom_guard_tau]=0.05
+  [hjb_vy_guard_tau_min]=1e-4
+  [hjb_denom_guard_tau_min]=1e-4
+  # First softplus pilot keeps tau fixed. Set a positive number of outer
+  # blocks here (or via PINN_OVERRIDES) to enable staged continuation.
+  [hjb_guard_anneal_every]=0
+  [hjb_guard_anneal_factor]=0.5
   [w_terminal]=10.0
   [w_shape]=1.0
   [w_eta]=1.5
   [eta_clip]=10.0
+  [policy_bounds_mode]=stabilized
   [pi_clip_abs]="${PI_CLIP_ABS:-2.0}"
   [pres_target]=none
   [val_points]=50000
@@ -179,17 +196,18 @@ declare -A BASE_PIPINN=(
   [kappa_max]=30.0
   [pi_scale]=0.6
   [mu_noise_rel]=0.02
+  [policy_bounds_mode]=stabilized
   [pi_clip_abs]="${PI_CLIP_ABS:-2.0}"
   [kappa_max_bound]=3.0
   [utility_cap]=1e3
   [value_hidden]=256
   [value_depth]=3
-  [batch_size]=5000
+  [batch_size]=10000
   [terminal_frac]=0.5
   [lr]=5e-4
   [outer_iters]=20
   [eval_epochs]=2000
-  [scheduler_patience]=10
+  [scheduler_patience]=20
   [scheduler_factor]=0.5
   [scheduler_min_lr]=1e-8
   [lr_schedule]=carry_plateau
@@ -282,6 +300,12 @@ enqueue() {
     script="$PIPINN_SCRIPT"; flags="$(build_flags BASE_PIPINN "$@")"
   fi
   tag="$(auto_tag "$model" "$@")"
+  if [[ -n "${ENQUEUED_TAGS[$tag]+x}" ]]; then
+    echo "[error] duplicate resolved run tag: $tag" >&2
+    echo "        Check global overrides versus explicit run_* variants." >&2
+    return 2
+  fi
+  ENQUEUED_TAGS["$tag"]=1
   local out_dir="$OUT_ROOT/$model/$tag"
   local weight_dir="$OUT_ROOT/weights/$model/$tag"
   local log="$LOG_DIR/${tag}.log"
@@ -323,10 +347,48 @@ enqueue() {
 run_pinn()   { _run_model pinn   "$@"; }
 run_pipinn() { _run_model pipinn "$@"; }
 declare -A ENQUEUED_N=()
+declare -A ENQUEUED_TAGS=()
 _run_model() {
   local model="$1"; shift
+  # Environment-level overrides apply to every manual run line.  Resolve
+  # duplicate keys once, with the per-run arguments appended last so a tuning
+  # line can intentionally specialize a global setting without emitting
+  # duplicate CLI flags or a misleading auto-tag.
+  local -a all_overrides=()
+  if [[ "$model" == "pinn" ]]; then
+    all_overrides=("${PINN_OVERRIDE_ARGS[@]}" "$@")
+  else
+    all_overrides=("${PIPINN_OVERRIDE_ARGS[@]}" "$@")
+  fi
+  declare -A resolved_overrides=()
+  local -a override_order=()
+  local kv key value
+  for kv in "${all_overrides[@]}"; do
+    [[ "$kv" == *=* ]] || {
+      echo "[error] override must have key=value form: $kv" >&2
+      exit 2
+    }
+    key="${kv%%=*}"
+    value="${kv#*=}"
+    [[ -n "$key" ]] || {
+      echo "[error] override key must not be empty: $kv" >&2
+      exit 2
+    }
+    # Both spellings map to Python's --pi-init-scale. Canonicalize before
+    # deduplication so a later per-run value always wins over the global one.
+    [[ "$key" == "pi_init_scale" ]] && key="theta_init_scale"
+    if [[ -z "${resolved_overrides[$key]+x}" ]]; then
+      override_order+=("$key")
+    fi
+    resolved_overrides["$key"]="$value"
+  done
+  local -a merged_overrides=()
+  for key in "${override_order[@]}"; do
+    merged_overrides+=("$key=${resolved_overrides[$key]}")
+  done
+
   local has_seed=0 n_val=""
-  for kv in "$@"; do
+  for kv in "${merged_overrides[@]}"; do
     [[ "${kv%%=*}" == "seed" ]] && has_seed=1
     [[ "${kv%%=*}" == "n_assets" ]] && n_val="${kv#*=}"
   done
@@ -336,9 +398,11 @@ _run_model() {
   [[ "$n_val" =~ ^[1-9][0-9]*$ ]] || { echo "[error] invalid n_assets: $n_val" >&2; exit 2; }
   ENQUEUED_N["$n_val"]=1
   if [[ ${#SEED_LIST[@]} -gt 0 && $has_seed -eq 0 ]]; then
-    for sd in "${SEED_LIST[@]}"; do enqueue "$model" "$@" "seed=$sd"; done
+    for sd in "${SEED_LIST[@]}"; do
+      enqueue "$model" "${merged_overrides[@]}" "seed=$sd"
+    done
   else
-    enqueue "$model" "$@"
+    enqueue "$model" "${merged_overrides[@]}"
   fi
 }
 
@@ -405,17 +469,12 @@ run_all_jobs() {
 #   run_pipinn n_assets=50 w_eta=1.0 sel_patience=3
 #   run_pinn   n_assets=10 seed=1            # single-seed (no SEEDS expansion)
 
-run_pinn   n_assets=10
-run_pinn   n_assets=10 outer_iters=30
-run_pipinn n_assets=10
-run_pipinn n_assets=10 outer_iters=30
-run_pipinn n_assets=10 scheduler_patience=20
-
-run_pinn   n_assets=50
-run_pinn   n_assets=50 outer_iters=30
-run_pipinn n_assets=50 
-run_pipinn n_assets=50 outer_iters=30
-run_pipinn n_assets=50 scheduler_patience=20
+for n_assets in "${N_ASSET_VALUES[@]}"; do
+  run_pinn   "n_assets=$n_assets"
+  run_pinn   "n_assets=$n_assets" outer_iters=30
+  run_pipinn "n_assets=$n_assets"
+  run_pipinn "n_assets=$n_assets" outer_iters=30
+done
 
 
 

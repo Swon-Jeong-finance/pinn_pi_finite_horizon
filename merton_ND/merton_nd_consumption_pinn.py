@@ -54,6 +54,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
@@ -118,6 +119,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--scheduler-min-lr", type=float, default=1e-8)
     p.add_argument("--lr-schedule", type=str, default="plateau",
                    choices=["plateau", "fixed"])
+    # Nonlinear-HJB positivity continuation.  ``softplus`` is the new paper
+    # candidate; ``abs`` reproduces the historical PINN and ``hard``
+    # reproduces the unsuccessful hard one-sided pilot.
+    p.add_argument("--hjb-guard-mode", type=str, default="softplus",
+                   choices=["abs", "hard", "softplus"])
+    p.add_argument("--hjb-vy-guard-eps", type=float, default=1e-8)
+    p.add_argument("--hjb-denom-guard-eps", type=float, default=1e-8)
+    p.add_argument("--hjb-vy-guard-tau", type=float, default=1e-2)
+    p.add_argument("--hjb-denom-guard-tau", type=float, default=1e-2)
+    p.add_argument("--hjb-vy-guard-tau-min", type=float, default=1e-4)
+    p.add_argument("--hjb-denom-guard-tau-min", type=float, default=1e-4)
+    p.add_argument(
+        "--hjb-guard-anneal-every", type=int, default=0,
+        help="Outer blocks per tau reduction; 0 keeps tau fixed (recommended first pilot).")
+    p.add_argument("--hjb-guard-anneal-factor", type=float, default=0.5)
     # Loss weights
     p.add_argument("--w-terminal", type=float, default=10.0)
     p.add_argument("--w-shape", type=float, default=1.0)
@@ -127,6 +143,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Optional |.|-clip for the eta diagnostic penalty (none = off).")
     p.add_argument("--pi-clip-abs", type=mxu.none_or_float, default=2.0,
                    help="Symmetric componentwise portfolio bound; none disables clipping.")
+    p.add_argument(
+        "--policy-bounds-mode", type=str, default="stabilized",
+        choices=["stabilized", "none"],
+        help=(
+            "stabilized applies the recorded portfolio/kappa/consumption projections; "
+            "none disables every finite action projection (FOC sign guards remain)."
+        ),
+    )
     # Held-out residual target and fixed diagnostics (same roles as Liu).
     p.add_argument("--pres-target", type=mxu.none_or_float, default=None)
     p.add_argument("--val-points", type=int, default=100000)
@@ -185,6 +209,20 @@ if ARGS.scheduler_min_lr <= 0.0:
     raise ValueError("--scheduler-min-lr must be positive")
 if ARGS.pres_target is not None and ARGS.val_points <= 0:
     raise ValueError("--pres-target requires --val-points > 0")
+for _name in ("hjb_vy_guard_eps", "hjb_denom_guard_eps",
+              "hjb_vy_guard_tau", "hjb_denom_guard_tau",
+              "hjb_vy_guard_tau_min", "hjb_denom_guard_tau_min"):
+    _value = float(getattr(ARGS, _name))
+    if not math.isfinite(_value) or _value <= 0.0:
+        raise ValueError(f"--{_name.replace('_', '-')} must be finite and positive")
+if ARGS.hjb_vy_guard_tau_min > ARGS.hjb_vy_guard_tau:
+    raise ValueError("--hjb-vy-guard-tau-min must not exceed --hjb-vy-guard-tau")
+if ARGS.hjb_denom_guard_tau_min > ARGS.hjb_denom_guard_tau:
+    raise ValueError("--hjb-denom-guard-tau-min must not exceed --hjb-denom-guard-tau")
+if ARGS.hjb_guard_anneal_every < 0:
+    raise ValueError("--hjb-guard-anneal-every must be nonnegative")
+if not (0.0 < ARGS.hjb_guard_anneal_factor < 1.0):
+    raise ValueError("--hjb-guard-anneal-factor must lie strictly between 0 and 1")
 
 
 # =============================================================================
@@ -393,11 +431,71 @@ def compute_derivatives_log(
 # =============================================================================
 # 7) Reduced-form HJB residual (multi-asset) in log space
 # =============================================================================
+HJB_GUARD_VERSION = "merton-direct-hjb-positive-v1"
+
+
+def smooth_positive(
+    x: torch.Tensor,
+    eps: float,
+    tau: float,
+) -> torch.Tensor:
+    """Identity-preserving smooth approximation of ``max(x, eps)``.
+
+    ``torch.nn.functional.softplus`` is used instead of a hand-written
+    log/exp expression so large positive inputs remain numerically stable.
+    """
+    return float(eps) + float(tau) * F.softplus(
+        (x - float(eps)) / float(tau))
+
+
+def positive_hjb_guard(
+    x: torch.Tensor,
+    mode: str,
+    eps: float,
+    tau: float,
+) -> torch.Tensor:
+    """Apply the selected positivity continuation to one HJB derivative."""
+    if mode == "abs":
+        return torch.abs(x) + float(eps)
+    if mode == "hard":
+        return torch.clamp(x, min=float(eps))
+    if mode == "softplus":
+        return smooth_positive(x, float(eps), float(tau))
+    raise ValueError(f"unsupported HJB guard mode: {mode!r}")
+
+
+def hjb_guard_taus_for_outer(
+    outer_iter: int,
+    tau_vy_initial: float,
+    tau_denom_initial: float,
+    tau_vy_min: float,
+    tau_denom_min: float,
+    anneal_every: int,
+    anneal_factor: float,
+) -> Tuple[float, float, int]:
+    """Resolve blockwise continuation temperatures.
+
+    The first block always uses the initial temperatures.  With
+    ``anneal_every=K>0``, both temperatures are multiplied by ``factor`` after
+    every K completed blocks and are floored independently.  A fixed tau
+    (anneal_every=0) is the default first-pilot protocol.
+    """
+    stage = 0 if int(anneal_every) == 0 else (int(outer_iter) - 1) // int(anneal_every)
+    scale = float(anneal_factor) ** int(stage)
+    tau_vy = max(float(tau_vy_min), float(tau_vy_initial) * scale)
+    tau_denom = max(float(tau_denom_min), float(tau_denom_initial) * scale)
+    return tau_vy, tau_denom, stage
+
+
 def reduced_hjb_residual_log_multi(
     value_net: nn.Module,
     t: torch.Tensor,
     y: torch.Tensor,
-    eps: float = 1e-8,
+    guard_mode: str = "softplus",
+    eps_vy: float = 1e-8,
+    eps_denom: float = 1e-8,
+    tau_vy: float = 1e-2,
+    tau_denom: float = 1e-2,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reduced-form HJB residual in (t,y), after substituting FOCs for c and pi:
@@ -406,21 +504,25 @@ def reduced_hjb_residual_log_multi(
             + (gamma/(1-gamma)) * ( (v_y / W) ^ ((gamma-1)/gamma) )
             + 0.5 * Theta * v_y^2 / (v_y - v_yy)
 
-    During early training, use an absolute-value continuation outside the
-    admissible derivative region to avoid dead gradients and singular HJB
-    terms.  The shape penalties still enforce V_y > 0 and V_y - V_yy > 0.
+    The default continuation is one-sided softplus:
+
+        g_{tau,eps}(x) = eps + tau softplus((x-eps)/tau).
+
+    It is asymptotically the identity on the admissible branch and retains a
+    recovery gradient near the sign boundary.  Raw one-sided shape penalties
+    still enforce V_y > 0 and V_y - V_yy > 0.  Historical ``abs`` and hard
+    clamp continuations remain available for controlled comparisons.
     """
     V, V_t, V_y, V_yy = compute_derivatives_log(value_net, t, y)
     W = torch.exp(y)
 
     # For CRRA exponent (gamma-1)/gamma in (0,1), the base must be positive.
-    # abs() keeps a gradient when the randomly initialized network has V_y < 0.
-    V_y_safe = torch.abs(V_y) + eps
+    V_y_safe = positive_hjb_guard(
+        V_y, guard_mode, eps=float(eps_vy), tau=float(tau_vy))
 
     denom = (V_y - V_yy)            # should be positive (concavity in W)
-    # Likewise, do not collapse every wrong-sign curvature to eps: that would
-    # create a large portfolio term while blocking its curvature gradient.
-    denom_safe = torch.abs(denom) + eps
+    denom_safe = positive_hjb_guard(
+        denom, guard_mode, eps=float(eps_denom), tau=float(tau_denom))
 
     exp_c = (gamma_risk - 1.0) / gamma_risk
     term_consumption = (gamma_risk / (1.0 - gamma_risk)) * ( (V_y_safe / W).pow(exp_c) )
@@ -434,27 +536,64 @@ def reduced_hjb_residual_log_multi(
 # =============================================================================
 # 8) (Optional) policies from FOC (used for evaluation/plots only)
 # =============================================================================
-# Symmetric componentwise portfolio safety bound. None is genuinely
-# unconstrained; diagnostics still report the raw FOC policy.
-pi_clip_abs: Optional[float] = ARGS.pi_clip_abs
+# ``policy_bounds_mode=none`` is the paper audit setting with no finite action
+# projection.  The one-sided FOC guards remain because they define the
+# implemented derivative-to-policy map and are diagnosed separately.
+policy_bounds_mode = str(ARGS.policy_bounds_mode)
+pi_clip_abs: Optional[float] = (
+    None if policy_bounds_mode == "none" else ARGS.pi_clip_abs
+)
 
 M_utility_cap = 1e3
 c_floor = ((gamma_risk - 1.0) * M_utility_cap) ** (-1.0 / (gamma_risk - 1.0))
-kappa_min_bound = c_floor / w_min
-kappa_max_bound = 3.0
+kappa_min_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else c_floor / w_min
+)
+kappa_max_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else 3.0
+)
+c_min_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else c_floor
+)
+c_max_bound: Optional[float] = (
+    None if policy_bounds_mode == "none" else w_max
+)
 
-c_min_bound = c_floor
-c_max_bound = w_max
+
+def _clamp_optional(
+    value: torch.Tensor,
+    minimum: Optional[float],
+    maximum: Optional[float],
+) -> torch.Tensor:
+    """Apply only the finite action bounds that are actually configured."""
+    if minimum is None and maximum is None:
+        return value
+    if minimum is None:
+        return torch.clamp(value, max=float(maximum))
+    if maximum is None:
+        return torch.clamp(value, min=float(minimum))
+    return torch.clamp(value, min=float(minimum), max=float(maximum))
+
+
+POLICY_METADATA = {
+    "policy_bounds_mode": policy_bounds_mode,
+    "policy_pi_min": None if pi_clip_abs is None else -float(pi_clip_abs),
+    "policy_pi_max": None if pi_clip_abs is None else float(pi_clip_abs),
+    "policy_kappa_min": kappa_min_bound,
+    "policy_kappa_max": kappa_max_bound,
+    "policy_c_min": c_min_bound,
+    "policy_c_max": c_max_bound,
+}
 
 
 def compute_c_from_foc_log(
     V_y: torch.Tensor,
     y: torch.Tensor,
     eps: float = 1e-8,
-    kappa_min: float = kappa_min_bound,
-    kappa_max: float = kappa_max_bound,
-    c_min: float = c_min_bound,
-    c_max: float = c_max_bound,
+    kappa_min: Optional[float] = kappa_min_bound,
+    kappa_max: Optional[float] = kappa_max_bound,
+    c_min: Optional[float] = c_min_bound,
+    c_max: Optional[float] = c_max_bound,
 ) -> torch.Tensor:
     """c* from U'(c)=V_W, with V_W = V_y/W and W=exp(y)."""
     W = torch.exp(y)
@@ -463,9 +602,9 @@ def compute_c_from_foc_log(
     c_raw = V_w_safe.pow(-1.0 / gamma_risk)
 
     kappa_raw = c_raw / W
-    kappa = torch.clamp(kappa_raw, min=kappa_min, max=kappa_max)
+    kappa = _clamp_optional(kappa_raw, kappa_min, kappa_max)
     c_new = kappa * W
-    return torch.clamp(c_new, min=c_min, max=c_max)
+    return _clamp_optional(c_new, c_min, c_max)
 
 
 def compute_pi_from_foc_log_multi(
@@ -546,6 +685,11 @@ def build_validation_set(
 def evaluate_heldout_pres_pinn(
     value_net: nn.Module,
     val_set: Dict[str, torch.Tensor],
+    guard_mode: str = "softplus",
+    eps_vy: float = 1e-8,
+    eps_denom: float = 1e-8,
+    tau_vy: float = 1e-2,
+    tau_denom: float = 1e-2,
     chunk: int = 4096,
 ) -> Tuple[float, float, float]:
     """Held-out p_res = RMS nonlinear-HJB residual + RMS terminal error."""
@@ -556,7 +700,10 @@ def evaluate_heldout_pres_pinn(
     for start in range(0, n, chunk):
         t = val_set["t_int"][start:start + chunk].detach().clone().requires_grad_(True)
         y = val_set["y_int"][start:start + chunk].detach().clone().requires_grad_(True)
-        residual, _, _, _, _ = reduced_hjb_residual_log_multi(value_net, t, y)
+        residual, _, _, _, _ = reduced_hjb_residual_log_multi(
+            value_net, t, y, guard_mode=guard_mode,
+            eps_vy=eps_vy, eps_denom=eps_denom,
+            tau_vy=tau_vy, tau_denom=tau_denom)
         sq_sum += float(torch.sum(residual.detach() ** 2).item())
     pde_rms = float(np.sqrt(sq_sum / max(n, 1)))
     with torch.no_grad():
@@ -568,7 +715,11 @@ def evaluate_heldout_pres_pinn(
 
 
 def build_diag_set(n_points: int, margin: float) -> Dict[str, torch.Tensor]:
-    """Fixed dense tensor grid on Q_ev; shrink log wealth, never time."""
+    """Fixed complete tensor grid; shrink log wealth, never time.
+
+    ``n_points`` is an approximate budget.  Using complete axes avoids
+    truncating the final time row, which is important for reproducible extrema.
+    """
     n_points = max(4, int(n_points))
     n_t = max(2, int(round(math.sqrt(n_points))))
     n_y = max(2, int(math.ceil(n_points / n_t)))
@@ -577,8 +728,8 @@ def build_diag_set(n_points: int, margin: float) -> Dict[str, torch.Tensor]:
     y_axis = np.linspace(y_lo, y_hi, n_y, dtype=np.float64)
     tt, yy = np.meshgrid(t_axis, y_axis, indexing="ij")
     return {
-        "t": torch.tensor(tt.reshape(-1, 1)[:n_points], device=device, dtype=torch.float32),
-        "y": torch.tensor(yy.reshape(-1, 1)[:n_points], device=device, dtype=torch.float32),
+        "t": torch.tensor(tt.reshape(-1, 1), device=device, dtype=torch.float32),
+        "y": torch.tensor(yy.reshape(-1, 1), device=device, dtype=torch.float32),
         "margin": float(margin),
     }
 
@@ -622,7 +773,7 @@ def eval_diag_metrics(
     diag: Dict[str, torch.Tensor],
     diag_col: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, float]:
-    """Fixed-Q_ev wealth bundle plus Q_col clipping/ellipticity diagnostics."""
+    """Fixed-Q_ev bundle/control diagnostics plus Q_col ellipticity."""
     was_training = value_net.training
     value_net.eval()
     t = diag["t"].detach().clone().requires_grad_(True)
@@ -641,9 +792,9 @@ def eval_diag_metrics(
     V_w_safe = torch.clamp(V_w, min=1e-8)
     c_raw = V_w_safe.pow(-1.0 / gamma_risk)
     kappa_raw = c_raw / W
-    kappa = torch.clamp(kappa_raw, min=kappa_min_bound, max=kappa_max_bound)
+    kappa = _clamp_optional(kappa_raw, kappa_min_bound, kappa_max_bound)
     c_level_raw = kappa * W
-    c_eval = torch.clamp(c_level_raw, min=c_min_bound, max=c_max_bound)
+    c_eval = _clamp_optional(c_level_raw, c_min_bound, c_max_bound)
 
     t_np = t.detach().cpu().numpy()
     W_np = W.detach().cpu().numpy()
@@ -664,14 +815,16 @@ def eval_diag_metrics(
     pi_raw_col = pi_raw_ev
     pi_col = pi_ev
     if diag_col is not None:
-        t_col = diag_col["t_int"].detach().clone().requires_grad_(True)
-        y_col = diag_col["y_int"].detach().clone().requires_grad_(True)
+        t_col = diag_col["t"].detach().clone().requires_grad_(True)
+        y_col = diag_col["y"].detach().clone().requires_grad_(True)
         _, _, Vy_col, Vyy_col = compute_derivatives_log(value_net, t_col, y_col)
         pi_raw_col = compute_pi_from_foc_log_multi(
             Vy_col, Vyy_col, Sigma_inv_mu, return_raw=True)
         pi_col = pi_raw_col if pi_clip_abs is None else torch.clamp(
             pi_raw_col, -float(pi_clip_abs), float(pi_clip_abs))
     diffusion = _diffusion_variance(pi_col)
+    pi_l2 = torch.linalg.vector_norm(pi_ev, dim=1)
+    chi_eval = c_eval / W
 
     out = {
         "e_V_sup": e_V,
@@ -683,13 +836,28 @@ def eval_diag_metrics(
         "m_Vw": float(V_w.min().item()),
         "m_minus_Vww": float((-V_ww).min().item()),
         "m_curvature_y": float(curvature_y.min().item()),
+        # Paper E1 derivative margins in the network's log-wealth coordinate.
+        "m_y": float(V_y.min().item()),
+        "M_y": float(V_y.max().item()),
+        "m_c": float(curvature_y.min().item()),
+        # Wealth-normalized controls on the fixed Q_ev diagnostic grid.
+        "pi_component_min_greedy": float(pi_ev.min().item()),
+        "pi_component_max_greedy": float(pi_ev.max().item()),
+        "pi_l2_min_greedy": float(pi_l2.min().item()),
+        "pi_l2_max_greedy": float(pi_l2.max().item()),
+        "chi_min_greedy": float(chi_eval.min().item()),
+        "chi_max_greedy": float(chi_eval.max().item()),
         "guard_frac_Vw": float((V_w <= 1e-8).float().mean().item()),
         "guard_frac_curvature": float((curvature_y <= 1e-8).float().mean().item()),
-        "clip_frac_pi_greedy": _clip_fraction_pi(pi_raw_col),
-        "clip_frac_kappa_low": float((kappa_raw <= kappa_min_bound + 1e-7).float().mean().item()),
-        "clip_frac_kappa_high": float((kappa_raw >= kappa_max_bound - 1e-7).float().mean().item()),
-        "clip_frac_c_level_low": float((c_level_raw <= c_min_bound + 1e-7).float().mean().item()),
-        "clip_frac_c_level_high": float((c_level_raw >= c_max_bound - 1e-7).float().mean().item()),
+        "clip_frac_pi_greedy": _clip_fraction_pi(pi_raw_ev),
+        "clip_frac_kappa_low": (0.0 if kappa_min_bound is None else
+            float((kappa_raw <= float(kappa_min_bound) + 1e-7).float().mean().item())),
+        "clip_frac_kappa_high": (0.0 if kappa_max_bound is None else
+            float((kappa_raw >= float(kappa_max_bound) - 1e-7).float().mean().item())),
+        "clip_frac_c_level_low": (0.0 if c_min_bound is None else
+            float((c_level_raw <= float(c_min_bound) + 1e-7).float().mean().item())),
+        "clip_frac_c_level_high": (0.0 if c_max_bound is None else
+            float((c_level_raw >= float(c_max_bound) - 1e-7).float().mean().item())),
         "diffusion_var_min_greedy": float(diffusion.min().item()),
         "diffusion_var_max_greedy": float(diffusion.max().item()),
     }
@@ -718,6 +886,15 @@ def train_pinn_hybrid_reduced_logw_multi(
     scheduler_factor: float = 0.5,
     scheduler_min_lr: float = 1e-8,
     lr_schedule: str = "plateau",
+    hjb_guard_mode: str = "softplus",
+    hjb_vy_guard_eps: float = 1e-8,
+    hjb_denom_guard_eps: float = 1e-8,
+    hjb_vy_guard_tau: float = 1e-2,
+    hjb_denom_guard_tau: float = 1e-2,
+    hjb_vy_guard_tau_min: float = 1e-4,
+    hjb_denom_guard_tau_min: float = 1e-4,
+    hjb_guard_anneal_every: int = 0,
+    hjb_guard_anneal_factor: float = 0.5,
     save_iterate_every: int = 0,
     pres_target: Optional[float] = None,
     val_points: int = 100000,
@@ -748,11 +925,15 @@ def train_pinn_hybrid_reduced_logw_multi(
         os.makedirs(iterate_dir, exist_ok=True)
 
     optimizer = optim.Adam(value_net.parameters(), lr=lr)
-    scheduler = None
-    if lr_schedule == "plateau":
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+
+    def _make_scheduler():
+        if lr_schedule != "plateau":
+            return None
+        return optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=scheduler_factor,
             patience=scheduler_patience, min_lr=scheduler_min_lr)
+
+    scheduler = _make_scheduler()
 
     loss_history: List[Dict[str, float]] = []
     best_loss = float("inf")
@@ -771,14 +952,17 @@ def train_pinn_hybrid_reduced_logw_multi(
     diag_col = None
     if diag_points > 0 and not timing_mode:
         diag = build_diag_set(int(diag_points), float(diag_margin))
-        diag_col = build_validation_set(
-            int(diag_points), 1, device, int(val_seed) + 104729)
+        # E1 ellipticity uses a fixed dense tensor grid on all of Q_col.
+        diag_col = build_diag_set(int(diag_points), 0.0)
 
     train_fields = [
         "timestamp", "model_type", "run_tag", "epoch", "outer_iter", "inner_epoch",
         "total_loss", "pde_loss", "terminal_loss", "monotonicity_loss",
         "concavity_loss", "eta_loss", "train_pres", "val_pde_rms",
-        "val_terminal_rms", "val_pres", "lr", "best_loss", "elapsed_sec",
+        "val_terminal_rms", "val_pres", "hjb_guard_mode",
+        "hjb_guard_tau_vy", "hjb_guard_tau_denom",
+        "hjb_guard_frac_vy", "hjb_guard_frac_denom",
+        "lr", "best_loss", "elapsed_sec",
         "stopped", "stop_reason",
     ]
     outer_fields = [
@@ -787,16 +971,25 @@ def train_pinn_hybrid_reduced_logw_multi(
         "eta_loss", "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
         "inner_epochs_used", "target_reached", "e_V_sup", "e_bundle_sup", "e_Xev",
         "diag_RelL2_V", "diag_RelL2_pi", "diag_RelL2_c", "m_Vw",
-        "m_minus_Vww", "m_curvature_y", "guard_frac_Vw", "guard_frac_curvature",
+        "m_minus_Vww", "m_curvature_y", "m_y", "M_y", "m_c",
+        "pi_component_min_greedy", "pi_component_max_greedy",
+        "pi_l2_min_greedy", "pi_l2_max_greedy",
+        "chi_min_greedy", "chi_max_greedy",
+        "guard_frac_Vw", "guard_frac_curvature",
         "clip_frac_pi_greedy", "clip_frac_kappa_low", "clip_frac_kappa_high",
         "clip_frac_c_level_low", "clip_frac_c_level_high",
-        "diffusion_var_min_greedy", "diffusion_var_max_greedy", "lr", "best_loss",
+        "diffusion_var_min_greedy", "diffusion_var_max_greedy",
+        "hjb_guard_mode", "hjb_guard_tau_vy", "hjb_guard_tau_denom",
+        "hjb_guard_frac_vy", "hjb_guard_frac_denom", "lr", "best_loss",
         "bad_count", "stop_active", "stop_is_bad", "stopped", "stop_reason",
         "elapsed_sec",
     ]
     diagnostic_fields = [
         "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_pi",
         "diag_RelL2_c", "m_Vw", "m_minus_Vww", "m_curvature_y",
+        "m_y", "M_y", "m_c", "pi_component_min_greedy",
+        "pi_component_max_greedy", "pi_l2_min_greedy", "pi_l2_max_greedy",
+        "chi_min_greedy", "chi_max_greedy",
         "guard_frac_Vw", "guard_frac_curvature", "clip_frac_pi_greedy",
         "clip_frac_kappa_low", "clip_frac_kappa_high", "clip_frac_c_level_low",
         "clip_frac_c_level_high", "diffusion_var_min_greedy",
@@ -808,6 +1001,17 @@ def train_pinn_hybrid_reduced_logw_multi(
     print(f"  outer_iters={outer_iters}, eval_epochs={eval_epochs}, epochs={epochs}")
     print(f"  batch={batch_size}, terminal_frac={terminal_frac}, lr={lr}")
     print(f"  w_terminal={w_terminal}, w_shape={w_shape}, w_eta={w_eta}")
+    print(
+        f"  policy bounds={policy_bounds_mode}; pi=[{POLICY_METADATA['policy_pi_min']},"
+        f"{POLICY_METADATA['policy_pi_max']}], kappa=[{kappa_min_bound},{kappa_max_bound}], "
+        f"c=[{c_min_bound},{c_max_bound}]"
+    )
+    print(
+        f"  HJB guard={hjb_guard_mode} ({HJB_GUARD_VERSION}); "
+        f"eps=({hjb_vy_guard_eps:g},{hjb_denom_guard_eps:g}), "
+        f"tau0=({hjb_vy_guard_tau:g},{hjb_denom_guard_tau:g}), "
+        f"anneal_every={hjb_guard_anneal_every}"
+    )
     print(f"{'='*70}\n")
     if resample_every not in (0, eval_epochs):
         print("[warn] --resample-every is deprecated for direct PINN; "
@@ -818,18 +1022,45 @@ def train_pinn_hybrid_reduced_logw_multi(
     current = {
         "total": float("nan"), "pde": float("nan"), "terminal": float("nan"),
         "mono": float("nan"), "conc": float("nan"), "eta": float("nan"),
+        "guard_frac_vy": float("nan"), "guard_frac_denom": float("nan"),
     }
     stop_info: Dict[str, object] = {
         "stopped_early": False, "target_reached": False,
         "total_optimizer_steps": 0,
     }
 
-    def _heldout() -> Optional[Tuple[float, float, float]]:
+    def _heldout(tau_vy_now: float, tau_denom_now: float) -> Optional[Tuple[float, float, float]]:
         if val_set is None:
             return None
-        return evaluate_heldout_pres_pinn(value_net, val_set)
+        return evaluate_heldout_pres_pinn(
+            value_net, val_set, guard_mode=hjb_guard_mode,
+            eps_vy=hjb_vy_guard_eps, eps_denom=hjb_denom_guard_eps,
+            tau_vy=tau_vy_now, tau_denom=tau_denom_now)
 
+    previous_guard_taus: Optional[Tuple[float, float]] = None
+    tau_vy_now = float(hjb_vy_guard_tau)
+    tau_denom_now = float(hjb_denom_guard_tau)
     for outer_iter in range(1, int(outer_iters) + 1):
+        tau_vy_now, tau_denom_now, guard_stage = hjb_guard_taus_for_outer(
+            outer_iter=outer_iter,
+            tau_vy_initial=hjb_vy_guard_tau,
+            tau_denom_initial=hjb_denom_guard_tau,
+            tau_vy_min=hjb_vy_guard_tau_min,
+            tau_denom_min=hjb_denom_guard_tau_min,
+            anneal_every=hjb_guard_anneal_every,
+            anneal_factor=hjb_guard_anneal_factor,
+        )
+        guard_taus = (tau_vy_now, tau_denom_now)
+        if (hjb_guard_mode == "softplus" and previous_guard_taus is not None
+                and guard_taus != previous_guard_taus and scheduler is not None):
+            # The surrogate loss changes when tau changes. Reset only the
+            # plateau comparison state; retain Adam moments and the current LR.
+            scheduler = _make_scheduler()
+            print(
+                f"[guard] stage={guard_stage}: tau_vy={tau_vy_now:.3e}, "
+                f"tau_denom={tau_denom_now:.3e}; plateau state reset"
+            )
+        previous_guard_taus = guard_taus
         # Hybrid sampling: several updates on one batch, then refresh at the
         # next pseudo-outer block while solving the same nonlinear PDE.
         t_int, y_int = sample_interior(int(batch_size), device)
@@ -842,14 +1073,18 @@ def train_pinn_hybrid_reduced_logw_multi(
 
         # A state already at tolerance must not be perturbed by another step.
         if pres_target is not None:
-            last_val = _heldout()
+            last_val = _heldout(tau_vy_now, tau_denom_now)
             target_reached = bool(last_val is not None and last_val[2] <= float(pres_target))
-            if target_reached and not math.isfinite(current["pde"]):
-                # Epoch-0 can legitimately satisfy a loose target. Measure
-                # that exact state so histories/checkpoints never contain an
-                # unexplained NaN-only first block.
+            if target_reached:
+                # Epoch 0 can legitimately satisfy the target in any block.
+                # Re-measure the current state on this block's fresh batch and
+                # active tau, rather than carrying a loss/guard fraction from
+                # the preceding block (especially after tau continuation).
                 residual0, _, Vy0, Vyy0, denom0 = reduced_hjb_residual_log_multi(
-                    value_net, t_int, y_int)
+                    value_net, t_int, y_int, guard_mode=hjb_guard_mode,
+                    eps_vy=hjb_vy_guard_eps,
+                    eps_denom=hjb_denom_guard_eps,
+                    tau_vy=tau_vy_now, tau_denom=tau_denom_now)
                 with torch.no_grad():
                     term0 = torch.mean((value_net(t_term, y_term) - V_T_target) ** 2)
                 pde0 = torch.mean(residual0.detach() ** 2)
@@ -866,21 +1101,31 @@ def train_pinn_hybrid_reduced_logw_multi(
                     "pde": float(pde0.item()), "terminal": float(term0.item()),
                     "mono": float(mono0.item()), "conc": float(conc0.item()),
                     "eta": float(eta_loss0.item()),
+                    "guard_frac_vy": float(
+                        (Vy0.detach() <= float(hjb_vy_guard_eps)).float().mean().item()),
+                    "guard_frac_denom": float(
+                        (denom0.detach() <= float(hjb_denom_guard_eps)).float().mean().item()),
                 }
                 current["total"] = float(
                     current["pde"] + w_terminal * current["terminal"]
                     + w_shape * (current["mono"] + current["conc"])
                     + w_eta * current["eta"])
-                best_loss = current["total"]
-                best_iter = 0
-                if not timing_mode:
-                    best_state = {
-                        key: val.detach().cpu().clone()
-                        for key, val in value_net.state_dict().items()}
+                if current["total"] < best_loss:
+                    best_loss = current["total"]
+                    best_iter = total_optimizer_steps
+                    if not timing_mode:
+                        best_state = {
+                            key: val.detach().cpu().clone()
+                            for key, val in value_net.state_dict().items()}
                 synthetic_history = {
                     "total": current["total"], "pde": current["pde"],
                     "terminal": current["terminal"], "mono": current["mono"],
                     "conc": current["conc"], "eta": current["eta"],
+                    "hjb_guard_mode": hjb_guard_mode,
+                    "hjb_guard_tau_vy": tau_vy_now,
+                    "hjb_guard_tau_denom": tau_denom_now,
+                    "hjb_guard_frac_vy": current["guard_frac_vy"],
+                    "hjb_guard_frac_denom": current["guard_frac_denom"],
                 }
                 if timing_mode and loss_history:
                     loss_history[-1] = synthetic_history
@@ -899,6 +1144,11 @@ def train_pinn_hybrid_reduced_logw_multi(
                             current["pde"], current["terminal"]),
                         "val_pde_rms": last_val[0],
                         "val_terminal_rms": last_val[1], "val_pres": last_val[2],
+                        "hjb_guard_mode": hjb_guard_mode,
+                        "hjb_guard_tau_vy": tau_vy_now,
+                        "hjb_guard_tau_denom": tau_denom_now,
+                        "hjb_guard_frac_vy": current["guard_frac_vy"],
+                        "hjb_guard_frac_denom": current["guard_frac_denom"],
                         "lr": float(optimizer.param_groups[0]["lr"]),
                         "best_loss": best_loss, "elapsed_sec": time.time() - start_time,
                         "stopped": 0, "stop_reason": "pres_target_reached",
@@ -909,7 +1159,10 @@ def train_pinn_hybrid_reduced_logw_multi(
                 break
             optimizer.zero_grad(set_to_none=True)
             residual, _, V_y, V_yy, denom = reduced_hjb_residual_log_multi(
-                value_net, t_int, y_int)
+                value_net, t_int, y_int, guard_mode=hjb_guard_mode,
+                eps_vy=hjb_vy_guard_eps,
+                eps_denom=hjb_denom_guard_eps,
+                tau_vy=tau_vy_now, tau_denom=tau_denom_now)
             pde_loss = torch.mean(residual ** 2)
             V_T_pred = value_net(t_term, y_term)
             terminal_loss = torch.mean((V_T_pred - V_T_target) ** 2)
@@ -941,6 +1194,10 @@ def train_pinn_hybrid_reduced_logw_multi(
                 "mono": float(mono_penalty.detach().cpu()),
                 "conc": float(conc_penalty.detach().cpu()),
                 "eta": float(eta_loss.detach().cpu()),
+                "guard_frac_vy": float(
+                    (V_y.detach() <= float(hjb_vy_guard_eps)).float().mean().item()),
+                "guard_frac_denom": float(
+                    (denom.detach() <= float(hjb_denom_guard_eps)).float().mean().item()),
             }
             lr_now = float(optimizer.param_groups[0]["lr"])
 
@@ -955,7 +1212,7 @@ def train_pinn_hybrid_reduced_logw_multi(
             row_val: Optional[Tuple[float, float, float]] = None
             if (val_set is not None and pres_target is not None and
                     inner_epoch % max(1, int(val_every)) == 0):
-                row_val = _heldout()
+                row_val = _heldout(tau_vy_now, tau_denom_now)
                 last_val = row_val
                 if (pres_target is not None and row_val is not None and
                         row_val[2] <= float(pres_target)):
@@ -965,6 +1222,11 @@ def train_pinn_hybrid_reduced_logw_multi(
                 "total": current["total"], "pde": current["pde"],
                 "terminal": current["terminal"], "mono": current["mono"],
                 "conc": current["conc"], "eta": current["eta"],
+                "hjb_guard_mode": hjb_guard_mode,
+                "hjb_guard_tau_vy": tau_vy_now,
+                "hjb_guard_tau_denom": tau_denom_now,
+                "hjb_guard_frac_vy": current["guard_frac_vy"],
+                "hjb_guard_frac_denom": current["guard_frac_denom"],
             }
             if timing_mode and loss_history:
                 loss_history[-1] = history_row
@@ -983,6 +1245,11 @@ def train_pinn_hybrid_reduced_logw_multi(
                     "val_pde_rms": "" if row_val is None else row_val[0],
                     "val_terminal_rms": "" if row_val is None else row_val[1],
                     "val_pres": "" if row_val is None else row_val[2],
+                    "hjb_guard_mode": hjb_guard_mode,
+                    "hjb_guard_tau_vy": tau_vy_now,
+                    "hjb_guard_tau_denom": tau_denom_now,
+                    "hjb_guard_frac_vy": current["guard_frac_vy"],
+                    "hjb_guard_frac_denom": current["guard_frac_denom"],
                     "lr": lr_now, "best_loss": best_loss,
                     "elapsed_sec": time.time() - start_time,
                     "stopped": 0,
@@ -993,7 +1260,9 @@ def train_pinn_hybrid_reduced_logw_multi(
                 ptxt = "" if row_val is None else f" | p_res={row_val[2]:.3e}"
                 print(f"[{total_optimizer_steps:6d}/{epochs}] total={current['total']:.3e} | "
                       f"pde={current['pde']:.3e} | term={current['terminal']:.3e} | "
-                      f"eta={current['eta']:.3e} | lr={lr_now:.2e}{ptxt}")
+                      f"eta={current['eta']:.3e} | lr={lr_now:.2e} | "
+                      f"guard=({current['guard_frac_vy']:.2%},"
+                      f"{current['guard_frac_denom']:.2%}){ptxt}")
 
             if t_int.grad is not None:
                 t_int.grad = None
@@ -1005,13 +1274,14 @@ def train_pinn_hybrid_reduced_logw_multi(
         # Always report p_res for the official end-of-block state when a
         # validation set exists, even when no target is active.
         if val_set is not None:
-            last_val = _heldout()
+            last_val = _heldout(tau_vy_now, tau_denom_now)
             if (pres_target is not None and last_val is not None and
                     last_val[2] <= float(pres_target)):
                 target_reached = True
         diag_res: Dict[str, float] = {}
         if (diag is not None and
-                (diag_every <= 1 or outer_iter == 1 or outer_iter % diag_every == 0)):
+                (diag_every <= 1 or outer_iter == 1
+                 or outer_iter % diag_every == 0 or outer_iter == outer_iters)):
             diag_res = eval_diag_metrics(value_net, diag, diag_col)
 
         stop_triggered = False
@@ -1035,6 +1305,11 @@ def train_pinn_hybrid_reduced_logw_multi(
             "val_pde_rms": "" if last_val is None else last_val[0],
             "val_terminal_rms": "" if last_val is None else last_val[1],
             "val_pres": "" if last_val is None else last_val[2],
+            "hjb_guard_mode": hjb_guard_mode,
+            "hjb_guard_tau_vy": tau_vy_now,
+            "hjb_guard_tau_denom": tau_denom_now,
+            "hjb_guard_frac_vy": current["guard_frac_vy"],
+            "hjb_guard_frac_denom": current["guard_frac_denom"],
             "inner_epochs_used": epochs_used, "target_reached": int(target_reached),
             **{key: diag_res.get(key, "") for key in diagnostic_fields},
             "lr": lr_now, "best_loss": best_loss,
@@ -1066,6 +1341,10 @@ def train_pinn_hybrid_reduced_logw_multi(
                 "achieved_pres": None if last_val is None else float(last_val[2]),
                 "outer_iter": outer_iter, "epoch_at_stop": total_optimizer_steps,
                 "total_optimizer_steps": total_optimizer_steps,
+                "hjb_guard_mode": hjb_guard_mode,
+                "hjb_guard_version": HJB_GUARD_VERSION,
+                "hjb_guard_tau_vy_final": tau_vy_now,
+                "hjb_guard_tau_denom_final": tau_denom_now,
             }
             reason = "p_res target" if target_reached else "divergence stopper"
             print(f"[stop] direct PINN ended at outer={outer_iter}, steps={total_optimizer_steps} ({reason})")
@@ -1083,6 +1362,10 @@ def train_pinn_hybrid_reduced_logw_multi(
         "outer_iters_completed": completed_outers,
         "total_optimizer_steps": total_optimizer_steps,
         "achieved_pres": None if last_val is None else float(last_val[2]),
+        "hjb_guard_mode": hjb_guard_mode,
+        "hjb_guard_version": HJB_GUARD_VERSION,
+        "hjb_guard_tau_vy_final": tau_vy_now,
+        "hjb_guard_tau_denom_final": tau_denom_now,
     })
     return loss_history, optimizer, stop_info
 
@@ -1379,6 +1662,17 @@ def plot_comparison_heatmaps(
 # 11) Main
 # =============================================================================
 def main():
+    # Persist an explicit separation between the training HJB continuation,
+    # the legacy eta auxiliary denominator, and evaluation-only FOC clamps.
+    # This prevents downstream audits from mistaking a direct-PINN change for
+    # a change to the PI-PINN/exact policy map.
+    ARGS.hjb_guard_version = HJB_GUARD_VERSION
+    ARGS.hjb_guard_formula = (
+        "eps+tau*softplus((x-eps)/tau)" if ARGS.hjb_guard_mode == "softplus"
+        else ("abs(x)+eps" if ARGS.hjb_guard_mode == "abs" else "clamp_min(x,eps)"))
+    ARGS.hjb_guard_scope = "direct-nonlinear-hjb-only"
+    ARGS.eta_aux_guard_mode = "legacy-abs"
+    ARGS.evaluation_policy_guard_mode = "one-sided-hard-clamp"
     out_dir = os.path.join(ARGS.output_root, ARGS.run_tag)
     weight_dir = ARGS.weight_root or os.path.join(out_dir, "weights")
     recorder = mxu.ExperimentRecorder(out_dir, weight_dir, ARGS)
@@ -1386,9 +1680,9 @@ def main():
     loaded_weight_path = None
 
     if ARGS.eval_only:
-        recorder.save_config_eval()
+        recorder.save_config_eval(extra=POLICY_METADATA)
     else:
-        recorder.save_config()
+        recorder.save_config(extra=POLICY_METADATA)
         # A NEW training run starts with FRESH per-run CSVs (appending onto a
         # previous same-tag run would interleave two experiments).
         recorder.rotate_training_logs()
@@ -1435,6 +1729,7 @@ def main():
                 print(f"[early-stop] shared stop flag exists; skipping run: {info}")
                 return
 
+        train_gpu_peak = None
         if not ARGS.eval_only:
             recorder.write_status("running")
             loss_history, _opt, stop_info = train_pinn_hybrid_reduced_logw_multi(
@@ -1454,6 +1749,15 @@ def main():
                 scheduler_factor=float(ARGS.scheduler_factor),
                 scheduler_min_lr=float(ARGS.scheduler_min_lr),
                 lr_schedule=str(ARGS.lr_schedule),
+                hjb_guard_mode=str(ARGS.hjb_guard_mode),
+                hjb_vy_guard_eps=float(ARGS.hjb_vy_guard_eps),
+                hjb_denom_guard_eps=float(ARGS.hjb_denom_guard_eps),
+                hjb_vy_guard_tau=float(ARGS.hjb_vy_guard_tau),
+                hjb_denom_guard_tau=float(ARGS.hjb_denom_guard_tau),
+                hjb_vy_guard_tau_min=float(ARGS.hjb_vy_guard_tau_min),
+                hjb_denom_guard_tau_min=float(ARGS.hjb_denom_guard_tau_min),
+                hjb_guard_anneal_every=int(ARGS.hjb_guard_anneal_every),
+                hjb_guard_anneal_factor=float(ARGS.hjb_guard_anneal_factor),
                 save_iterate_every=int(ARGS.save_iterate_every),
                 pres_target=ARGS.pres_target,
                 val_points=int(ARGS.val_points),
@@ -1470,12 +1774,23 @@ def main():
                 stopper=stopper,
             )
             elapsed = time.time() - start
+            if device.type == "cuda":
+                train_gpu_peak = int(torch.cuda.max_memory_allocated(device))
+                # Evaluation receives an independent peak-memory window.
+                torch.cuda.reset_peak_memory_stats(device)
             h = int(elapsed // 3600); m = int((elapsed % 3600) // 60); s = elapsed % 60
             print(f"\nElapsed time: {h:02d}:{m:02d}:{s:05.2f}")
             if bool(stop_info.get("stopped_early", False)):
                 recorder.write_status(
                     "stopped_early", elapsed_sec=elapsed,
                     final_weight_path=os.path.join(weight_dir, "value_net_final.pt"),
+                    train_gpu_peak_mem_bytes=train_gpu_peak,
+                    policy_bounds_mode=policy_bounds_mode,
+                    policy_pi_min=POLICY_METADATA["policy_pi_min"],
+                    policy_pi_max=POLICY_METADATA["policy_pi_max"],
+                    policy_kappa_min=kappa_min_bound,
+                    policy_kappa_max=kappa_max_bound,
+                    policy_c_min=c_min_bound, policy_c_max=c_max_bound,
                     **stop_info)
                 return
         else:
@@ -1501,11 +1816,9 @@ def main():
             value_net.load_state_dict(torch.load(load_path, map_location=device))
             loaded_weight_path = load_path
             print(f"[eval-only] loaded checkpoint: {load_path}")
-
-        train_gpu_peak = None
-        if device.type == "cuda":
-            train_gpu_peak = int(torch.cuda.max_memory_allocated(device))
-            torch.cuda.reset_peak_memory_stats(device)
+            if device.type == "cuda":
+                # Exclude construction/checkpoint loading from eval peak.
+                torch.cuda.reset_peak_memory_stats(device)
 
         Nt, Nw = int(ARGS.n_tau), int(ARGS.n_x)
         margins = mxu.parse_eval_margins(ARGS.eval_margin)
@@ -1524,6 +1837,16 @@ def main():
                     target_reached=bool(stop_info.get("target_reached", False)),
                     achieved_pres=stop_info.get("achieved_pres"),
                     total_optimizer_steps=stop_info.get("total_optimizer_steps"),
+                    hjb_guard_mode=stop_info.get("hjb_guard_mode"),
+                    hjb_guard_version=stop_info.get("hjb_guard_version"),
+                    hjb_guard_tau_vy_final=stop_info.get("hjb_guard_tau_vy_final"),
+                    hjb_guard_tau_denom_final=stop_info.get("hjb_guard_tau_denom_final"),
+                    policy_bounds_mode=policy_bounds_mode,
+                    policy_pi_min=POLICY_METADATA["policy_pi_min"],
+                    policy_pi_max=POLICY_METADATA["policy_pi_max"],
+                    policy_kappa_min=kappa_min_bound,
+                    policy_kappa_max=kappa_max_bound,
+                    policy_c_min=c_min_bound, policy_c_max=c_max_bound,
                     train_gpu_peak_mem_bytes=train_gpu_peak,
                     timing_mode=bool(ARGS.timing_mode))
             return
@@ -1607,6 +1930,16 @@ def main():
                 final_weight_path=final_weight_path, best_weight_path=best_weight_path,
                 target_reached=bool(stop_info.get("target_reached", False)),
                 achieved_pres=stop_info.get("achieved_pres"), pi_clip_abs=pi_clip_abs,
+                policy_bounds_mode=policy_bounds_mode,
+                policy_pi_min=POLICY_METADATA["policy_pi_min"],
+                policy_pi_max=POLICY_METADATA["policy_pi_max"],
+                policy_kappa_min=kappa_min_bound,
+                policy_kappa_max=kappa_max_bound,
+                policy_c_min=c_min_bound, policy_c_max=c_max_bound,
+                hjb_guard_mode=stop_info.get("hjb_guard_mode"),
+                hjb_guard_version=stop_info.get("hjb_guard_version"),
+                hjb_guard_tau_vy_final=stop_info.get("hjb_guard_tau_vy_final"),
+                hjb_guard_tau_denom_final=stop_info.get("hjb_guard_tau_denom_final"),
                 train_gpu_peak_mem_bytes=train_gpu_peak,
                 eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins)
         print("\nDone.")
