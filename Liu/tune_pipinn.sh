@@ -11,7 +11,6 @@ set -euo pipefail
 #   FORCE_RERUN=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   RERUN_STOPPED=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   SEEDS="1,2,3,4,5,6,7,8,9,10" DEVICE_LIST="cuda:0,cuda:1" bash tune_pipinn.sh /workspace/outputs/main10seed
-#   CONTRACTION_PILOT=1 DEVICE_LIST="cuda:0,cuda:1" bash tune_pipinn.sh outputs/pilot_theta_scale
 #   AGGREGATE=0 bash tune_pipinn.sh ...   # skip the automatic seed aggregation step
 #   STRICT_PAPER_AGGREGATION=0 SEEDS="1,2" bash tune_pipinn.sh ...  # smoke/non-paper sweep
 
@@ -19,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
 MAX_PARALLEL_ARG="${2:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+SWEEP_PROFILE="${SWEEP_PROFILE:-main}"  # main | nonaffine
 mkdir -p "$OUT_ROOT"
 LOG_DIR="$OUT_ROOT/logs"
 mkdir -p "$LOG_DIR"
@@ -42,27 +42,11 @@ PDE_STOP_PATIENCE="${PDE_STOP_PATIENCE:-20}"
 # auto tag, so each seed gets its own output/weight directory). Calls that
 # pass seed=... explicitly are left untouched. When SEEDS is empty, behavior
 # is identical to the original single-seed script (BASE seed).
-CONTRACTION_PILOT="${CONTRACTION_PILOT:-0}"
-PILOT_SCALES="${PILOT_SCALES:-0.5,1.5}"
-if [[ "$CONTRACTION_PILOT" != "0" && "$CONTRACTION_PILOT" != "1" ]]; then
-  echo "[error] CONTRACTION_PILOT must be 0 or 1" >&2
-  exit 2
-fi
-
 SEEDS="${SEEDS:-}"
-if [[ "$CONTRACTION_PILOT" == "1" && -z "$SEEDS" ]]; then
-  SEEDS="1,2"
-fi
 # Main-paper default: a multi-seed launch is valid only for the exact seed
 # set 1..10, and a failed post-run audit makes the launcher fail.  Explicitly
 # disable this only for smoke tests or non-paper sweeps.
-if [[ "$CONTRACTION_PILOT" == "1" ]]; then
-  STRICT_PAPER_AGGREGATION="${STRICT_PAPER_AGGREGATION:-0}"
-  AGGREGATE="${AGGREGATE:-0}"
-else
-  STRICT_PAPER_AGGREGATION="${STRICT_PAPER_AGGREGATION:-1}"
-  AGGREGATE="${AGGREGATE:-1}"
-fi
+STRICT_PAPER_AGGREGATION="${STRICT_PAPER_AGGREGATION:-1}"
 
 # Cap CPU thread pools: parallel workers otherwise oversubscribe cores
 # (each process would spawn nproc-sized OMP/MKL pools).
@@ -76,43 +60,35 @@ SEED_LIST=()
 if [[ -n "$SEEDS" ]]; then
   IFS=', ' read -ra SEED_LIST <<< "$SEEDS"
   echo "[info] multi-seed mode: seeds = ${SEED_LIST[*]}"
-  if [[ "$CONTRACTION_PILOT" == "1" ]]; then
-    if (( ${#SEED_LIST[@]} < 1 )); then
-      echo "[error] contraction pilot requires at least one seed" >&2
+  # Validate uniqueness for every profile.  Duplicate seeds enqueue the
+  # same tag/output directory twice and can corrupt CSV/checkpoint writes
+  # when workers run concurrently.
+  declare -A _seed_seen=()
+  for _seed in "${SEED_LIST[@]}"; do
+    if [[ ! "$_seed" =~ ^[0-9]+$ ]]; then
+      echo "[error] training seeds must be non-negative integers; got: $_seed" >&2
       exit 2
     fi
-    declare -A _pilot_seed_seen=()
-    for _seed in "${SEED_LIST[@]}"; do
-      if [[ ! "$_seed" =~ ^[0-9]+$ ]]; then
-        echo "[error] pilot seeds must be nonnegative integers; got: $_seed" >&2
-        exit 2
-      fi
-      if [[ -n "${_pilot_seed_seen[$_seed]+x}" ]]; then
-        echo "[error] duplicate pilot seed: $_seed" >&2
-        exit 2
-      fi
-      _pilot_seed_seen[$_seed]=1
-    done
-  fi
+    _seed_key=$((10#$_seed))
+    if [[ -n "${_seed_seen[$_seed_key]+x}" ]]; then
+      echo "[error] duplicate training seed: $_seed" >&2
+      exit 2
+    fi
+    _seed_seen[$_seed_key]=1
+  done
   if [[ "$STRICT_PAPER_AGGREGATION" == "1" ]]; then
     if (( ${#SEED_LIST[@]} != 10 )); then
       echo "[error] paper main requires exactly 10 training seeds (1..10); got: ${SEED_LIST[*]}" >&2
       exit 2
     fi
-    declare -A _paper_seed_seen=()
     for _seed in "${SEED_LIST[@]}"; do
-      if [[ ! "$_seed" =~ ^[0-9]+$ ]] || (( _seed < 1 || _seed > 10 )); then
+      if (( 10#$_seed < 1 || 10#$_seed > 10 )); then
         echo "[error] paper main seed set must be exactly 1..10; got: ${SEED_LIST[*]}" >&2
         exit 2
       fi
-      if [[ -n "${_paper_seed_seen[$_seed]+x}" ]]; then
-        echo "[error] duplicate paper seed: $_seed" >&2
-        exit 2
-      fi
-      _paper_seed_seen[$_seed]=1
     done
     for _seed in {1..10}; do
-      if [[ -z "${_paper_seed_seen[$_seed]+x}" ]]; then
+      if [[ -z "${_seed_seen[$_seed]+x}" ]]; then
         echo "[error] missing paper seed: $_seed" >&2
         exit 2
       fi
@@ -593,10 +569,13 @@ declare -A BASE_PIPINN=(
   # and "greedy updates are used unconstrained" -> no clipping. Override
   # theta_init_method=zero theta_clip_abs=3.0 to reproduce older runs.
   [theta_init_method]=myopic
-  # Positive multiplier applied before the optional clip.  Keep 1.0 for the
-  # paper main; CONTRACTION_PILOT enqueues 0.5 and 1.5 explicitly.
   [theta_init_scale]=1.0
   [theta_clip_abs]="none"
+  # Actual risk-premium specification.  The non-affine profile overrides mode
+  # and epsilon while retaining every other production training default.
+  [risk_premium_mode]=affine
+  [nonaffine_eps]=0.0
+  [nonaffine_loading_scale]=1.0
   [print_every_outer]=1
   # 0 = no inner prints (default). Set print_every_eval=1 to log every inner
   # (policy-evaluation) epoch, with p_res shown on validation-check epochs.
@@ -861,6 +840,9 @@ run_pipinn_single() {
   local theta_init_method="${OVR[theta_init_method]:-${BASE_PIPINN[theta_init_method]}}"
   local theta_init_scale="${OVR[theta_init_scale]:-${BASE_PIPINN[theta_init_scale]}}"
   local theta_clip_abs="${OVR[theta_clip_abs]:-${BASE_PIPINN[theta_clip_abs]}}"
+  local risk_premium_mode="${OVR[risk_premium_mode]:-${BASE_PIPINN[risk_premium_mode]}}"
+  local nonaffine_eps="${OVR[nonaffine_eps]:-${BASE_PIPINN[nonaffine_eps]}}"
+  local nonaffine_loading_scale="${OVR[nonaffine_loading_scale]:-${BASE_PIPINN[nonaffine_loading_scale]}}"
   local print_every_outer="${OVR[print_every_outer]:-${BASE_PIPINN[print_every_outer]}}"
   local print_every_eval="${OVR[print_every_eval]:-${BASE_PIPINN[print_every_eval]}}"
   local terminal_frac="${OVR[terminal_frac]:-${BASE_PIPINN[terminal_frac]}}"
@@ -903,7 +885,7 @@ run_pipinn_single() {
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
   # alias two different configurations onto one flag.
-  local variant="ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};"
+  local variant="ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};rpm:${risk_premium_mode};eps:${nonaffine_eps};nls:${nonaffine_loading_scale};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};"
 
   local run_output_root="$OUT_ROOT/pi-pinn/$tag"
   local run_weight_root="$OUT_ROOT/weights/pi-pinn/$tag"
@@ -938,6 +920,8 @@ run_pipinn_single() {
     --w-terminal "$w_terminal" --w-shape "$w_shape" --w-rra "$w_rra" \
     --theta-init-method "$theta_init_method" --theta-init-scale "$theta_init_scale" \
     --theta-clip-abs "$theta_clip_abs" --print-every-outer "$print_every_outer" \
+    --risk-premium-mode "$risk_premium_mode" --nonaffine-eps "$nonaffine_eps" \
+    --nonaffine-loading-scale "$nonaffine_loading_scale" \
     --print-every-eval "$print_every_eval" --stop-flag-path "$stop_flag_path" \
     --scheduler-patience "$scheduler_patience" --scheduler-factor "$scheduler_factor" --scheduler-min-lr "$scheduler_min_lr" \
     --save-iterate-every "$save_iterate_every" \
@@ -987,26 +971,7 @@ run_pipinn() {
 #   the market is pinned by market_seed=12 regardless of the training seed.
 # =============================================================================
 
-if [[ "$CONTRACTION_PILOT" == "1" ]]; then
-  IFS=',' read -ra PILOT_SCALE_LIST <<< "$PILOT_SCALES"
-  if (( ${#PILOT_SCALE_LIST[@]} != 2 )); then
-    echo "[error] PILOT_SCALES must contain exactly two comma-separated scales" >&2
-    exit 2
-  fi
-  for _pilot_scale in "${PILOT_SCALE_LIST[@]}"; do
-    if [[ -z "${_pilot_scale//[[:space:]]/}" ]]; then
-      echo "[error] PILOT_SCALES contains an empty scale" >&2
-      exit 2
-    fi
-    run_pipinn auto \
-      m_states=3 \
-      theta_init_method=myopic \
-      theta_init_scale="$_pilot_scale" \
-      theta_clip_abs=none \
-      diag_every=1 \
-      skip_eval=1
-  done
-else
+if [[ "$SWEEP_PROFILE" == "main" ]]; then
   run_pipinn auto m_states=5
   run_pinn   auto m_states=5
 
@@ -1015,6 +980,70 @@ else
 
   run_pipinn auto m_states=1 e3b_checkpoints=1
   run_pinn   auto m_states=1
+elif [[ "$SWEEP_PROFILE" == "nonaffine" ]]; then
+  # Figure 4 profile: N=30 is fixed; choose one or more M values from 1,3,5.
+  # Every epsilon uses the SAME market_seed and training-seed set.  eps=0 is
+  # mandatory because postprocess_nonaffine.py forms paired within-seed
+  # deformations relative to that baseline.
+  _m_text="${M_STATES_LIST:-3}"
+  _eps_text="${EPS_LIST:-0,0.1,1,2,3,4,5}"
+  _loading_scale="${NONAFFINE_LOADING_SCALE:-1.0}"
+  _skip_figures="${NONAFFINE_SKIP_FIGURES:-0}"
+  IFS=', ' read -ra _m_values <<< "$_m_text"
+  IFS=', ' read -ra _eps_values <<< "$_eps_text"
+  if (( ${#_m_values[@]} == 0 || ${#_eps_values[@]} == 0 )); then
+    echo "[error] nonaffine profile requires non-empty M_STATES_LIST and EPS_LIST" >&2
+    exit 2
+  fi
+  _has_eps_zero=0
+  declare -A _nonaff_eps_seen=()
+  for _eps in "${_eps_values[@]}"; do
+    if [[ ! "$_eps" =~ ^[+]?[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?$ ]]; then
+      echo "[error] invalid non-negative epsilon: $_eps" >&2
+      exit 2
+    fi
+    _eps_key="$(awk -v value="$_eps" 'BEGIN { printf "%.17g", value + 0.0 }')"
+    if [[ -n "${_nonaff_eps_seen[$_eps_key]+x}" ]]; then
+      echo "[error] duplicate epsilon value: $_eps" >&2
+      exit 2
+    fi
+    _nonaff_eps_seen[$_eps_key]=1
+    if [[ "$_eps" =~ ^[+]?0*\.?0+([eE][+-]?[0-9]+)?$ ]]; then
+      _has_eps_zero=1
+    fi
+  done
+  if (( _has_eps_zero == 0 )); then
+    echo "[error] EPS_LIST must include 0 for the paired affine baseline" >&2
+    exit 2
+  fi
+  declare -A _nonaff_m_seen=()
+  for _m_state in "${_m_values[@]}"; do
+    case "$_m_state" in
+      1|3|5) ;;
+      *)
+        echo "[error] nonaffine M_STATES_LIST supports only 1, 3, or 5; got $_m_state" >&2
+        exit 2
+        ;;
+    esac
+    if [[ -n "${_nonaff_m_seen[$_m_state]+x}" ]]; then
+      echo "[error] duplicate M_STATES_LIST value: $_m_state" >&2
+      exit 2
+    fi
+    _nonaff_m_seen[$_m_state]=1
+  done
+  for _m_state in "${_m_values[@]}"; do
+    for _eps in "${_eps_values[@]}"; do
+      run_pipinn auto \
+        n_assets=30 m_states="$_m_state" \
+        risk_premium_mode=tanh nonaffine_eps="$_eps" \
+        nonaffine_loading_scale="$_loading_scale" \
+        theta_init_scale=1.0 e3b_checkpoints=0 \
+        skip_figures="$_skip_figures" skip_eval=0
+    done
+  done
+else
+  echo "[error] unknown SWEEP_PROFILE=$SWEEP_PROFILE (expected main or nonaffine)" >&2
+  exit 2
 fi
 
 
@@ -1046,7 +1075,7 @@ echo "[done] manifest: $MANIFEST"
 # Aggregate per-seed metrics into mean / std / 95% CI tables.
 # Disable with AGGREGATE=0. Can also be run standalone at any time:
 #   python3 aggregate_seeds.py --out-root <OUT_ROOT>
-if [[ "$AGGREGATE" == "1" ]]; then
+if [[ "$SWEEP_PROFILE" == "main" && "${AGGREGATE:-1}" == "1" ]]; then
   echo ""
   echo "[aggregate] computing seed statistics (mean / std / 95% CI) ..."
   aggregate_args=(--out-root "$OUT_ROOT")
@@ -1067,10 +1096,4 @@ if [[ "$AGGREGATE" == "1" ]]; then
     fi
     echo "[warn] aggregation failed; run manually: $PYTHON_BIN $SCRIPT_DIR/aggregate_seeds.py --out-root $OUT_ROOT"
   fi
-fi
-
-if [[ "$CONTRACTION_PILOT" == "1" ]]; then
-  echo ""
-  echo "[pilot] inspect with:"
-  echo "  $PYTHON_BIN $SCRIPT_DIR/check_contraction_pilot.py --out-root $OUT_ROOT --m-states 3 --seeds $SEEDS --expected-scales $PILOT_SCALES"
 fi

@@ -39,6 +39,7 @@ import sys
 import math
 import argparse
 import copy
+import csv
 import numpy as np
 from datetime import datetime
 from scipy.integrate import solve_ivp
@@ -65,33 +66,33 @@ from experiment_utils import (
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
     parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
 )
+from liu_risk_premium import (
+    RISK_PREMIUM_MODES,
+    has_affine_reference,
+    risk_premium_numpy,
+    risk_premium_torch,
+    validate_risk_premium_config,
+)
 
 
 # =============================================================================
 # 0) CLI + Reproducibility + Device
 # =============================================================================
-def positive_finite_float(raw):
-    """Argparse type for strictly positive finite floating-point values."""
-    value = float(raw)
-    if not math.isfinite(value) or value <= 0.0:
-        raise argparse.ArgumentTypeError("must be finite and > 0")
-    return value
-
-
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="Liu ND PIPINN experiment runner")
     add_common_experiment_args(parser, model_type_default="pipinn")
 
     parser.add_argument("--theta-init-method", type=str, default="zero", choices=["myopic", "zero", "closed_form"])
-    parser.add_argument(
-        "--theta-init-scale",
-        type=positive_finite_float,
-        default=1.0,
-        help=("Positive scale in theta_0 = scale * theta_init(method), applied "
-              "before the optional componentwise clip. Use 0.5 and 1.5 for "
-              "the fractional-myopic contraction pilot."),
-    )
+    parser.add_argument("--theta-init-scale", type=float, default=1.0,
+                        help="theta_0 = scale * theta_init(method). Nondegenerate fixed-point "
+                             "perturbation for the contraction pilot (e.g. 0.5, 1.5); 1.0 = unchanged.")
     parser.add_argument("--theta-clip-abs", type=none_or_float, default=3.0)
+    parser.add_argument("--risk-premium-mode", choices=RISK_PREMIUM_MODES, default="affine",
+                        help="affine benchmark or the paper's aligned tanh perturbation.")
+    parser.add_argument("--nonaffine-eps", type=float, default=0.0,
+                        help="epsilon >= 0 in lambda_eps; mode=tanh, eps=0 is the paired affine baseline.")
+    parser.add_argument("--nonaffine-loading-scale", type=float, default=1.0,
+                        help="Psi = scale * Lambda in the aligned tanh perturbation (paper default: 1).")
     # Previously hardcoded at the solver call site; exposed so bash overrides take effect.
     # LR schedule modes:
     #   inner_plateau (default): scheduler is re-created at the START of every
@@ -143,6 +144,16 @@ def build_arg_parser():
 
 
 ARGS = build_arg_parser().parse_args()
+RISK_PREMIUM_MODE = str(ARGS.risk_premium_mode)
+NONAFFINE_EPS = float(ARGS.nonaffine_eps)
+NONAFFINE_LOADING_SCALE = float(ARGS.nonaffine_loading_scale)
+try:
+    validate_risk_premium_config(
+        RISK_PREMIUM_MODE, NONAFFINE_EPS, NONAFFINE_LOADING_SCALE
+    )
+except ValueError as exc:
+    raise SystemExit(f"[config error] {exc}") from exc
+HAS_AFFINE_REFERENCE = has_affine_reference(RISK_PREMIUM_MODE, NONAFFINE_EPS)
 # Resolve skip flags. --skip-plots is a BACK-COMPAT alias for --skip-figures
 # (figures-only); evaluation is skipped ONLY when --skip-eval is passed. This
 # guarantees a main sweep always computes full-dim metrics.csv even when
@@ -223,9 +234,13 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
 N_ASSETS = ARGS.n_assets    # Number of risky assets
 M_STATES = ARGS.m_states    # Number of state variables
 
-weight_dir = ARGS.weight_root or f"weights/pi-pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+_default_exp_name = f"kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+if RISK_PREMIUM_MODE == "tanh":
+    _eps_token = format(NONAFFINE_EPS, ".12g").replace("-", "m").replace(".", "p")
+    _default_exp_name += f"_tanh_eps{_eps_token}"
+weight_dir = ARGS.weight_root or f"weights/pi-pinn/{_default_exp_name}"
 os.makedirs(weight_dir, exist_ok=True)
-output_dir = ARGS.output_root or f"outputs/pi-pinn/kim_omberg_{N_ASSETS}asset-{M_STATES}state"
+output_dir = ARGS.output_root or f"outputs/pi-pinn/{_default_exp_name}"
 os.makedirs(output_dir, exist_ok=True)
 recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
 if ARGS.eval_only:
@@ -285,6 +300,52 @@ eta = params.eta if params.eta is not None else np.diag(SigmaX)
 X_min = xbar - X_RANGE_SCALE * eta
 X_max = xbar + X_RANGE_SCALE * eta
 
+try:
+    validate_risk_premium_config(
+        RISK_PREMIUM_MODE,
+        NONAFFINE_EPS,
+        NONAFFINE_LOADING_SCALE,
+        state_scale=eta,
+    )
+except ValueError as exc:
+    raise SystemExit(f"[config error] {exc}") from exc
+
+# Fixed coefficient tensors used by every actual-model path.  D=diag(eta)
+# and Psi=loading_scale*Lambda are deterministic functions of the saved market
+# snapshot, so market_params.npz remains identical across epsilon runs.
+RISK_XBAR_T = torch.tensor(xbar, device=device, dtype=torch.float32)
+RISK_STATE_SCALE_T = torch.tensor(eta, device=device, dtype=torch.float32)
+
+
+def actual_risk_premium_torch(x, lam0_t, Lam_t):
+    """Risk premium of the model being trained (affine or tanh)."""
+
+    return risk_premium_torch(
+        x,
+        lam0_t,
+        Lam_t,
+        mode=RISK_PREMIUM_MODE,
+        eps=NONAFFINE_EPS,
+        xbar=RISK_XBAR_T,
+        state_scale=RISK_STATE_SCALE_T,
+        loading_scale=NONAFFINE_LOADING_SCALE,
+    )
+
+
+def actual_risk_premium_numpy(x, lam0_np=lam0, Lam_np=Lam):
+    """NumPy counterpart used by model-only diagnostics."""
+
+    return risk_premium_numpy(
+        x,
+        lam0_np,
+        Lam_np,
+        mode=RISK_PREMIUM_MODE,
+        eps=NONAFFINE_EPS,
+        xbar=xbar,
+        state_scale=eta,
+        loading_scale=NONAFFINE_LOADING_SCALE,
+    )
+
 # Print configuration
 print_joint_market_report(params)
 # print(f"\n{'='*60}")
@@ -297,6 +358,11 @@ print(f"Maxmimum State domain: X ∈ {X_max}")
 print(f"Minimum Wealth domain: W ∈ [{W_min}, {W_max}]")
 print(f"\nK (mean reversion):\n{np.diag(K)}")
 print(f"x̄ (long-run mean): {xbar}")
+print(
+    f"Risk premium: mode={RISK_PREMIUM_MODE}, eps={NONAFFINE_EPS:g}, "
+    f"Psi={NONAFFINE_LOADING_SCALE:g}*Lambda, D=diag(eta), "
+    f"affine_reference={'yes' if HAS_AFFINE_REFERENCE else 'no'}"
+)
 # print(f"Σ_X (state diffusion):\n{SigmaX}")
 # print(f"ρ (correlation):\n{rho}")
 # print(f"Λ (loading):\n{Lam}")
@@ -638,8 +704,8 @@ def hjb_residual_nd(model, w, x, tau, M, N, gamma, r, K_t, k0_t, Q_t, Gamma_t, l
     term4 = 0.5 * torch.einsum('ij,bij->b', Q_t, V_xx).unsqueeze(1)  # (batch, 1)
     
     # Term 5: -‖λ(x)V_w + Γ V_wx‖² / (2V_ww)
-    # λ(x) = λ_0 + Λx → (batch, N)
-    lam_x = lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', Lam_t, x)  # (batch, N)
+    # Actual model coefficient: affine benchmark or aligned tanh perturbation.
+    lam_x = actual_risk_premium_torch(x, lam0_t, Lam_t)  # (batch, N)
     
     # Γ V_wx → (batch, N)
     Gamma_Vwx = torch.einsum('ij,bj->bi', Gamma_t, V_wx)  # (batch, N)
@@ -684,8 +750,7 @@ def compute_optimal_theta_nd(model, w, x, tau, M, N, gamma,
     V_ww = torch.autograd.grad(V_w, w, grad_outputs=torch.ones_like(V_w),
                                create_graph=create_graph, retain_graph=True)[0]
     
-    # λ(x) = λ_0 + Λx
-    lam_x = lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', Lam_t, x)  # (batch, N)
+    lam_x = actual_risk_premium_torch(x, lam0_t, Lam_t)  # (batch, N)
     
     # Γ V_wx
     Gamma_Vwx = torch.einsum('ij,bj->bi', Gamma_t, V_wx)  # (batch, N)
@@ -758,8 +823,7 @@ def linear_pde_residual_nd(
     # 1/2 tr(Q V_xx)
     term4 = 0.5 * torch.einsum('ij,bij->b', Q_t, V_xx).unsqueeze(1)  # (batch,1)
 
-    # λ(x) = λ0 + Λ x
-    lam_x = lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', Lam_t, x)  # (batch, N)
+    lam_x = actual_risk_premium_torch(x, lam0_t, Lam_t)  # (batch, N)
 
     # (θ^T λ(x)) V_w
     theta_dot_lam = torch.sum(theta_n * lam_x, dim=1, keepdim=True)  # (batch,1)
@@ -800,7 +864,7 @@ def compute_theta_from_foc_nd(
     V_ww = torch.autograd.grad(V_w, w, grad_outputs=torch.ones_like(V_w), create_graph=True, retain_graph=True)[0]
     V_wx = torch.autograd.grad(V_w, x, grad_outputs=torch.ones_like(V_w), create_graph=True, retain_graph=True)[0]  # (batch,M)
 
-    lam_x = lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', Lam_t, x)  # (batch,N)
+    lam_x = actual_risk_premium_torch(x, lam0_t, Lam_t)  # (batch,N)
     Gamma_Vwx = torch.einsum('ij,bj->bi', Gamma_t, V_wx)               # (batch,N)
 
     numerator = lam_x * V_w + Gamma_Vwx                                 # (batch,N)
@@ -852,7 +916,6 @@ class PIPINN_KimOmbergND:
         self.Lam_t = Lam_t
 
         self.theta_clip_abs = theta_clip_abs
-        self.theta_init_scale = 1.0
 
         self.value_net = ValueNetND(M=M, hidden=value_hidden, depth=value_depth).to(device)
         self.initial_lr = lr
@@ -983,11 +1046,16 @@ class PIPINN_KimOmbergND:
         - closed_form: θ from ODE (expensive; for debugging)
         """
         if method == "myopic":
-            lam_x = self.lam0_t.unsqueeze(0) + torch.einsum('ij,bj->bi', self.Lam_t, x)
+            lam_x = actual_risk_premium_torch(x, self.lam0_t, self.Lam_t)
             theta = (w / self.gamma) * lam_x
         elif method == "zero":
             theta = torch.zeros((w.shape[0], self.N), device=self.device, dtype=torch.float32)
         elif method == "closed_form":
+            if not HAS_AFFINE_REFERENCE:
+                raise ValueError(
+                    "theta-init-method=closed_form is unavailable for non-affine eps>0; "
+                    "use myopic (paper default) or zero"
+                )
             # WARNING: slow (loop). Use only for sanity checks.
             theta_list = []
             w_np = w.detach().cpu().numpy().reshape(-1)
@@ -1004,10 +1072,12 @@ class PIPINN_KimOmbergND:
         else:
             raise ValueError(f"Unknown theta init method: {method}")
 
-        # Pilot perturbation.  With method="myopic" and clipping disabled this
-        # is exactly theta_0 = a * theta_myopic.  Keep the clip outermost so a
-        # finite clip has the explicit interpretation clip(a * theta_init).
-        theta = theta * self.theta_init_scale
+        # Contraction-pilot perturbation: theta_0 = scale * theta_init(method).
+        # Apply before the numerical clip so the clip remains the outermost
+        # safeguard and the non-affine myopic structure is preserved.
+        _scale = float(getattr(self, "theta_init_scale", 1.0))
+        if _scale != 1.0:
+            theta = theta * _scale
         if self.theta_clip_abs is not None:
             theta = torch.clamp(theta, -float(self.theta_clip_abs), float(self.theta_clip_abs))
         return theta
@@ -1439,9 +1509,10 @@ class PIPINN_KimOmbergND:
         print(f"  outer_iters   : {outer_iters}")
         print(f"  eval_epochs   : {eval_epochs}")
         print(f"  batch_size    : {batch_size}")
-        self.theta_init_scale = positive_finite_float(theta_init_scale)
+        self.theta_init_scale = float(theta_init_scale)
         print(f"  θ init        : {theta_init_method} (scale={self.theta_init_scale:g})")
         print(f"  θ clip abs    : {self.theta_clip_abs}")
+        print(f"  risk premium : {RISK_PREMIUM_MODE} (eps={NONAFFINE_EPS:g})")
         print(f"  init LR       : {self.initial_lr:.2e}")
         print(f"  lr schedule   : {self.lr_schedule} (adam_reset={self.adam_reset}, patience={self.scheduler_patience})")
         print(f"  pres target   : {pres_target}  (val: {val_points} int + {val_terminal_points} term pts, check every {val_every} inner epochs)")
@@ -1451,6 +1522,8 @@ class PIPINN_KimOmbergND:
             "theta_diff": [],
             "theta_cf_diff": [],
             "eval_loss": [],
+            "val_pde_rms": [],
+            "val_terminal_rms": [],
             "val_pres": [],
             "e_Xev": [],
             "inner_epochs_used": [],
@@ -1492,8 +1565,10 @@ class PIPINN_KimOmbergND:
                 int(diag_points), float(diag_margin), self.M, self.N, self.gamma, self.r,
                 X_min, X_max, W_min, W_max, tau_max,
                 cf_sol, lam0, Lam, Gamma, market_seed=MARKET_SEED,
+                include_affine_reference=HAS_AFFINE_REFERENCE,
             )
-            print(f"  diag set      : {diag_points} pts on Q_ev(margin={diag_margin}) for e_n / margins")
+            _diag_kind = "e_n / margins" if HAS_AFFINE_REFERENCE else "model-side margins only"
+            print(f"  diag set      : {diag_points} pts on Q_ev(margin={diag_margin}) for {_diag_kind}")
 
         best_eval_loss = float("inf")
         best_iter = 0
@@ -1646,28 +1721,30 @@ class PIPINN_KimOmbergND:
                 theta_sel = theta_sel.detach()
                 sel_fn = lambda: self.evaluate_heldout_pres(theta_sel, sel_set)
 
-            # Empirical ellipticity of the FROZEN policy alpha_n on a fixed
-            # Q_col subsample.  This diagnostic depends on the audit set, not
-            # on whether held-out inner-best selection is enabled.
-            _do_frozen_diag = (
-                val_set is not None
-                and diag_points and diag_points > 0
-                and not timing_mode
-                and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
-            )
-            if _do_frozen_diag:
-                _tv = theta_val[: int(diag_points)].cpu().numpy()
-                _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
-                frozen_lam_min = float(np.min(_lmin))
-                frozen_lam_max = float(np.max(_lmax))
-                if self.theta_clip_abs is not None:
-                    _c = float(self.theta_clip_abs)
-                    frozen_clip_frac = float(np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1)))
-                if it == 1:
-                    results["theta0_lam_min_sigma"] = frozen_lam_min
-                    results["theta0_lam_max_sigma"] = frozen_lam_max
-                    print(f"  [init policy] empirical lam(Sigma^theta0) on Q_col subsample: "
-                          f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
+                # Ellipticity of the FROZEN policy alpha_n on Q_col: reuse
+                # theta_val (already computed on the held-out points, which
+                # sample the FULL collocation window) -- no extra autograd.
+                # Cost control: only a FIXED Q_col subsample (first
+                # diag_points held-out points) and only on the diag schedule;
+                # iteration 1 (initial-policy nondegeneracy) and the final
+                # iteration always run.
+                _do_frozen_diag = (
+                    diag_points and diag_points > 0 and not timing_mode
+                    and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
+                )
+                if _do_frozen_diag:
+                    _tv = theta_val[: int(diag_points)].cpu().numpy()
+                    _lmin, _lmax = sigma_eig_extremes_batch(_tv, Gamma, Q)
+                    frozen_lam_min = float(np.min(_lmin))
+                    frozen_lam_max = float(np.max(_lmax))
+                    if self.theta_clip_abs is not None:
+                        _c = float(self.theta_clip_abs)
+                        frozen_clip_frac = float(np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1)))
+                    if it == 1:
+                        results["theta0_lam_min_sigma"] = frozen_lam_min
+                        results["theta0_lam_max_sigma"] = frozen_lam_max
+                        print(f"  [init policy] lam(Sigma^theta0) on Q_col subsample: "
+                              f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
 
             # LR protocol for this outer iteration (inner_plateau: reset).
             self.prepare_optimizer_for_outer()
@@ -1696,6 +1773,8 @@ class PIPINN_KimOmbergND:
 
             results["loss_history"].extend(eval_hist)
             results["eval_loss"].append(last_eval_loss)
+            results["val_pde_rms"].append(eval_info.get("val_pde_rms", ""))
+            results["val_terminal_rms"].append(eval_info.get("val_terminal_rms", ""))
             results["val_pres"].append(eval_info.get("val_pres", ""))
             results["inner_epochs_used"].append(eval_info.get("epochs_used", 0))
 
@@ -1703,14 +1782,16 @@ class PIPINN_KimOmbergND:
             # and the stability margins (E1-b/c analogues).
             diag_res = {}
             if diag is not None and (
-                diag_every <= 1 or it == 1 or it % diag_every == 0 or it == outer_iters
+                diag_every <= 1 or it % diag_every == 0 or it == 1 or it == outer_iters
             ):
                 diag_res = eval_diag_metrics(
                     self.value_net, diag, self.M, self.N, self.gamma,
                     self.Gamma_t, self.lam0_t, self.Lam_t,
                     Gamma, lam0, Lam,
                 )
-                results["e_Xev"].append(diag_res["e_Xev"])
+                if "e_Xev" in diag_res:
+                    results["e_Xev"].append(diag_res["e_Xev"])
+                results["last_diag"] = dict(diag_res)
 
             # Snapshot the current iterate v~_n (state right after policy
             # evaluation at outer iter `it`). Main runs keep this OFF; the
@@ -1748,7 +1829,7 @@ class PIPINN_KimOmbergND:
 
             # Distance of the current iterate to the closed-form optimum,
             # on the same collocation points (for the convergence figure).
-            if timing_mode or theta_new is None:
+            if timing_mode or theta_new is None or not HAS_AFFINE_REFERENCE:
                 theta_cf_diff = float("nan")  # closed-form oracle diagnostic: off in timing runs
             else:
                 theta_star = self.closed_form_theta_on_points(w_colloc, x_colloc, tau_colloc)
@@ -1778,10 +1859,11 @@ class PIPINN_KimOmbergND:
             _vp = eval_info.get("val_pres", "")
             _vp_s = f"{_vp:.3e}" if isinstance(_vp, float) else "n/a"
             _pi = f"p_res={_vp_s} | inner={eval_info.get('epochs_used', 0)}{'*' if eval_info.get('target_reached') else ''}"
+            _cf_s = f"{theta_cf_diff:.4e}" if np.isfinite(theta_cf_diff) else "n/a"
             if verbose:
-                print(f"[Iter {it:3d}] Loss={last['total']:.2e} | PDE Loss: {last['pde']:.4e} | Terminal Loss: {last['terminal']:.4e} | {_pi} | θ diff={theta_diff:.4e} | θ-θ* diff={theta_cf_diff:.4e} | RRA(η-γ)²={last.get('rra', float('nan')):.4e} | LR={lr_now:.2e}")
+                print(f"[Iter {it:3d}] Loss={last['total']:.2e} | PDE Loss: {last['pde']:.4e} | Terminal Loss: {last['terminal']:.4e} | {_pi} | θ diff={theta_diff:.4e} | θ-θ* diff={_cf_s} | RRA(η-γ)²={last.get('rra', float('nan')):.4e} | LR={lr_now:.2e}")
             elif it % 20 == 0:
-                print(f"[Iter {it:3d}] Loss={last['total']:.2e} | PDE Loss: {last['pde']:.4e} | Terminal Loss: {last['terminal']:.4e} | {_pi} | θ diff={theta_diff:.4e} | θ-θ* diff={theta_cf_diff:.4e} | RRA(η-γ)²={last.get('rra', float('nan')):.4e} | LR={lr_now:.2e}")
+                print(f"[Iter {it:3d}] Loss={last['total']:.2e} | PDE Loss: {last['pde']:.4e} | Terminal Loss: {last['terminal']:.4e} | {_pi} | θ diff={theta_diff:.4e} | θ-θ* diff={_cf_s} | RRA(η-γ)²={last.get('rra', float('nan')):.4e} | LR={lr_now:.2e}")
 
             elapsed = time.time() - start_time
             stop_triggered = False
@@ -1841,7 +1923,7 @@ class PIPINN_KimOmbergND:
                     "concavity_loss": last.get("conc", ""),
                     "rra_loss": last.get("rra", ""),
                     "theta_diff": theta_diff,
-                    "theta_cf_diff": theta_cf_diff,
+                    "theta_cf_diff": theta_cf_diff if HAS_AFFINE_REFERENCE else "",
                     "eval_loss": last_eval_loss,
                     "train_pres": eval_info.get("train_pres", ""),
                     "val_pde_rms": eval_info.get("val_pde_rms", ""),
@@ -2519,13 +2601,15 @@ def eval_closed_form_on_tau_X_grid(
 
 def build_diag_set(n_points, margin, M, N, gamma, r,
                    X_min, X_max, W_min, W_max, tau_max,
-                   sol, lam0, Lam, Gamma, market_seed):
+                   sol, lam0, Lam, Gamma, market_seed,
+                   include_affine_reference=True):
     """Fixed Q_ev diagnostic set for per-iteration e_n and stability margins.
 
     Points are uniform over (0, tau_max] x Omega_ev at the PRIMARY margin,
     drawn from a MARKET-seed-derived RNG so every training seed and both
     methods use the SAME set. Closed-form V and the reduced derivative
-    bundle (V_w, V_ww, grad_x V_w) are precomputed here once:
+    bundle (V_w, V_ww, grad_x V_w) are precomputed here once when the
+    affine Riccati solution is an exact reference:
 
         V    = D * w^{1-g}/(1-g) * phi,  phi = exp(a + b'x + x'Cx/2),
         V_w  = D * w^{-g} * phi,         D = exp((1-g) r tau),
@@ -2543,29 +2627,31 @@ def build_diag_set(n_points, margin, M, N, gamma, r,
     w_np = W_lo + U[:, 1] * (W_hi - W_lo)
     x_np = X_lo[None, :] + U[:, 2:] * (X_hi - X_lo)[None, :]
 
-    P = int(n_points)
-    V_cf = np.zeros(P)
-    Vw_cf = np.zeros(P)
-    Vww_cf = np.zeros(P)
-    Vwx_cf = np.zeros((P, M))
-    for i in range(P):
-        a, b, C = get_closed_form_at_tau(float(tau_np[i]), sol, M)
-        phi = np.exp(a + b @ x_np[i] + 0.5 * x_np[i] @ C @ x_np[i])
-        D = np.exp((1.0 - gamma) * r * tau_np[i])
-        w_i = w_np[i]
-        V_cf[i] = D * np.power(w_i, 1.0 - gamma) / (1.0 - gamma) * phi
-        Vw_cf[i] = D * np.power(w_i, -gamma) * phi
-        Vww_cf[i] = -gamma * D * np.power(w_i, -gamma - 1.0) * phi
-        Vwx_cf[i] = D * np.power(w_i, -gamma) * phi * (b + C @ x_np[i])
-
     dev = device
-    return {
+    out = {
         "w": torch.tensor(w_np.reshape(-1, 1), dtype=torch.float32, device=dev),
         "x": torch.tensor(x_np, dtype=torch.float32, device=dev),
         "tau": torch.tensor(tau_np.reshape(-1, 1), dtype=torch.float32, device=dev),
         "w_np": w_np, "x_np": x_np,
-        "V_cf": V_cf, "Vw_cf": Vw_cf, "Vww_cf": Vww_cf, "Vwx_cf": Vwx_cf,
+        "has_affine_reference": bool(include_affine_reference),
     }
+    if include_affine_reference:
+        P = int(n_points)
+        V_cf = np.zeros(P)
+        Vw_cf = np.zeros(P)
+        Vww_cf = np.zeros(P)
+        Vwx_cf = np.zeros((P, M))
+        for i in range(P):
+            a, b, C = get_closed_form_at_tau(float(tau_np[i]), sol, M)
+            phi = np.exp(a + b @ x_np[i] + 0.5 * x_np[i] @ C @ x_np[i])
+            D = np.exp((1.0 - gamma) * r * tau_np[i])
+            w_i = w_np[i]
+            V_cf[i] = D * np.power(w_i, 1.0 - gamma) / (1.0 - gamma) * phi
+            Vw_cf[i] = D * np.power(w_i, -gamma) * phi
+            Vww_cf[i] = -gamma * D * np.power(w_i, -gamma - 1.0) * phi
+            Vwx_cf[i] = D * np.power(w_i, -gamma) * phi * (b + C @ x_np[i])
+        out.update(V_cf=V_cf, Vw_cf=Vw_cf, Vww_cf=Vww_cf, Vwx_cf=Vwx_cf)
+    return out
 
 
 def sigma_eig_extremes_batch(theta_np, Gamma_np, Q_np):
@@ -2592,11 +2678,10 @@ def eval_diag_metrics(model, diag, M, N, gamma,
                       chunk=4096):
     """One diagnostic pass on the fixed Q_EV set.
 
-    Returns e_n components (sup-norms vs the closed form) plus the margins
-    m_ww = min(-V_ww) and M_num = max||lam(x)V_w + Gamma V_wx|| and the
-    V_ww guard-activation fraction ON OMEGA_EV. Ellipticity of the frozen
-    policy (lambda_min, clip fraction) is measured separately on the
-    Q_col held-out points -- see the caller.
+    Always returns model-side margins m_ww, M_num, and guard_frac.  The e_n
+    and RelL2 fields are returned only when ``diag`` contains an exact affine
+    reference; for tanh eps>0 those fields would conflate deformation with
+    solver error and are intentionally omitted.
     """
     was_training = model.training
     model.eval()
@@ -2619,6 +2704,17 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     if was_training:
         model.train()
 
+    # Stability margins (model side)
+    m_ww = float(np.min(-Vww_m))
+    guard_frac = float(np.mean(Vww_m > -VWW_GUARD))
+    lam_x = actual_risk_premium_numpy(diag["x_np"], lam0_np, Lam_np)  # (P, N)
+    numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
+    M_num = float(np.max(np.linalg.norm(numer, axis=1)))
+
+    out = {"m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac}
+    if not bool(diag.get("has_affine_reference", False)):
+        return out
+
     # e_n on the fixed set: sup |V - V*| + sup ||bundle - bundle*||_2
     e_V = float(np.max(np.abs(V_m - diag["V_cf"])))
     bundle_err = np.concatenate([
@@ -2630,13 +2726,6 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     e_Vw_sup = float(np.max(np.abs(Vw_m - diag["Vw_cf"])))
     e_Vww_sup = float(np.max(np.abs(Vww_m - diag["Vww_cf"])))
     e_Vwx_sup = float(np.max(np.linalg.norm(Vwx_m - diag["Vwx_cf"], axis=1)))
-
-    # Stability margins (model side)
-    m_ww = float(np.min(-Vww_m))
-    guard_frac = float(np.mean(Vww_m > -VWW_GUARD))
-    lam_x = lam0_np[None, :] + diag["x_np"] @ Lam_np.T            # (P, N)
-    numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
-    M_num = float(np.max(np.linalg.norm(numer, axis=1)))
 
     # Table-grade norms on the SAME diagnostic set (same RelL2 norm as the
     # full-dim Table metric, primary margin only): per-outer convergence
@@ -2652,12 +2741,12 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
                          / max(np.linalg.norm(theta_cf), 1e-300))
 
-    return {
+    out.update({
         "e_V_sup": e_V, "e_bundle_sup": e_D, "e_Xev": e_V + e_D,
         "e_Vw_sup": e_Vw_sup, "e_Vww_sup": e_Vww_sup, "e_Vwx_sup": e_Vwx_sup,
         "diag_RelL2_V": rel_l2_V, "diag_RelL2_theta": rel_l2_theta,
-        "m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac,
-    }
+    })
+    return out
 
 
 def eval_fulldim_test_metrics(model, n_points, margins,
@@ -2778,7 +2867,7 @@ w_shape         = ARGS.w_shape      # monotonicity/concavity penalty weight
 w_rra           = ARGS.w_rra        # CRRA homogeneity penalty weight (0 disables)
 
 theta_init_method = ARGS.theta_init_method  # {"myopic", "zero", "closed_form"}
-theta_init_scale  = ARGS.theta_init_scale   # positive; applied before optional clip
+theta_init_scale  = float(ARGS.theta_init_scale)  # theta_0 = scale * theta_init(method)
 theta_clip_abs    = ARGS.theta_clip_abs       # None -> no clamp, else componentwise |θ_i| <= clip
 
 print_every_outer = ARGS.print_every_outer
@@ -2854,6 +2943,7 @@ if __name__ == "__main__":
         elapsed = 0.0
     else:
         results = solver.run_policy_iteration(
+            theta_init_scale=theta_init_scale,
             outer_iters=outer_iters,
             eval_epochs=eval_epochs,
             batch_size=batch_size,
@@ -2862,7 +2952,6 @@ if __name__ == "__main__":
             w_shape=w_shape,
             w_rra=w_rra,
             theta_init_method=theta_init_method,
-            theta_init_scale=theta_init_scale,
             print_every_outer=print_every_outer,
             print_every_eval=print_every_eval,
             verbose_detail=verbose_detail,
@@ -2907,7 +2996,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("\n" + "="*60)
-    print("Evaluating PINN-PI vs Closed-form...")
+    if HAS_AFFINE_REFERENCE:
+        print("Evaluating PINN-PI vs Closed-form...")
+    else:
+        print("Evaluating PINN-PI non-affine residual and stability diagnostics...")
     print(f"{'='*60}")
     print(f"  hidden node      : {value_hidden}")
     print(f"  hidden layers    : {value_depth}")
@@ -2919,6 +3011,7 @@ if __name__ == "__main__":
     print(f"  shape weight     : {w_shape}")
     print(f"  theta init       : {theta_init_method} (scale={theta_init_scale:g})")
     print(f"  theta clip abs   : {theta_clip_abs}")
+    print(f"  risk premium     : {RISK_PREMIUM_MODE}, eps={NONAFFINE_EPS:g}")
     print(f"  Seed             : {SEED}")
     print(f"Elapsed time       : {h:02d}:{m:02d}:{s:05.2f}")
     print(f"{'='*70}")
@@ -3006,11 +3099,58 @@ if __name__ == "__main__":
             os.remove(recorder.metrics_csv)  # stale tmp from an older failed eval
         print(f"[eval-only] Recording metrics to {recorder.metrics_csv} (atomic swap on success).")
     
+    # For eps>0 there is no exact solution.  Record only quantities that remain
+    # meaningful: the final held-out frozen-policy residual on Q_col and
+    # model-side stability diagnostics.  The affine-reference error columns
+    # below are deliberately not produced in this branch.
+    if not HAS_AFFINE_REFERENCE:
+        _last_outer = {}
+        if os.path.exists(recorder.outer_csv):
+            with open(recorder.outer_csv, newline="", encoding="utf-8") as _f:
+                for _row in csv.DictReader(_f):
+                    _last_outer = _row
+
+        _nonaffine_metrics = [
+            ("frozen_policy_heldout", "", "val_pde_rms"),
+            ("frozen_policy_heldout", "", "val_terminal_rms"),
+            ("frozen_policy_heldout", "", "val_pres"),
+            ("model_diagnostic", primary_margin, "m_ww"),
+            ("model_diagnostic", primary_margin, "M_num"),
+            ("model_diagnostic", primary_margin, "guard_frac_ev"),
+            ("frozen_policy_diagnostic", "", "lam_min_sigma_frozen"),
+            ("frozen_policy_diagnostic", "", "lam_max_sigma_frozen"),
+            ("frozen_policy_diagnostic", "", "clip_frac_frozen"),
+        ]
+        _rows = []
+        for _scope, _margin, _metric in _nonaffine_metrics:
+            _raw = _last_outer.get(_metric, "")
+            if _raw in (None, ""):
+                continue
+            try:
+                _value = float(_raw)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(_value):
+                continue
+            _rows.append({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model_type": ARGS.model_type,
+                "run_tag": ARGS.run_tag,
+                "scope": _scope,
+                "eval_margin": _margin,
+                "metric": _metric,
+                "value": _value,
+            })
+        append_csv_rows(recorder.metrics_csv, _rows, metric_fields)
+        print("\n--- Non-affine final diagnostics (no closed-form accuracy claim) ---")
+        for _row in _rows:
+            print(f"  {_row['metric']}: {_row['value']:.6e}")
+
     # Independent FULL-DIMENSIONAL test evaluation on Omega_ev (Table / E9).
     # All coordinates vary; the same base points are mapped into every margin
     # window so nested-window results are directly comparable. Printed BEFORE
     # the (tau, x_0) grid slices; per-asset metrics go to metrics.csv only.
-    if ARGS.test_points and ARGS.test_points > 0:
+    if HAS_AFFINE_REFERENCE and ARGS.test_points and ARGS.test_points > 0:
         fulldim_metrics = eval_fulldim_test_metrics(
             model, ARGS.test_points, EVAL_MARGINS,
             M_STATES, N_ASSETS, gamma, r,
@@ -3043,7 +3183,12 @@ if __name__ == "__main__":
     # evaluation window. Slice metrics were removed: all reported numbers come
     # from the full-dimensional Omega_ev test above. Under --skip-figures the
     # slice loop is skipped entirely (figures only; metrics already written).
-    for w_test in ([] if SKIP_FIGURES else W_levels):
+    if not HAS_AFFINE_REFERENCE and not SKIP_FIGURES:
+        print(
+            "[non-affine] Skipping built-in affine comparison heatmaps; "
+            "use postprocess_nonaffine.py for the paired homotopy figure."
+        )
+    for w_test in ([] if (SKIP_FIGURES or not HAS_AFFINE_REFERENCE) else W_levels):
         X_ev_min, X_ev_max = shrink_bounds(X_min, X_max, primary_margin)
         print(f"\n--- Grid slice for plots: w={w_test:.2f}, eval_margin={primary_margin:.2f} ---")
 
