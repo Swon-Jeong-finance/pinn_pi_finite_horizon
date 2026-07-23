@@ -23,7 +23,7 @@ Typical use::
     python3 postprocess_nonaffine.py \
       --out-root outputs/nonaffine \
       --n-assets 30 --m-states 1 \
-      --expected-seeds 1-10 \
+      --expected-seeds '1,2,3,5,7,11,17,23,42,101' \
       --eps 0,0.1,1,2,3,4,5
 
 Run directories are discovered recursively from ``config.json``.  The
@@ -33,8 +33,9 @@ preferred launcher layout is
     OUT_ROOT/weights/pi-pinn/<run-tag>/
 
 but the recorded ``weight_dir`` is honored, so copied or custom layouts also
-work.  Checkpoints are selected in the paper protocol order
-``value_net_final.pt``, ``value_net_last.pt``, ``value_net_best.pt``.
+work.  Paper mode requires ``value_net_final.pt``.  The legacy
+``final -> last -> best`` search is available only through the explicit
+``--allow-checkpoint-fallback`` exploratory option.
 """
 
 from __future__ import annotations
@@ -54,11 +55,16 @@ import numpy as np
 try:
     import torch
     import torch.nn as nn
-except ModuleNotFoundError as exc:
-    raise SystemExit(
-        "postprocess_nonaffine.py requires PyTorch to load Liu checkpoints and "
-        "differentiate the saved value networks; run it in the training environment."
-    ) from exc
+except ModuleNotFoundError:
+    torch = None  # type: ignore[assignment]
+
+    class _UnavailableModule:
+        pass
+
+    class _UnavailableNN:
+        Module = _UnavailableModule
+
+    nn = _UnavailableNN()  # type: ignore[assignment]
 
 import matplotlib
 
@@ -66,7 +72,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from aggregate_seeds import GROUP_IGNORE_KEYS, canonical_market_hash, parse_seed_spec, run_status
-from experiment_utils import VWW_GUARD, safe_concave_vww
+from joint_market_setup_dirichlet import validate_market_snapshot
+if torch is not None:
+    from experiment_utils import VWW_GUARD, safe_concave_vww
+else:
+    VWW_GUARD = 1.0e-8
+
+    def safe_concave_vww(_value):  # pragma: no cover - guarded in main
+        raise RuntimeError("safe_concave_vww requires PyTorch")
 from liu_risk_premium import risk_premium_torch
 
 
@@ -366,25 +379,35 @@ def _weight_dir_candidates(record: RunRecord, out_root: Path) -> List[Path]:
     return [path.resolve() if path.exists() else path for path in unique]
 
 
-def _resolve_checkpoint(record: RunRecord, out_root: Path) -> Tuple[Path, str]:
+def _resolve_checkpoint(
+    record: RunRecord,
+    out_root: Path,
+    *,
+    allow_fallback: bool = False,
+) -> Tuple[Path, str]:
     weight_dirs = _weight_dir_candidates(record, out_root)
     # Filename priority is global across all candidate directories: a copied
     # official final must outrank a legacy best file left at the recorded
     # training-machine path.
-    for name, kind in (
-        ("value_net_final.pt", "final"),
-        ("value_net_last.pt", "last_fallback"),
-        ("value_net_best.pt", "best_legacy_fallback"),
-    ):
+    names = [("value_net_final.pt", "final")]
+    if allow_fallback:
+        names.extend((
+            ("value_net_last.pt", "last_fallback"),
+            ("value_net_best.pt", "best_legacy_fallback"),
+        ))
+    for name, kind in names:
         for weight_dir in weight_dirs:
             path = weight_dir / name
             if path.is_file():
                 return path, kind
     attempted = "\n".join(f"  - {path}" for path in weight_dirs)
-    raise FileNotFoundError(
-        "no value_net_final.pt/value_net_last.pt/value_net_best.pt in candidate weight directories:\n"
-        f"{attempted}"
+    policy = (
+        "no official value_net_final.pt"
+        if not allow_fallback
+        else "no value_net_final.pt/value_net_last.pt/value_net_best.pt"
     )
+    suffix = " (pass --allow-checkpoint-fallback only for legacy exploratory runs)" if not allow_fallback else ""
+    raise FileNotFoundError(f"{policy}{suffix} in candidate weight directories:\n{attempted}")
 
 
 class ValueNetND(nn.Module):
@@ -434,17 +457,24 @@ def _evaluate_run(
     tau_grid: np.ndarray,
     w0: float,
     device: torch.device,
+    allow_checkpoint_fallback: bool = False,
 ) -> LoadedRun:
     market_path = record.run_dir / "market_params.npz"
     if not market_path.is_file():
         raise FileNotFoundError(f"missing market_params.npz: {market_path}")
-    checkpoint, checkpoint_kind = _resolve_checkpoint(record, out_root)
+    checkpoint, checkpoint_kind = _resolve_checkpoint(
+        record, out_root, allow_fallback=allow_checkpoint_fallback
+    )
 
     with np.load(market_path, allow_pickle=False) as market:
         required = ("xbar", "lam0", "Lam", "Gamma", "eta")
         missing = [key for key in required if key not in market.files]
         if missing:
             raise ValueError(f"{market_path}: missing fields {missing}")
+        try:
+            validate_market_snapshot(market)
+        except ValueError as exc:
+            raise ValueError(f"{market_path}: invalid market snapshot: {exc}") from exc
         xbar_np = np.asarray(market["xbar"], dtype=np.float32).reshape(-1)
         lam0_np = np.asarray(market["lam0"], dtype=np.float32).reshape(-1)
         loading_np = np.asarray(market["Lam"], dtype=np.float32)
@@ -552,7 +582,7 @@ def _mean_std(values: Sequence[float]) -> Tuple[float, float]:
     if not array.size:
         return float("nan"), float("nan")
     mean = float(np.mean(array))
-    std = float(np.std(array, ddof=1)) if array.size > 1 else 0.0
+    std = float(np.std(array, ddof=1)) if array.size > 1 else float("nan")
     return mean, std
 
 
@@ -722,7 +752,14 @@ def process_group(
 
     loaded: Dict[Tuple[int, str], LoadedRun] = {}
     for key, record in sorted(selected.items(), key=lambda item: (item[0][0], float(item[0][1]))):
-        loaded[key] = _evaluate_run(record, out_root=out_root, tau_grid=tau_grid, w0=args.w0, device=device)
+        loaded[key] = _evaluate_run(
+            record,
+            out_root=out_root,
+            tau_grid=tau_grid,
+            w0=args.w0,
+            device=device,
+            allow_checkpoint_fallback=bool(args.allow_checkpoint_fallback),
+        )
         if loaded[key].checkpoint_kind != "final":
             print(f"[warn] {record.run_dir}: using {loaded[key].checkpoint_kind} checkpoint {loaded[key].checkpoint}")
 
@@ -883,11 +920,22 @@ def process_group(
         "baseline_epsilon": baseline_eps,
         "paired_seeds_by_epsilon": {str(epsilon): seeds for epsilon, seeds in target_by_eps.items()},
         "market_hash": next(iter(market_hashes)),
-        "checkpoint_order": ["value_net_final.pt", "value_net_last.pt", "value_net_best.pt"],
+        "checkpoint_policy": (
+            "official_final_only" if not args.allow_checkpoint_fallback
+            else "legacy_fallback_final_last_best"
+        ),
+        "allow_checkpoint_fallback": bool(args.allow_checkpoint_fallback),
+        "checkpoint_order": (
+            ["value_net_final.pt"] if not args.allow_checkpoint_fallback
+            else ["value_net_final.pt", "value_net_last.pt", "value_net_best.pt"]
+        ),
         "curve_definition": {
             "delta_V": "V_epsilon(tau,w0,xbar)-V_0(tau,w0,xbar) (signed)",
             "delta_theta_l2": "L2 norm across assets of theta_epsilon/w0-theta_0/w0",
-            "aggregation": "pair within training seed, then pointwise mean and sample std",
+            "aggregation": (
+                "pair within training seed, then pointwise mean and sample std; "
+                "sample SD is undefined (NaN) for n=1"
+            ),
         },
         "group_config": sample.group_config,
         "figures": [str(path) for path in figure_paths],
@@ -935,6 +983,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-incomplete", action="store_true",
         help="Pilot only: use per-epsilon intersection with baseline seeds.",
     )
+    parser.add_argument(
+        "--allow-checkpoint-fallback", action="store_true",
+        help="Exploratory legacy mode: allow final -> last -> best; paper mode requires final.",
+    )
     parser.add_argument("--min-seeds", type=int, default=2, help="Minimum paired seeds per epsilon>0 (default: 2).")
     parser.add_argument(
         "--allow-missing-residuals", action="store_true",
@@ -970,7 +1022,7 @@ def _make_self_test_run(root: Path, *, seed: int, epsilon: float) -> None:
     _write_json(run_dir / "status.json", {"status": "success", "updated_at": "test"})
     (run_dir / "_SUCCESS").touch()
     arrays = {
-        "K": np.eye(1), "xbar": np.zeros(1), "SigmaX": np.eye(1), "rho": np.zeros((2, 1)),
+        "K": np.eye(1), "xbar": np.zeros(1), "SigmaX": np.eye(1), "rho": np.ones((2, 1)) * 0.02,
         "Lam": np.ones((2, 1)) * 0.1, "Q": np.eye(1), "Gamma": np.ones((2, 1)) * 0.02,
         "k0": np.zeros(1), "lam0": np.ones(2) * 0.1, "X_min": np.ones(1) * -1.0,
         "X_max": np.ones(1), "eta": np.ones(1), "gamma": np.array([2.0]), "r": np.array([0.03]),
@@ -1068,6 +1120,11 @@ def run(args: argparse.Namespace) -> List[Dict[str, Any]]:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if torch is None:
+        parser.error(
+            "PyTorch is required to load and differentiate Liu checkpoints; "
+            "run this command in the training environment"
+        )
     if args.self_test:
         run_self_test()
         return

@@ -10,7 +10,9 @@ import argparse
 import csv
 import json
 import os
+import platform
 import socket
+import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -67,6 +69,68 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def runtime_environment_metadata(device_spec: str = "") -> Dict[str, Any]:
+    """Return reproducibility metadata needed by the E8 timing tables.
+
+    This is deliberately observational: it does not change deterministic
+    settings.  The *effective* device is recorded as well as the user's raw
+    spelling so that ``--device auto`` cannot lose the GPU identity needed by
+    the E8 timing audit.
+    """
+
+    cuda_api = getattr(torch, "cuda", None)
+    cuda_available = bool(
+        cuda_api is not None
+        and hasattr(cuda_api, "is_available")
+        and cuda_api.is_available()
+    )
+    torch_version_api = getattr(torch, "version", None)
+    backends = getattr(torch, "backends", None)
+    cudnn = getattr(backends, "cudnn", None) if backends is not None else None
+    cudnn_version = None
+    if cuda_available and cudnn is not None and hasattr(cudnn, "version"):
+        observed = cudnn.version()
+        cudnn_version = int(observed) if observed is not None else None
+
+    requested_device = str(device_spec or "")
+    requested_lower = requested_device.strip().lower()
+    if requested_lower in {"", "auto"}:
+        effective_device = "cuda" if cuda_available else "cpu"
+    elif requested_lower.startswith("cuda"):
+        # resolve_device() uses CPU when CUDA was requested but unavailable.
+        effective_device = requested_device if cuda_available else "cpu"
+    else:
+        effective_device = requested_device
+
+    data: Dict[str, Any] = {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "executable": sys.executable,
+        "numpy_version": np.__version__,
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "cuda_available": cuda_available,
+        "cuda_runtime_version": getattr(torch_version_api, "cuda", None),
+        "cudnn_version": cudnn_version,
+        "requested_device": requested_device,
+        "effective_device": str(effective_device),
+    }
+    if cuda_available and str(effective_device).startswith("cuda"):
+        try:
+            device = torch.device(effective_device)
+            props = torch.cuda.get_device_properties(device)
+            data.update({
+                "effective_cuda_device": str(device),
+                "gpu_name": str(props.name),
+                "gpu_total_memory_bytes": int(props.total_memory),
+                "gpu_compute_capability": f"{props.major}.{props.minor}",
+            })
+        except Exception as exc:
+            # Metadata collection must never make a valid training run fail.
+            data["gpu_metadata_error"] = f"{type(exc).__name__}: {exc}"
+    return data
+
+
 def ensure_dir(path: Optional[str]) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
@@ -99,6 +163,63 @@ def save_json(path: str, data: Dict[str, Any]) -> None:
     ensure_dir(os.path.dirname(path))
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True, default=json_default)
+
+
+def validate_eval_only_config(
+    config_path: str,
+    current_args: argparse.Namespace,
+    critical_keys: Sequence[str],
+) -> None:
+    """Reject eval-only use when checkpoint-defining arguments changed.
+
+    Evaluation-only knobs such as test size, margins, figures, and device are
+    intentionally omitted by each caller. Economic-model and network-
+    architecture arguments must match the immutable training config.
+    """
+
+    if not os.path.isfile(config_path):
+        raise ValueError(f"missing training config: {config_path}")
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        raise ValueError(f"cannot read training config {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"training config root must be an object: {config_path}")
+    trained = payload.get("args", payload)
+    if not isinstance(trained, dict):
+        raise ValueError(f"training config args must be an object: {config_path}")
+
+    current = vars(current_args)
+    missing = [key for key in critical_keys if key not in trained or key not in current]
+    if missing:
+        raise ValueError(f"training/current config is missing critical keys {missing}")
+    mismatches: List[str] = []
+    for key in critical_keys:
+        old = trained[key]
+        new = current[key]
+        if isinstance(old, (int, float)) and not isinstance(old, bool):
+            try:
+                equal = bool(
+                    np.isclose(
+                        float(old),
+                        float(new),
+                        rtol=1.0e-13,
+                        atol=1.0e-14,
+                        equal_nan=False,
+                    )
+                )
+            except (TypeError, ValueError):
+                equal = False
+        else:
+            equal = old == new
+        if not equal:
+            mismatches.append(f"{key}: trained={old!r}, current={new!r}")
+    if mismatches:
+        raise ValueError(
+            "eval-only arguments differ from the training configuration: "
+            + "; ".join(mismatches)
+        )
 
 
 def append_csv_rows(path: str, rows: Sequence[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
@@ -436,6 +557,9 @@ class ExperimentRecorder:
             "args": vars(self.args),
             "output_dir": self.output_dir,
             "weight_dir": self.weight_dir,
+            "runtime_environment": runtime_environment_metadata(
+                getattr(self.args, "device", "")
+            ),
         }
         if extra:
             data.update(extra)
@@ -460,6 +584,9 @@ class ExperimentRecorder:
             "output_dir": self.output_dir,
             "weight_dir": self.weight_dir,
             "mode": "eval_only",
+            "runtime_environment": runtime_environment_metadata(
+                getattr(self.args, "device", "")
+            ),
         }
         if extra:
             data.update(extra)

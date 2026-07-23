@@ -56,12 +56,18 @@ from matplotlib.colors import TwoSlopeNorm
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 sys.path.insert(1, '/mnt/user-data/uploads')
-from joint_market_setup_dirichlet import generate_joint_market_params, JointMarketParams, cholesky_solve
+from joint_market_setup_dirichlet import (
+    generate_joint_market_params,
+    JointMarketParams,
+    cholesky_solve,
+    rho_snapshot_metadata,
+    validate_market_snapshot,
+)
 from experiment_utils import (
     add_common_experiment_args, parse_w_levels, resolve_device, set_reproducibility,
     ExperimentRecorder, PDEEarlyStopper, append_csv_rows, save_json, none_or_float,
     parse_eval_margins, shrink_bounds, pres_from_mse, safe_concave_vww, VWW_GUARD,
-    normalized_control_stats,
+    normalized_control_stats, validate_eval_only_config,
 )
 
 
@@ -106,6 +112,7 @@ print(f"Device: {device}")
 def print_joint_market_report(params, gamma=2.0, Y_ref=None):
     n, k = params.n, params.k
     jc = params.diag["joint_corr"]
+    hjb_joint = params.diag.get("identity_joint_corr")
 
     print(f"\n[Joint Market Parameters] n={n}, k={k}")
     print(f"  sigma (asset vols)   : min={params.sigma.min():.4f}, max={params.sigma.max():.4f}, mean={params.sigma.mean():.4f}")
@@ -117,6 +124,9 @@ def print_joint_market_report(params, gamma=2.0, Y_ref=None):
     print(f"  joint min eig(C)     : {jc['min_eig']:.2e}")
     print(f"  joint max|rho_ij|    : {jc['max_abs_rho']:.4f}")
     print(f"  joint shrink alpha   : {jc['alpha_used']:.4f}")
+    if hjb_joint is not None:
+        print(f"  HJB rho spectral norm: {hjb_joint['rho_spectral_norm']:.6f}")
+        print(f"  HJB joint min eig    : {hjb_joint['min_eig']:.2e}")
     print(f"  asset cond(raw Σ_RR) : {params.diag['asset_cond_raw']:.2f}")
     print(f"  asset cond(safe Σ)   : {params.diag['asset_cond_safe']:.2f}")
     print(f"  ridge delta_asset    : {params.diag['delta_asset']:.2e}")
@@ -187,8 +197,9 @@ if (
 
 recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
 if ARGS.eval_only:
-    # Eval-only must NOT touch training-time provenance (config.json etc.).
-    recorder.save_config_eval()
+    # Delay writing config_eval.json until the immutable training config and
+    # complete market snapshot have both passed provenance validation.
+    pass
 else:
     # Quarantine the complete previous attempt before creating the new
     # canonical config/checkpoint namespace.
@@ -222,8 +233,11 @@ params = generate_joint_market_params(
 # Extract parameters
 K = params.K                    # (M, M) mean reversion
 xbar = params.theta             # (M,) long-run mean
-SigmaX = params.SigmaZ          # (M, M) state diffusion
-rho = params.rho_Z              # (N, M) asset-state correlation
+SigmaX = params.SigmaZ          # (M, M) state diffusion under identity shocks
+# The source generator samples C=[[Psi,rho_raw],[rho_raw.T,Phi_Z]].  The HJB
+# uses identity asset/state Brownian covariance blocks, so its compatible
+# cross-correlation must be whitened rather than copied from C verbatim.
+rho = params.rho_canonical       # (N, M) Psi^{-1/2} rho_raw Phi_Z^{-1/2}
 Lam = params.alpha              # (N, M) risk premium loading
 
 # Derived quantities
@@ -238,6 +252,38 @@ lam0 = np.ones(N_ASSETS) * 0.1
 eta = params.eta if params.eta is not None else np.diag(SigmaX)
 X_min = xbar - X_RANGE_SCALE * eta
 X_max = xbar + X_RANGE_SCALE * eta
+
+if ARGS.eval_only:
+    _market_path = os.path.join(output_dir, "market_params.npz")
+    _config_path = os.path.join(output_dir, "config.json")
+    _critical_eval_keys = (
+        "model_type", "n_assets", "m_states", "seed", "market_seed",
+        "tau_max", "w_min", "w_max", "gamma", "r", "x_range_scale",
+        "dirichlet_concentration", "alpha_scale", "value_hidden", "value_depth",
+    )
+    _expected_market = {
+        "K": K, "xbar": xbar, "SigmaX": SigmaX, "rho": rho, "Lam": Lam,
+        "Q": Q, "Gamma": Gamma, "k0": k0, "lam0": lam0,
+        "X_min": X_min, "X_max": X_max, "eta": eta,
+        "gamma": np.array([gamma]), "r": np.array([r]),
+        "tau_max": np.array([tau_max]), "W_min": np.array([W_min]),
+        "W_max": np.array([W_max]), "seed": np.array([SEED]),
+        "market_seed": np.array([MARKET_SEED]),
+        **rho_snapshot_metadata(params),
+    }
+    try:
+        validate_eval_only_config(_config_path, ARGS, _critical_eval_keys)
+        if not os.path.isfile(_market_path):
+            raise ValueError(f"missing market snapshot: {_market_path}")
+        with np.load(_market_path, allow_pickle=False) as _saved_market:
+            validate_market_snapshot(
+                _saved_market,
+                expected=_expected_market,
+                require_canonical_metadata=True,
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemExit(f"[eval-only provenance error] {exc}") from exc
+    recorder.save_config_eval()
 
 # Print configuration
 print_joint_market_report(params)
@@ -382,6 +428,7 @@ if not ARGS.eval_only:
         k0=k0, lam0=lam0, X_min=X_min, X_max=X_max, eta=eta,
         gamma=np.array([gamma]), r=np.array([r]), tau_max=np.array([tau_max]),
         W_min=np.array([W_min]), W_max=np.array([W_max]), seed=np.array([SEED]), market_seed=np.array([MARKET_SEED]),
+        **rho_snapshot_metadata(params),
     )
     recorder.save_closed_form_solution(cf_sol)
 
@@ -830,7 +877,8 @@ def train_pinn_nd(model, M, N, gamma, r,
         "terminal_loss", "monotonicity_loss", "concavity_loss", "rra_loss",
         "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
         "inner_epochs_used", "target_reached",
-        "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_theta",
+        "e_V_sup", "e_bundle_sup", "e_Xev",
+        "diag_RelL2_V", "diag_RelL2_theta", "diag_RelL2_vartheta",
         "m_ww", "M_num", "guard_frac_ev",
         "lam_min_sigma_greedy", "lam_max_sigma_greedy", "clip_frac_frozen",
         "vartheta_l2_min", "vartheta_l2_max",
@@ -854,6 +902,18 @@ def train_pinn_nd(model, M, N, gamma, r,
     block_epochs_used = 0
     block_last_val = None        # (pde_rms, term_rms, pres) at the block's final state
     block_last_val_at_final = False
+
+    # E8 core timer: measure the actual training protocol, including its
+    # sampling/validation work, but exclude final checkpoint serialization.
+    # CUDA synchronization makes both timer boundaries explicit.
+    if timing_mode and torch.cuda.is_available() and str(device).startswith("cuda"):
+        torch.cuda.synchronize(device)
+    core_train_start = time.perf_counter()
+
+    def _core_train_elapsed():
+        if timing_mode and torch.cuda.is_available() and str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+        return float(time.perf_counter() - core_train_start)
 
     # Initial sampling
     w_int, x_int, tau_int = sample_interior(batch_size, device, M, X_min, X_max, W_min, W_max, tau_max)
@@ -1121,6 +1181,7 @@ def train_pinn_nd(model, M, N, gamma, r,
                     "e_Xev": diag_res.get("e_Xev", ""),
                     "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
                     "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
+                    "diag_RelL2_vartheta": diag_res.get("diag_RelL2_vartheta", ""),
                     "m_ww": diag_res.get("m_ww", ""),
                     "M_num": diag_res.get("M_num", ""),
                     "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
@@ -1223,8 +1284,9 @@ def train_pinn_nd(model, M, N, gamma, r,
                 "e_V_sup": diag_res.get("e_V_sup", ""),
                 "e_bundle_sup": diag_res.get("e_bundle_sup", ""),
                 "e_Xev": diag_res.get("e_Xev", ""),
-                    "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
-                    "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
+                "diag_RelL2_V": diag_res.get("diag_RelL2_V", ""),
+                "diag_RelL2_theta": diag_res.get("diag_RelL2_theta", ""),
+                "diag_RelL2_vartheta": diag_res.get("diag_RelL2_vartheta", ""),
                 "m_ww": diag_res.get("m_ww", ""),
                 "M_num": diag_res.get("M_num", ""),
                 "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
@@ -1256,12 +1318,16 @@ def train_pinn_nd(model, M, N, gamma, r,
                 pending_train_rows = []
 
             if stop_triggered:
+                core_train_wall_sec = _core_train_elapsed()
                 torch.save(model.state_dict(), last_path)
                 torch.save(model.state_dict(), final_path)
                 stop_info = {"stopped_early": True, **stop_meta, "outer_iter": outer_iter, "epoch": epoch,
-                             "total_optimizer_steps": int(total_opt_steps)}
+                             "total_optimizer_steps": int(total_opt_steps),
+                             "core_train_wall_sec": core_train_wall_sec}
                 print(f"\n[early-stop] PINN stopped at outer={outer_iter}, epoch={epoch}, PDE={current_pde:.4e}, reason={stop_meta.get('reason', '')}")
                 return loss_history, optimizer, stop_info
+
+    core_train_wall_sec = _core_train_elapsed()
 
     if recorder is not None and pending_train_rows:
         append_csv_rows(recorder.train_csv, pending_train_rows, train_fields)
@@ -1279,6 +1345,7 @@ def train_pinn_nd(model, M, N, gamma, r,
     print(f"  [diagnostic] best checkpoint (loss={best_loss:.3e}) -> {best_path}")
 
     stop_info["total_optimizer_steps"] = int(total_opt_steps)
+    stop_info["core_train_wall_sec"] = core_train_wall_sec
     return loss_history, optimizer, stop_info
 
 
@@ -1989,12 +2056,12 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     numer = lam_x * Vw_m[:, None] + Vwx_m @ Gamma_np.T            # (P, N)
     M_num = float(np.max(np.linalg.norm(numer, axis=1)))
 
-    # Table-grade norms on the SAME diagnostic set (same RelL2 norm as the
-    # full-dim Table metric, primary margin only): per-outer convergence
-    # trajectory without saving per-iteration weights. theta is derived from
-    # the ALREADY computed bundle (no extra autograd): the model side reuses
-    # the FOC numerator with the training-side V_ww guard; the closed-form
-    # side uses the exact (negative) V_ww*.
+    # Per-outer norms on the SAME fixed diagnostic set (primary margin only).
+    # Vartheta below uses the full-dimensional Table/E9 convention; the raw
+    # theta norm is retained only for backward compatibility. Both controls
+    # are derived from the ALREADY computed bundle (no extra autograd): the
+    # model side reuses the training-side V_ww guard and the closed-form side
+    # uses the exact (negative) V_ww*.
     rel_l2_V = float(np.linalg.norm(V_m - diag["V_cf"])
                      / max(np.linalg.norm(diag["V_cf"]), 1e-300))
     theta_hat = -numer / np.minimum(Vww_m, -VWW_GUARD)[:, None]
@@ -2006,10 +2073,23 @@ def eval_diag_metrics(model, diag, M, N, gamma,
     theta_cf = -numer_cf / diag["Vww_cf"][:, None]
     rel_l2_theta = float(np.linalg.norm(theta_hat - theta_cf)
                          / max(np.linalg.norm(theta_cf), 1e-300))
+    # Paper control convention: vartheta = theta / w.  Keep the raw-theta
+    # diagnostic above for backward compatibility, but do not use it as a
+    # surrogate for the unweighted normalized-control L2 error: the raw norm
+    # weights every diagnostic point by w^2.
+    w_col = np.asarray(diag["w_np"], dtype=np.float64).reshape(-1, 1)
+    vartheta_hat = theta_hat / w_col
+    vartheta_cf = theta_cf / w_col
+    rel_l2_vartheta = float(
+        np.linalg.norm(vartheta_hat - vartheta_cf)
+        / max(np.linalg.norm(vartheta_cf), 1e-300)
+    )
 
     return {
         "e_V_sup": e_V, "e_bundle_sup": e_D, "e_Xev": e_V + e_D,
-        "diag_RelL2_V": rel_l2_V, "diag_RelL2_theta": rel_l2_theta,
+        "diag_RelL2_V": rel_l2_V,
+        "diag_RelL2_theta": rel_l2_theta,
+        "diag_RelL2_vartheta": rel_l2_vartheta,
         "m_ww": m_ww, "M_num": M_num, "guard_frac_ev": guard_frac,
         **vartheta_stats,
     }
@@ -2439,6 +2519,7 @@ if __name__ == "__main__":
                               achieved_pres=stop_info.get("achieved_pres"),
                               total_optimizer_steps=stop_info.get("total_optimizer_steps"),
                               train_wall_sec=elapsed,
+                              core_train_wall_sec=stop_info.get("core_train_wall_sec"),
                               timing_mode=bool(ARGS.timing_mode),
                               train_gpu_peak_mem_bytes=_train_gpu_peak,
                               eval_gpu_peak_mem_bytes=_eval_gpu_peak,

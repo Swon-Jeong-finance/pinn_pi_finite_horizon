@@ -28,9 +28,13 @@ If k == 0, the generator reduces to "asset-only" parameters.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, Mapping
 
 import numpy as np
+
+
+RHO_CONVENTION = "identity_block_whitened_v1"
+MARKET_SCHEMA_VERSION = 2
 
 
 # ----------------------------
@@ -124,6 +128,363 @@ def _ridge_for_target_kappa(lam_min: float, lam_max: float, kappa_target: Option
     num = lam_max - kappa_target * lam_min
     den = kappa_target - 1.0
     return float(max(num / den, 0.0))
+
+
+def _symmetric_inverse_sqrt(A: np.ndarray, *, name: str) -> np.ndarray:
+    """Return the symmetric inverse square root of a finite SPD matrix."""
+
+    value = np.asarray(A, dtype=float)
+    if value.ndim != 2 or value.shape[0] != value.shape[1]:
+        raise ValueError(f"{name} must be a square matrix, got shape={value.shape}")
+    if not np.all(np.isfinite(value)):
+        raise ValueError(f"{name} contains NaN or infinity")
+    if not np.allclose(value, value.T, rtol=2.0e-12, atol=2.0e-13):
+        raise ValueError(f"{name} must be symmetric")
+    symmetric = 0.5 * (value + value.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+    if float(eigenvalues[0]) <= 0.0:
+        raise ValueError(
+            f"{name} must be positive definite; min eigenvalue={eigenvalues[0]:.3e}"
+        )
+    inverse_root = (
+        eigenvectors * np.power(eigenvalues, -0.5)[None, :]
+    ) @ eigenvectors.T
+    return 0.5 * (inverse_root + inverse_root.T)
+
+
+def identity_block_correlation_diagnostics(rho: np.ndarray) -> Dict[str, float]:
+    """Diagnose ``[[I, rho], [rho.T, I]]`` without forming the full matrix.
+
+    Its extreme eigenvalues are ``1 +/- sigma_max(rho)``.  Strict positive
+    definiteness is therefore equivalent to ``||rho||_2 < 1``.
+    """
+
+    value = np.asarray(rho, dtype=float)
+    if value.ndim != 2 or min(value.shape) <= 0:
+        raise ValueError(
+            f"rho must be a non-empty asset-by-state matrix, got shape={value.shape}"
+        )
+    if not np.all(np.isfinite(value)):
+        raise ValueError("rho contains NaN or infinity")
+    singular_values = np.linalg.svd(value, compute_uv=False)
+    spectral_norm = float(singular_values[0])
+    return {
+        "rho_spectral_norm": spectral_norm,
+        "min_eig": 1.0 - spectral_norm,
+        "max_eig": 1.0 + spectral_norm,
+    }
+
+
+def canonicalize_cross_correlation(
+    Psi: np.ndarray,
+    rho_raw: np.ndarray,
+    Phi_Z: np.ndarray,
+) -> np.ndarray:
+    """Whiten a cross block for the identity-block Brownian convention.
+
+    ``sample_spd_correlation`` supplies a valid source correlation
+
+        C = [[Psi, rho_raw], [rho_raw.T, Phi_Z]].
+
+    The Liu HJB, however, writes the asset and state Brownian covariance
+    blocks as identities.  Its compatible cross-correlation is therefore
+
+        rho = Psi^{-1/2} rho_raw Phi_Z^{-1/2}.
+
+    No clipping or jitter is applied.  If the source blocks do not imply a
+    strictly positive identity-block correlation, generation fails rather
+    than silently changing the model.
+    """
+
+    psi = np.asarray(Psi, dtype=float)
+    phi = np.asarray(Phi_Z, dtype=float)
+    raw = np.asarray(rho_raw, dtype=float)
+    psi_inverse_root = _symmetric_inverse_sqrt(psi, name="Psi")
+    phi_inverse_root = _symmetric_inverse_sqrt(phi, name="Phi_Z")
+    expected_shape = (psi_inverse_root.shape[0], phi_inverse_root.shape[0])
+    if raw.shape != expected_shape:
+        raise ValueError(
+            "rho_raw shape is incompatible with Psi/Phi_Z: "
+            f"{raw.shape} vs {expected_shape}"
+        )
+    if not np.all(np.isfinite(raw)):
+        raise ValueError("rho_raw contains NaN or infinity")
+    canonical = psi_inverse_root @ raw @ phi_inverse_root
+    diagnostics = identity_block_correlation_diagnostics(canonical)
+    if diagnostics["min_eig"] <= 0.0:
+        raise ValueError(
+            "whitened cross-correlation is not strictly admissible for identity "
+            f"Brownian blocks: ||rho||_2={diagnostics['rho_spectral_norm']:.16g}"
+        )
+    return canonical
+
+
+def rho_snapshot_metadata(params: "JointMarketParams") -> Dict[str, np.ndarray]:
+    """Return auditable metadata for the HJB cross-correlation snapshot."""
+
+    if params.k <= 0 or params.Phi_Z is None or params.rho_Z is None:
+        return {}
+    diagnostics = identity_block_correlation_diagnostics(params.rho_canonical)
+    return {
+        "market_schema_version": np.asarray([MARKET_SCHEMA_VERSION], dtype=np.int64),
+        "rho_convention": np.asarray([RHO_CONVENTION]),
+        "Psi": np.asarray(params.Psi, dtype=float),
+        "Phi_Z": np.asarray(params.Phi_Z, dtype=float),
+        "rho_raw": np.asarray(params.rho_Z, dtype=float),
+        "rho_spectral_norm": np.asarray(
+            [diagnostics["rho_spectral_norm"]], dtype=float
+        ),
+        "min_eig_joint_innovation": np.asarray(
+            [diagnostics["min_eig"]], dtype=float
+        ),
+    }
+
+
+def validate_rho_snapshot(
+    values: Mapping[str, Any],
+    *,
+    expected_rho: Optional[np.ndarray] = None,
+    require_canonical_metadata: bool = False,
+) -> Dict[str, float]:
+    """Validate the rho convention and identity-block covariance in an NPZ.
+
+    Legacy snapshots without convention metadata remain readable when
+    ``require_canonical_metadata`` is false, but they must still have a
+    strictly positive identity-block covariance.  Eval-only execution of the
+    updated trainers sets the flag to true so an old checkpoint cannot be
+    silently evaluated under newly whitened coefficients.
+    """
+
+    if "rho" not in values:
+        raise ValueError("market snapshot is missing rho")
+    rho = np.asarray(values["rho"], dtype=float)
+    diagnostics = identity_block_correlation_diagnostics(rho)
+    if diagnostics["min_eig"] <= 0.0:
+        raise ValueError(
+            "market snapshot has a non-positive identity-block innovation "
+            f"covariance: min eigenvalue={diagnostics['min_eig']:.3e}"
+        )
+
+    metadata_keys = {
+        "market_schema_version", "rho_convention", "Psi", "Phi_Z", "rho_raw",
+        "rho_spectral_norm", "min_eig_joint_innovation",
+    }
+    present = metadata_keys.intersection(values.keys())
+    if present and present != metadata_keys:
+        missing = sorted(metadata_keys - present)
+        raise ValueError(f"market snapshot has incomplete rho metadata: {missing}")
+    if not present:
+        if require_canonical_metadata:
+            raise ValueError(
+                "market snapshot predates canonical rho metadata; retraining is "
+                "required before eval-only use with the updated solver"
+            )
+    else:
+        version_array = np.asarray(values["market_schema_version"]).reshape(-1)
+        convention_array = np.asarray(values["rho_convention"]).reshape(-1)
+        if (
+            version_array.size != 1
+            or not np.issubdtype(version_array.dtype, np.number)
+            or not np.isfinite(float(version_array[0]))
+            or float(version_array[0]) != float(MARKET_SCHEMA_VERSION)
+        ):
+            raise ValueError(
+                "unsupported market schema version: "
+                f"{version_array.tolist()}"
+            )
+        if convention_array.size != 1 or str(convention_array[0]) != RHO_CONVENTION:
+            raise ValueError(
+                "unsupported rho convention: "
+                f"{convention_array.tolist()}"
+            )
+        reconstructed = canonicalize_cross_correlation(
+            np.asarray(values["Psi"], dtype=float),
+            np.asarray(values["rho_raw"], dtype=float),
+            np.asarray(values["Phi_Z"], dtype=float),
+        )
+        if not np.allclose(rho, reconstructed, rtol=2.0e-12, atol=2.0e-13):
+            raise ValueError(
+                "saved rho does not equal the canonical whitening of "
+                "Psi/rho_raw/Phi_Z"
+            )
+        spectral_array = np.asarray(values["rho_spectral_norm"]).reshape(-1)
+        minimum_array = np.asarray(values["min_eig_joint_innovation"]).reshape(-1)
+        if spectral_array.size != 1 or minimum_array.size != 1:
+            raise ValueError(
+                "rho_spectral_norm and min_eig_joint_innovation must be scalars"
+            )
+        recorded_spectral = float(spectral_array[0])
+        recorded_minimum = float(minimum_array[0])
+        if not np.isfinite(recorded_spectral) or not np.isfinite(recorded_minimum):
+            raise ValueError(
+                "rho_spectral_norm and min_eig_joint_innovation must be finite"
+            )
+        if not np.isclose(
+            recorded_spectral,
+            diagnostics["rho_spectral_norm"],
+            rtol=2.0e-12,
+            atol=2.0e-13,
+        ):
+            raise ValueError("saved rho_spectral_norm is inconsistent with rho")
+        if not np.isclose(
+            recorded_minimum,
+            diagnostics["min_eig"],
+            rtol=2.0e-12,
+            atol=2.0e-13,
+        ):
+            raise ValueError(
+                "saved min_eig_joint_innovation is inconsistent with rho"
+            )
+
+    if expected_rho is not None and not np.allclose(
+        rho, np.asarray(expected_rho, dtype=float), rtol=2.0e-12, atol=2.0e-13
+    ):
+        raise ValueError(
+            "saved rho differs from the market generated by the current "
+            "canonical convention"
+        )
+    return diagnostics
+
+
+def validate_market_snapshot(
+    values: Mapping[str, Any],
+    *,
+    expected: Optional[Mapping[str, Any]] = None,
+    require_canonical_metadata: bool = False,
+) -> Dict[str, Any]:
+    """Validate all economic identities in a saved Liu market snapshot."""
+
+    required = (
+        "K", "xbar", "SigmaX", "rho", "Lam", "Q", "Gamma", "k0", "lam0",
+        "X_min", "X_max", "eta", "gamma", "r", "tau_max", "W_min", "W_max",
+        "market_seed",
+    )
+    missing = [key for key in required if key not in values]
+    if missing:
+        raise ValueError(f"market snapshot is missing fields {missing}")
+    arrays = {
+        key: np.asarray(values[key], dtype=float)
+        for key in required
+    }
+    if any(not np.all(np.isfinite(value)) for value in arrays.values()):
+        raise ValueError("market snapshot contains NaN or infinity")
+
+    xbar = arrays["xbar"].reshape(-1)
+    lam0 = arrays["lam0"].reshape(-1)
+    eta = arrays["eta"].reshape(-1)
+    n_assets = int(lam0.size)
+    m_states = int(xbar.size)
+    if n_assets <= 0 or m_states <= 0:
+        raise ValueError("market snapshot must have positive asset/state dimensions")
+    shapes = {
+        "K": (m_states, m_states),
+        "SigmaX": (m_states, m_states),
+        "rho": (n_assets, m_states),
+        "Lam": (n_assets, m_states),
+        "Q": (m_states, m_states),
+        "Gamma": (n_assets, m_states),
+        "k0": (m_states,),
+        "X_min": (m_states,),
+        "X_max": (m_states,),
+        "eta": (m_states,),
+    }
+    for key, shape in shapes.items():
+        if arrays[key].shape != shape:
+            raise ValueError(
+                f"market snapshot {key} has shape {arrays[key].shape}, expected {shape}"
+            )
+    for key in ("gamma", "r", "tau_max", "W_min", "W_max", "market_seed"):
+        if arrays[key].size != 1:
+            raise ValueError(f"market snapshot {key} must be scalar")
+
+    if not np.allclose(
+        arrays["Q"],
+        arrays["SigmaX"] @ arrays["SigmaX"].T,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    ):
+        raise ValueError("market snapshot Q != SigmaX @ SigmaX.T")
+    if not np.allclose(
+        arrays["Gamma"],
+        arrays["rho"] @ arrays["SigmaX"].T,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    ):
+        raise ValueError("market snapshot Gamma != rho @ SigmaX.T")
+    if not np.allclose(
+        arrays["k0"],
+        arrays["K"] @ xbar,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    ):
+        raise ValueError("market snapshot k0 != K @ xbar")
+    q_symmetric = 0.5 * (arrays["Q"] + arrays["Q"].T)
+    min_eig_q = float(np.linalg.eigvalsh(q_symmetric)[0])
+    if min_eig_q <= 0.0:
+        raise ValueError(
+            f"market snapshot Q is not positive definite: min eigenvalue={min_eig_q:.3e}"
+        )
+    if np.any(eta <= 0.0) or np.any(arrays["X_max"] <= arrays["X_min"]):
+        raise ValueError("market snapshot has invalid state scales or bounds")
+    gamma = float(arrays["gamma"].reshape(-1)[0])
+    horizon = float(arrays["tau_max"].reshape(-1)[0])
+    w_min = float(arrays["W_min"].reshape(-1)[0])
+    w_max = float(arrays["W_max"].reshape(-1)[0])
+    if gamma <= 0.0 or abs(gamma - 1.0) < 1.0e-12:
+        raise ValueError("market snapshot requires CRRA gamma>0 and gamma!=1")
+    if horizon <= 0.0 or w_min <= 0.0 or w_max <= w_min:
+        raise ValueError("market snapshot has invalid horizon or wealth bounds")
+    market_seed = float(arrays["market_seed"].reshape(-1)[0])
+    if not market_seed.is_integer():
+        raise ValueError("market snapshot market_seed must be integer-valued")
+
+    rho_diagnostics = validate_rho_snapshot(
+        values,
+        expected_rho=(None if expected is None else np.asarray(expected["rho"])),
+        require_canonical_metadata=require_canonical_metadata,
+    )
+
+    if expected is not None:
+        missing_expected = [key for key in expected if key not in values]
+        if missing_expected:
+            raise ValueError(
+                f"saved market snapshot is missing expected fields {missing_expected}"
+            )
+        for key, expected_value in expected.items():
+            actual = np.asarray(values[key])
+            target = np.asarray(expected_value)
+            if actual.shape != target.shape:
+                raise ValueError(
+                    f"saved market field {key} has shape {actual.shape}, "
+                    f"expected {target.shape}"
+                )
+            if actual.dtype.kind in {"U", "S"} or target.dtype.kind in {"U", "S"}:
+                matches = np.array_equal(actual.astype(str), target.astype(str))
+            else:
+                matches = np.allclose(
+                    np.asarray(actual, dtype=float),
+                    np.asarray(target, dtype=float),
+                    rtol=2.0e-12,
+                    atol=2.0e-13,
+                )
+            if not matches:
+                raise ValueError(
+                    f"saved market field {key} differs from the current run configuration"
+                )
+
+    has_metadata = "rho_convention" in values
+    return {
+        **rho_diagnostics,
+        "min_eig_Q": min_eig_q,
+        "n_assets": n_assets,
+        "m_states": m_states,
+        "market_schema_version": (
+            MARKET_SCHEMA_VERSION if has_metadata else None
+        ),
+        "rho_convention": (
+            RHO_CONVENTION if has_metadata else "legacy_unlabeled"
+        ),
+    }
 
 
 # ----------------------------
@@ -353,7 +714,9 @@ class JointMarketParams:
     - Blocks:
         Psi   = C[:n, :n]   (asset shock correlation)
         Phi_Z = C[n:, n:]   (state shock correlation)
-        rho_Z = C[:n, n:]   (asset-state cross correlation)
+        rho_Z = C[:n, n:]   (raw asset-state cross block)
+        rho_canonical = Psi^{-1/2} rho_Z Phi_Z^{-1/2}, the cross-correlation
+                        used when both Brownian covariance blocks are identity
 
     - Volatility scales:
         sigma (n,), eta (k,)
@@ -378,6 +741,7 @@ class JointMarketParams:
     Psi: np.ndarray
     Phi_Z: Optional[np.ndarray]
     rho_Z: Optional[np.ndarray]
+    rho_canonical: Optional[np.ndarray]
 
     # Volatility scales
     sigma: np.ndarray
@@ -465,9 +829,11 @@ def generate_joint_market_params(
 
     Phi_Z = None
     rho_Z = None
+    rho_canonical = None
     if k > 0:
         Phi_Z = C[n:, n:].copy()
         rho_Z = C[:n, n:].copy()
+        rho_canonical = canonicalize_cross_correlation(Psi, rho_Z, Phi_Z)
 
     rng = np.random.default_rng(seed + 1 if seed is not None else None)
 
@@ -549,6 +915,11 @@ def generate_joint_market_params(
 
     diag_out: Dict[str, Any] = {
         "joint_corr": diag_C,
+        "identity_joint_corr": (
+            identity_block_correlation_diagnostics(rho_canonical)
+            if rho_canonical is not None else None
+        ),
+        "rho_convention": RHO_CONVENTION,
         "asset_sigma_range": sigma_range,
         "state_eta_range": (eta_range if k > 0 else None),
         "asset_cond_raw": float(lam_max / max(lam_min, 1e-18)),
@@ -563,6 +934,7 @@ def generate_joint_market_params(
         Psi=Psi,
         Phi_Z=Phi_Z,
         rho_Z=rho_Z,
+        rho_canonical=rho_canonical,
         sigma=sigma,
         eta=eta,
         Sigma_RR=Sigma_RR,
@@ -609,6 +981,7 @@ def to_torch(params: JointMarketParams, *, device: str = "cpu", dtype: str = "fl
         Psi=t(params.Psi),
         Phi_Z=t(params.Phi_Z),
         rho_Z=t(params.rho_Z),
+        rho_canonical=t(params.rho_canonical),
         sigma=t(params.sigma),
         eta=t(params.eta),
         Sigma_RR=t(params.Sigma_RR),

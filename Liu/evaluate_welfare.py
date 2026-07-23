@@ -47,6 +47,7 @@ from aggregate_seeds import (
     run_updated_at,
     t_crit_95,
 )
+from joint_market_setup_dirichlet import validate_market_snapshot
 
 
 VWW_GUARD = 1.0e-8
@@ -327,6 +328,7 @@ def discover_paper_runs(
     expected_seeds: Sequence[int],
     run_name_regex: str = "",
     allow_incomplete: bool = False,
+    expected_n_assets: Optional[int] = None,
 ) -> Dict[Tuple[str, int], List[RunRecord]]:
     """Select exactly one configuration and the requested seeds per method/M.
 
@@ -338,6 +340,8 @@ def discover_paper_runs(
     wanted_m = set(int(x) for x in m_states)
     expected = set(int(x) for x in expected_seeds)
     pattern = re.compile(run_name_regex) if run_name_regex else None
+    wrong_asset_dimensions: List[Tuple[str, int, str]] = []
+    nonaffine_runs: List[Tuple[str, int, str]] = []
 
     newest: Dict[Tuple[str, int], RunRecord] = {}
     for run_dir_text in find_runs(str(out_root)):
@@ -358,6 +362,42 @@ def discover_paper_runs(
         except ValueError:
             relative_name = str(run_dir)
         if pattern and not pattern.search(relative_name):
+            continue
+        if expected_n_assets is not None and n != int(expected_n_assets):
+            wrong_asset_dimensions.append((
+                model,
+                int(m),
+                f"{relative_name}: N={n}, expected N={int(expected_n_assets)}",
+            ))
+            continue
+        try:
+            nonaffine_eps = float(cfg.get("nonaffine_eps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            nonaffine_runs.append((
+                model,
+                int(m),
+                f"{relative_name}: invalid nonaffine_eps={cfg.get('nonaffine_eps')!r}",
+            ))
+            continue
+        risk_premium_mode = str(cfg.get("risk_premium_mode", "affine")).strip().lower()
+        if risk_premium_mode not in {"affine", "tanh"}:
+            nonaffine_runs.append((
+                model,
+                int(m),
+                f"{relative_name}: unsupported risk_premium_mode={risk_premium_mode!r}",
+            ))
+            continue
+        # Match the training/reference gate exactly: any nonzero epsilon,
+        # however small, is a genuinely non-affine experiment.  A numerical
+        # tolerance here could silently apply an affine CE denominator to the
+        # wrong model.
+        if not math.isfinite(nonaffine_eps) or nonaffine_eps != 0.0:
+            nonaffine_runs.append((
+                model,
+                int(m),
+                f"{relative_name}: nonaffine_eps={nonaffine_eps:g}; "
+                "the affine closed-form welfare denominator is unavailable",
+            ))
             continue
 
         group, _canonical = group_key(cfg)
@@ -438,6 +478,22 @@ def discover_paper_runs(
             cell_records = [successful_by_seed[seed] for seed in seeds]
             selected[cell] = sorted(cell_records, key=lambda record: record.seed)
 
+    missing_cells = {
+        (str(model), int(m)) for model in models for m in m_states
+    } - set(selected)
+    relevant_wrong_n = [detail for model, m, detail in wrong_asset_dimensions
+                        if (model, m) in missing_cells]
+    relevant_nonaffine = [detail for model, m, detail in nonaffine_runs
+                          if (model, m) in missing_cells]
+    if relevant_wrong_n:
+        errors.append(
+            "asset-dimension mismatch:\n    " + "\n    ".join(sorted(relevant_wrong_n))
+        )
+    if relevant_nonaffine:
+        errors.append(
+            "non-affine runs are not valid for this closed-form CE/WL evaluator:\n    "
+            + "\n    ".join(sorted(relevant_nonaffine))
+        )
     if errors:
         raise ValueError("paper-run validation failed:\n  - " + "\n  - ".join(errors))
 
@@ -611,6 +667,11 @@ def load_market(path: Path) -> MarketData:
         raise ValueError(f"{path}: invalid horizon or wealth bounds")
     if np.any(arrays["X_max"] <= arrays["X_min"]):
         raise ValueError(f"{path}: invalid state bounds")
+
+    try:
+        validate_market_snapshot(values)
+    except ValueError as exc:
+        raise ValueError(f"{path}: invalid market snapshot: {exc}") from exc
 
     joint = np.block([
         [np.eye(n), arrays["rho"]],
@@ -1582,8 +1643,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--output", default=None, help="Output directory (default: <out-root>/welfare_summary)"
     )
     parser.add_argument("--models", default="both", help="both, pinn, pipinn, or a comma list")
+    parser.add_argument(
+        "--n-assets", type=int, default=30,
+        help="Exact risky-asset dimension required in every selected run (default: 30)",
+    )
     parser.add_argument("--m-states", default="1,3,5", help="Paper state dimensions")
-    parser.add_argument("--expected-seeds", default="1-10", help="Exact successful seed set")
+    parser.add_argument(
+        "--expected-seeds", default="",
+        help=(
+            "Optional exact successful seed set (comma/space/range syntax). "
+            "Specify it explicitly for paper aggregation; no fixed seed numbering is assumed."
+        ),
+    )
     parser.add_argument(
         "--run-name-regex", default="", help="Regex used to narrow run paths if OUT_ROOT has ablations"
     )
@@ -1636,6 +1707,7 @@ def run(args: argparse.Namespace) -> None:
         expected_seeds,
         args.run_name_regex,
         args.allow_incomplete,
+        args.n_assets,
     )
     checkpoints: Dict[Tuple[str, int, int], Path] = {}
     for (model, m), records in selected.items():

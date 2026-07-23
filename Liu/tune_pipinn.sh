@@ -11,6 +11,8 @@ set -euo pipefail
 #   FORCE_RERUN=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   RERUN_STOPPED=1 DEVICE_LIST="cuda:1,cuda:2,cuda:3" bash tune_pipinn.sh /workspace/outputs/my_run
 #   SEEDS="1,2,3,4,5,6,7,8,9,10" DEVICE_LIST="cuda:0,cuda:1" bash tune_pipinn.sh /workspace/outputs/main10seed
+#   SWEEP_PROFILE=timing SEEDS="1" TIMING_M_STATES_LIST="1,3,5" \
+#     DEVICE_LIST="cuda:0" bash tune_pipinn.sh /workspace/outputs/timing
 #   AGGREGATE=0 bash tune_pipinn.sh ...   # skip the automatic seed aggregation step
 #   STRICT_PAPER_AGGREGATION=0 SEEDS="1,2" bash tune_pipinn.sh ...  # do not fail on an incomplete aggregate
 
@@ -18,7 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
 MAX_PARALLEL_ARG="${2:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-SWEEP_PROFILE="${SWEEP_PROFILE:-main}"  # main | nonaffine
+SWEEP_PROFILE="${SWEEP_PROFILE:-main}"  # main | nonaffine | timing
+# Output namespaces must change when the economic market convention changes.
+# Otherwise an older raw-rho _SUCCESS directory can be skipped and silently
+# mixed into a canonical-rho paper aggregate.
+MARKET_SCHEMA_TAG="rho_canonical_v1"
 mkdir -p "$OUT_ROOT"
 LOG_DIR="$OUT_ROOT/logs"
 mkdir -p "$LOG_DIR"
@@ -142,7 +148,7 @@ normalize_key() {
 auto_tag() {
   local model="$1"; shift
   if [[ $# -eq 0 ]]; then
-    echo "${model}_baseline"
+    echo "${model}_${MARKET_SCHEMA_TAG}_baseline"
     return
   fi
   local parts=()
@@ -151,7 +157,7 @@ auto_tag() {
     local v=${kv#*=}
     parts+=("$(sanitize "${k}${v}")")
   done
-  printf "%s_%s" "$model" "$(IFS=_; echo "${parts[*]}")"
+  printf "%s_%s_%s" "$model" "$MARKET_SCHEMA_TAG" "$(IFS=_; echo "${parts[*]}")"
 }
 
 stop_flag_for_shared_hparams() {
@@ -722,7 +728,7 @@ run_pinn_single() {
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
   # alias two different configurations onto one flag.
-  local variant="ls:${lr_schedule};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};"
+  local variant="rho:${MARKET_SCHEMA_TAG};ls:${lr_schedule};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};"
 
   local run_output_root="$OUT_ROOT/pinn/$tag"
   local run_weight_root="$OUT_ROOT/weights/pinn/$tag"
@@ -880,7 +886,7 @@ run_pipinn_single() {
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
   # alias two different configurations onto one flag.
-  local variant="ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};rpm:${risk_premium_mode};eps:${nonaffine_eps};nls:${nonaffine_loading_scale};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};"
+  local variant="rho:${MARKET_SCHEMA_TAG};ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};rpm:${risk_premium_mode};eps:${nonaffine_eps};nls:${nonaffine_loading_scale};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};"
 
   local run_output_root="$OUT_ROOT/pi-pinn/$tag"
   local run_weight_root="$OUT_ROOT/weights/pi-pinn/$tag"
@@ -1036,8 +1042,40 @@ elif [[ "$SWEEP_PROFILE" == "nonaffine" ]]; then
         skip_figures="$_skip_figures" skip_eval=0
     done
   done
+elif [[ "$SWEEP_PROFILE" == "timing" ]]; then
+  # E8 core-training timing profile.  It keeps the actual optimization and
+  # inner-selection protocol, while --timing-mode removes diagnostics,
+  # per-iterate snapshots and diagnostic best-state copies.  Final evaluation
+  # remains enabled so the same run supplies the error coordinate.  The
+  # CUDA-synchronized core_train_wall_sec excludes final checkpoint I/O;
+  # train_wall_sec remains the broader pre-evaluation elapsed observation.
+  _timing_m_text="${TIMING_M_STATES_LIST:-1,3,5}"
+  IFS=', ' read -ra _timing_m_values <<< "$_timing_m_text"
+  if (( ${#_timing_m_values[@]} == 0 )); then
+    echo "[error] timing profile requires non-empty TIMING_M_STATES_LIST" >&2
+    exit 2
+  fi
+  declare -A _timing_m_seen=()
+  for _m_state in "${_timing_m_values[@]}"; do
+    case "$_m_state" in
+      1|3|5) ;;
+      *)
+        echo "[error] TIMING_M_STATES_LIST supports only 1, 3, or 5; got $_m_state" >&2
+        exit 2
+        ;;
+    esac
+    if [[ -n "${_timing_m_seen[$_m_state]+x}" ]]; then
+      echo "[error] duplicate TIMING_M_STATES_LIST value: $_m_state" >&2
+      exit 2
+    fi
+    _timing_m_seen[$_m_state]=1
+    run_pipinn auto m_states="$_m_state" timing_mode=1 \
+      e3b_checkpoints=0 save_iterate_every=0 skip_figures=1 skip_eval=0
+    run_pinn auto m_states="$_m_state" timing_mode=1 \
+      save_iterate_every=0 skip_figures=1 skip_eval=0
+  done
 else
-  echo "[error] unknown SWEEP_PROFILE=$SWEEP_PROFILE (expected main or nonaffine)" >&2
+  echo "[error] unknown SWEEP_PROFILE=$SWEEP_PROFILE (expected main, nonaffine, or timing)" >&2
   exit 2
 fi
 
@@ -1051,9 +1089,10 @@ fi
 # --- Liu M=1 FD frozen-policy reference (all outer checkpoints ON) ----------
 # run_pipinn auto m_states=1 e3b_checkpoints=1
 
-# --- E8 timing runs (all diagnostics off) ----------------------------------
-# run_pipinn auto m_states=3 timing_mode=1
-# run_pinn   auto m_states=3 timing_mode=1
+# --- E8 timing runs ---------------------------------------------------------
+# Prefer the dedicated profile instead of editing this sweep block:
+# SWEEP_PROFILE=timing TIMING_M_STATES_LIST="1,3,5" SEEDS="1" \
+#   bash tune_pipinn.sh outputs/timing
 
 # --- smoke template --------------------------------------------------------
 # run_pipinn auto m_states=1 batch_size=500 outer_iters=5 eval_epochs=20 \
@@ -1086,5 +1125,31 @@ if [[ "$SWEEP_PROFILE" == "main" && "${AGGREGATE:-1}" == "1" ]]; then
       exit 1
     fi
     echo "[warn] aggregation failed; run manually: $PYTHON_BIN $SCRIPT_DIR/aggregate_seeds.py --out-root $OUT_ROOT"
+  fi
+fi
+
+# E8 timing runs use a different schema and must never be passed through the
+# ordinary final-metric seed aggregator as if they were paper main runs.
+if [[ "$SWEEP_PROFILE" == "timing" && "${AGGREGATE_COMPUTE:-1}" == "1" ]]; then
+  echo ""
+  echo "[aggregate] computing E8 timing/error statistics ..."
+  compute_args=(
+    --out-root "$OUT_ROOT"
+    --n-assets 30
+    --m-states "${TIMING_M_STATES_LIST:-1,3,5}"
+    --models "pinn,pipinn"
+    --overwrite
+  )
+  if (( ${#SEED_LIST[@]} > 0 )); then
+    compute_args+=(--expected-seeds "$SEEDS" --min-runs "${#SEED_LIST[@]}")
+  fi
+  if "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_compute.py" "${compute_args[@]}"; then
+    echo "[aggregate] E8 summary written under: $OUT_ROOT/compute_summary"
+  else
+    if [[ "${STRICT_TIMING_AGGREGATION:-1}" == "1" ]]; then
+      echo "[error] E8 timing aggregation failed: $OUT_ROOT" >&2
+      exit 1
+    fi
+    echo "[warn] E8 aggregation failed; run aggregate_compute.py manually"
   fi
 fi

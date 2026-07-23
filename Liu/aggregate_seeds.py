@@ -32,7 +32,7 @@ import argparse
 import csv
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import os
 import re
@@ -207,8 +207,10 @@ def run_updated_at(run_dir: str) -> str:
     except Exception:
         pass
     try:
-        return datetime.utcfromtimestamp(
-            os.path.getmtime(os.path.join(run_dir, "config.json"))).isoformat()
+        return datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(run_dir, "config.json")),
+            tz=timezone.utc,
+        ).isoformat()
     except Exception:
         return ""
 
