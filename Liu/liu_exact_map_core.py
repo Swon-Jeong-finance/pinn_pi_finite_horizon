@@ -24,7 +24,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.interpolate import RectBivariateSpline
 from scipy.sparse import coo_matrix, csr_matrix, eye
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import splu
 
 
 Array = np.ndarray
@@ -115,6 +115,10 @@ class FDDiagnostics:
     upwind_x_points: int = 0
     operator_points: int = 0
     max_linear_residual: float = 0.0
+    boundary_elimination_size: int = 0
+    boundary_elimination_rank: int = 0
+    boundary_elimination_cond_inf: float = float("nan")
+    min_linear_system_lu_pivot_ratio: float = float("inf")
     policy_sums: Dict[str, float] = field(default_factory=dict)
     policy_minima: Dict[str, float] = field(default_factory=dict)
     policy_maxima: Dict[str, float] = field(default_factory=dict)
@@ -153,6 +157,12 @@ class FDDiagnostics:
             "upwind_y_fraction": float(self.upwind_y_points) / operator_points,
             "upwind_x_fraction": float(self.upwind_x_points) / operator_points,
             "max_linear_residual": float(self.max_linear_residual),
+            "boundary_elimination_size": int(self.boundary_elimination_size),
+            "boundary_elimination_rank": int(self.boundary_elimination_rank),
+            "boundary_elimination_cond_inf": float(self.boundary_elimination_cond_inf),
+            "min_linear_system_lu_pivot_ratio": float(
+                self.min_linear_system_lu_pivot_ratio
+            ),
             "policy_points": float(self.policy_points),
         }
         out.update({f"policy_{key}": float(value) / denom for key, value in self.policy_sums.items()})
@@ -259,6 +269,108 @@ def crra_terminal(problem: LiuProblem, y: Array) -> Array:
 
 def _interior_index(i: int, j: int, nx: int) -> int:
     return (i - 1) * (nx - 2) + (j - 1)
+
+
+def _linearity_boundary_matrix(grid: FDGrid) -> Array:
+    """Boundary-to-boundary block of the unnormalised closure system.
+
+    The edge equations are the one-sided ``u_yy-u_y=0`` and ``u_xx=0``
+    conditions used by :func:`_linearity_extension`.  Corner equations apply
+    the documented bilinear continuation.  This small square block is checked
+    before any parabolic solve so a singular or badly conditioned elimination
+    cannot masquerade as a successful FD variant.
+    """
+
+    ny, nx = grid.ny, grid.nx
+    hy = (grid.y_max - grid.y_min) / (ny - 1)
+    y_edges = [(0, j) for j in range(1, nx - 1)]
+    y_edges += [(ny - 1, j) for j in range(1, nx - 1)]
+    x_edges = [(i, 0) for i in range(1, ny - 1)]
+    x_edges += [(i, nx - 1) for i in range(1, ny - 1)]
+    corners = [(0, 0), (0, nx - 1), (ny - 1, 0), (ny - 1, nx - 1)]
+    boundary = y_edges + x_edges + corners
+    index = {node: position for position, node in enumerate(boundary)}
+    matrix = np.zeros((len(boundary), len(boundary)), dtype=np.float64)
+
+    row = 0
+    for _j in range(1, nx - 1):
+        matrix[row, index[(0, _j)]] = 4.0 + 3.0 * hy
+        row += 1
+    for _j in range(1, nx - 1):
+        matrix[row, index[(ny - 1, _j)]] = 4.0 - 3.0 * hy
+        row += 1
+    for _i in range(1, ny - 1):
+        matrix[row, index[(_i, 0)]] = 2.0
+        row += 1
+    for _i in range(1, ny - 1):
+        matrix[row, index[(_i, nx - 1)]] = 2.0
+        row += 1
+    for corner, y_edge, x_edge in (
+        ((0, 0), (0, 1), (1, 0)),
+        ((0, nx - 1), (0, nx - 2), (1, nx - 1)),
+        ((ny - 1, 0), (ny - 1, 1), (ny - 2, 0)),
+        ((ny - 1, nx - 1), (ny - 1, nx - 2), (ny - 2, nx - 1)),
+    ):
+        matrix[row, index[corner]] = 1.0
+        matrix[row, index[y_edge]] = -1.0
+        matrix[row, index[x_edge]] = -1.0
+        row += 1
+    if row != len(boundary):
+        raise AssertionError("linearity boundary-system assembly is incomplete")
+    return matrix
+
+
+def _boundary_elimination_diagnostics(grid: FDGrid, boundary: str) -> Dict[str, float]:
+    """Return rank and exact infinity-norm conditioning of the boundary block.
+
+    The linearity block has the form ``[[D, 0], [C, I]]`` when edge
+    unknowns precede the four corners.  ``D`` is diagonal, so its rank and
+    infinity-norm condition number can be evaluated analytically.  Avoiding a
+    dense SVD here matters because this check runs for every FD variant and
+    time-independent boundary geometry.
+    """
+
+    normalized = str(boundary).replace("_", "-").lower()
+    if normalized == "linearity":
+        size = 2 * grid.ny + 2 * grid.nx - 4
+        hy = (grid.y_max - grid.y_min) / (grid.ny - 1)
+        lower_y_pivot = 4.0 + 3.0 * hy
+        upper_y_pivot = 4.0 - 3.0 * hy
+        x_pivot = 2.0
+        edge_pivots = np.concatenate((
+            np.full(grid.nx - 2, lower_y_pivot, dtype=np.float64),
+            np.full(grid.nx - 2, upper_y_pivot, dtype=np.float64),
+            np.full(2 * (grid.ny - 2), x_pivot, dtype=np.float64),
+        ))
+        if not np.all(np.isfinite(edge_pivots)):
+            raise FloatingPointError(
+                "boundary elimination pivots contain non-finite entries"
+            )
+        zero_count = int(np.count_nonzero(edge_pivots == 0.0))
+        rank = int(size - zero_count)
+        if zero_count:
+            condition = float("inf")
+        else:
+            # Boundary rows have either one edge pivot or the three
+            # coefficients (1, -1, -1) of a corner continuation.
+            matrix_norm_inf = max(3.0, float(np.max(np.abs(edge_pivots))))
+            inverse_norm_inf = max(
+                float(np.max(1.0 / np.abs(edge_pivots))),
+                1.0 + 1.0 / abs(lower_y_pivot) + 1.0 / abs(x_pivot),
+                1.0 + 1.0 / abs(upper_y_pivot) + 1.0 / abs(x_pivot),
+            )
+            condition = float(matrix_norm_inf * inverse_norm_inf)
+    elif normalized == "exact-dirichlet":
+        size = 2 * grid.ny + 2 * grid.nx - 4
+        rank = int(size)
+        condition = 1.0
+    else:
+        raise ValueError(f"unsupported boundary closure {boundary!r}")
+    return {
+        "size": int(size),
+        "rank": rank,
+        "condition_inf": condition,
+    }
 
 
 def _linearity_extension(grid: FDGrid) -> csr_matrix:
@@ -489,7 +601,9 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
                         drift_scheme: str = "adaptive", peclet_limit: float = 1.0,
                         boundary: str = "linearity",
                         exact_boundary_value: Optional[BoundaryValueFn] = None,
-                        ellipticity_tolerance: float = 0.0) -> FDSolution:
+                        ellipticity_tolerance: float = 0.0,
+                        linear_residual_tolerance: float = 1.0e-8,
+                        boundary_condition_limit: float = 1.0e12) -> FDSolution:
     """Solve one frozen-feedback equation on a 2-D log-wealth/factor grid.
 
     No ellipticity repair is performed.  The sampled minimum eigenvalue must
@@ -507,18 +621,43 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
         raise ValueError("boundary must be linearity or exact-dirichlet")
     if boundary == "exact-dirichlet" and exact_boundary_value is None:
         raise ValueError("exact-dirichlet requires exact_boundary_value")
+    if not np.isfinite(linear_residual_tolerance) or linear_residual_tolerance <= 0.0:
+        raise ValueError("linear_residual_tolerance must be finite and positive")
+    if not np.isfinite(boundary_condition_limit) or boundary_condition_limit < 1.0:
+        raise ValueError("boundary_condition_limit must be finite and at least one")
 
     tau = np.linspace(0.0, problem.horizon, grid.nt + 1, dtype=np.float64)
     y = np.linspace(grid.y_min, grid.y_max, grid.ny, dtype=np.float64)
     x = np.linspace(grid.x_min, grid.x_max, grid.nx, dtype=np.float64)
     dt = float(tau[1] - tau[0])
-    extension = _linearity_extension(grid) if boundary == "linearity" else _dirichlet_extension(grid)
+    boundary_diag = _boundary_elimination_diagnostics(grid, boundary)
+    if int(boundary_diag["rank"]) != int(boundary_diag["size"]):
+        raise np.linalg.LinAlgError(
+            f"{boundary} boundary elimination is rank deficient: "
+            f"rank={int(boundary_diag['rank'])}, size={int(boundary_diag['size'])}"
+        )
+    if (not np.isfinite(boundary_diag["condition_inf"])
+            or float(boundary_diag["condition_inf"]) > float(boundary_condition_limit)):
+        raise np.linalg.LinAlgError(
+            f"{boundary} boundary elimination is ill-conditioned: "
+            f"cond_inf={float(boundary_diag['condition_inf']):.3e}, "
+            f"limit={float(boundary_condition_limit):.3e}"
+        )
+    extension = (
+        _linearity_extension(grid)
+        if boundary == "linearity"
+        else _dirichlet_extension(grid)
+    )
     n_int = (grid.ny - 2) * (grid.nx - 2)
     ident = eye(n_int, format="csr", dtype=np.float64)
     z = np.broadcast_to(crra_terminal(problem, y[1:-1])[:, None],
                         (grid.ny - 2, grid.nx - 2)).copy().reshape(-1)
     values = np.empty((grid.nt + 1, grid.ny, grid.nx), dtype=np.float64)
-    diagnostics = FDDiagnostics()
+    diagnostics = FDDiagnostics(
+        boundary_elimination_size=int(boundary_diag["size"]),
+        boundary_elimination_rank=int(boundary_diag["rank"]),
+        boundary_elimination_cond_inf=float(boundary_diag["condition_inf"]),
+    )
 
     def bvec(time_value: float) -> Array:
         if boundary == "linearity":
@@ -574,15 +713,45 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
         old_l = reduced @ z + full_operator @ old_boundary
         rhs = z + dt * (1.0 - theta) * old_l + dt * theta * (full_operator @ new_boundary)
         matrix = (ident - dt * theta * reduced).tocsr()
-        z_new = np.asarray(spsolve(matrix, rhs), dtype=np.float64)
+        try:
+            lu = splu(matrix.tocsc())
+        except RuntimeError as exc:
+            raise np.linalg.LinAlgError(
+                f"singular FD linear system for boundary={boundary}, "
+                f"step={step + 1}/{grid.nt}, tau={new_tau:.6g}, "
+                f"grid=({grid.ny},{grid.nx},{grid.nt})"
+            ) from exc
+        pivots = np.abs(np.asarray(lu.U.diagonal(), dtype=np.float64))
+        if pivots.size != n_int or not np.all(np.isfinite(pivots)) or np.any(pivots == 0.0):
+            raise np.linalg.LinAlgError(
+                f"invalid LU pivots for boundary={boundary}, step={step + 1}/{grid.nt}"
+            )
+        pivot_ratio = float(np.min(pivots) / np.max(pivots))
+        diagnostics.min_linear_system_lu_pivot_ratio = min(
+            diagnostics.min_linear_system_lu_pivot_ratio, pivot_ratio
+        )
+        z_new = np.asarray(lu.solve(rhs), dtype=np.float64)
+        if not np.all(np.isfinite(z_new)):
+            raise FloatingPointError(
+                f"non-finite FD value for boundary={boundary}, "
+                f"step={step + 1}/{grid.nt}, tau={new_tau:.6g}"
+            )
         residual = matrix @ z_new - rhs
         scale = max(1.0, float(np.max(np.abs(rhs))))
+        normalized_residual = float(np.max(np.abs(residual))) / scale
         diagnostics.max_linear_residual = max(
             diagnostics.max_linear_residual,
-            float(np.max(np.abs(residual))) / scale,
+            normalized_residual,
         )
-        if not np.all(np.isfinite(z_new)):
-            raise FloatingPointError(f"non-finite FD value at tau step {step + 1}")
+        if (not np.isfinite(normalized_residual)
+                or normalized_residual > float(linear_residual_tolerance)):
+            raise FloatingPointError(
+                f"FD linear residual gate failed for boundary={boundary}, "
+                f"step={step + 1}/{grid.nt}, tau={new_tau:.6g}, "
+                f"grid=({grid.ny},{grid.nx},{grid.nt}): "
+                f"normalized_residual={normalized_residual:.3e} exceeds "
+                f"tolerance={float(linear_residual_tolerance):.3e}"
+            )
         z = z_new
         values[step + 1] = (extension @ z + new_boundary).reshape(grid.ny, grid.nx)
 

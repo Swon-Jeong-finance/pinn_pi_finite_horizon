@@ -2,14 +2,17 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+import liu_exact_map_core as exact_map_core
 from liu_exact_map_core import (
     FDDiagnostics,
     FDGrid,
     FDSolution,
     LiuProblem,
+    _boundary_elimination_diagnostics,
     _joint_eigen_extremes,
     _linearity_extension,
     _spatial_operator,
@@ -39,6 +42,18 @@ def problem() -> LiuProblem:
 
 
 class LiuExactMapCoreTests(unittest.TestCase):
+    @staticmethod
+    def _constant_elliptic_policy(p: LiuProblem):
+        vector = np.asarray([0.20, -0.10], dtype=np.float64)
+        if vector.size != p.n_assets:
+            raise AssertionError("test policy dimension must match the test problem")
+
+        def policy(_tau: float, _y: np.ndarray, x: np.ndarray):
+            values = np.broadcast_to(vector, (*x.shape, p.n_assets)).copy()
+            return values, {"points": float(x.size)}
+
+        return policy
+
     def test_joint_minimum_eigenvalue_is_stable_for_guard_scale_policy(self) -> None:
         low, high = _joint_eigen_extremes(
             np.asarray([[1.0e8, 0.0]]),
@@ -102,6 +117,94 @@ class LiuExactMapCoreTests(unittest.TestCase):
         upper_xx = 2 * full[:, -1] - 5 * full[:, -2] + 4 * full[:, -3] - full[:, -4]
         np.testing.assert_allclose(lower_xx[1:-1], 0.0, atol=2e-13)
         np.testing.assert_allclose(upper_xx[1:-1], 0.0, atol=2e-13)
+
+    def test_boundary_elimination_diagnostics_are_full_rank_and_recorded(self) -> None:
+        p = problem()
+        grid = FDGrid(p.y_min, p.y_max, p.x_min, p.x_max, ny=9, nx=10, nt=4)
+        expected_size = 2 * grid.ny + 2 * grid.nx - 4
+
+        boundary_diag = _boundary_elimination_diagnostics(grid, "linearity")
+        self.assertEqual(int(boundary_diag["size"]), expected_size)
+        self.assertEqual(int(boundary_diag["rank"]), expected_size)
+        self.assertTrue(np.isfinite(boundary_diag["condition_inf"]))
+        self.assertGreaterEqual(float(boundary_diag["condition_inf"]), 1.0)
+
+        solution = solve_frozen_policy(
+            p,
+            self._constant_elliptic_policy(p),
+            grid,
+            boundary="linearity",
+        )
+        recorded = solution.diagnostics.as_dict()
+        self.assertEqual(recorded["boundary_elimination_size"], expected_size)
+        self.assertEqual(recorded["boundary_elimination_rank"], expected_size)
+        self.assertAlmostEqual(
+            recorded["boundary_elimination_cond_inf"],
+            float(boundary_diag["condition_inf"]),
+        )
+
+    def test_rank_deficient_linearity_boundary_is_rejected_before_fd_solve(self) -> None:
+        p = problem()
+        # h_y = 4/3 makes the upper u_yy-u_y boundary pivot 4-3*h_y zero.
+        grid = FDGrid(0.0, 8.0, p.x_min, p.x_max, ny=7, nx=7, nt=2)
+        boundary_diag = _boundary_elimination_diagnostics(grid, "linearity")
+        self.assertLess(int(boundary_diag["rank"]), int(boundary_diag["size"]))
+        self.assertFalse(np.isfinite(boundary_diag["condition_inf"]))
+
+        with self.assertRaisesRegex(np.linalg.LinAlgError, "rank deficient"):
+            solve_frozen_policy(
+                p,
+                self._constant_elliptic_policy(p),
+                grid,
+                boundary="linearity",
+            )
+
+    def test_normal_linearity_solve_residual_passes_hard_gate(self) -> None:
+        p = problem()
+        solution = solve_frozen_policy(
+            p,
+            self._constant_elliptic_policy(p),
+            FDGrid(p.y_min, p.y_max, p.x_min, p.x_max, ny=9, nx=9, nt=4),
+            boundary="linearity",
+            linear_residual_tolerance=1.0e-8,
+        )
+        diagnostics = solution.diagnostics.as_dict()
+        self.assertTrue(np.isfinite(diagnostics["max_linear_residual"]))
+        self.assertLessEqual(diagnostics["max_linear_residual"], 1.0e-8)
+        self.assertGreater(diagnostics["min_linear_system_lu_pivot_ratio"], 0.0)
+
+    def test_hard_residual_gate_rejects_inaccurate_finite_lu_solution(self) -> None:
+        p = problem()
+        grid = FDGrid(p.y_min, p.y_max, p.x_min, p.x_max, ny=9, nx=9, nt=2)
+
+        class FakeU:
+            def __init__(self, size: int):
+                self._size = size
+
+            def diagonal(self) -> np.ndarray:
+                return np.ones(self._size, dtype=np.float64)
+
+        class InaccurateLU:
+            def __init__(self, size: int):
+                self.U = FakeU(size)
+
+            @staticmethod
+            def solve(rhs: np.ndarray) -> np.ndarray:
+                # Finite and correctly shaped, but deliberately not A^{-1} rhs.
+                return np.zeros_like(rhs)
+
+        def inaccurate_splu(matrix):
+            return InaccurateLU(int(matrix.shape[0]))
+
+        with patch.object(exact_map_core, "splu", side_effect=inaccurate_splu):
+            with self.assertRaisesRegex(FloatingPointError, "linear residual gate failed"):
+                solve_frozen_policy(
+                    p,
+                    self._constant_elliptic_policy(p),
+                    grid,
+                    boundary="linearity",
+                    linear_residual_tolerance=1.0e-8,
+                )
 
     def test_spline_bundle_is_converted_to_original_wealth_derivatives(self) -> None:
         tau = np.linspace(0.0, 0.5, 5)

@@ -49,6 +49,10 @@ def update_exact_rows(directory: Path, updates) -> None:
 
 
 def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
+    analysis_mode = "exact_map_and_e4"
+    policy_extension = "boundary-projection"
+    map_definition = "finite_domain_boundary_projected_policy_extension"
+    whole_space_map_claim = "not_a_whole_space_map"
     run_dir = root / f"seed{seed}"
     directory = run_dir / "liu_exact_map_fd"
     directory.mkdir(parents=True)
@@ -70,6 +74,8 @@ def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
     common = {
         "problem": "liu", "group": "same-group", "protocol_hash": "same-protocol",
         "market_sha256": "same-market", "seed": str(seed), "is_primary": "1",
+        "analysis_mode": analysis_mode, "policy_extension": policy_extension,
+        "map_definition": map_definition,
         "refinement_status": "pass",
     }
     exact_rows = []
@@ -83,10 +89,21 @@ def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
             "checkpoint_sha256": checkpoint_hashes[str(outer)],
             "policy_hash": f"policy-{seed}-{outer}",
             "denominator_defined": "0" if undefined and outer == 1 else "1",
-            "local_map_unmodified_on_xfd": "1", "map_variant": "locally_unmodified_on_sampled_xfd",
+            "checkpoint_selection": "all",
+            "local_map_unmodified_on_xfd": "1",
+            "local_greedy_unmodified_on_policy_support": "1",
+            "map_variant": "locally_unmodified_on_sampled_xfd",
+            "whole_space_map_claim": whole_space_map_claim,
+            "linear_residual_tolerance": "1e-8",
+            "boundary_elimination_size": "2",
+            "boundary_elimination_rank": "2",
         }
         exact.update({metric: str(float(seed + outer)) for metric in EXACT_METRICS})
         exact["nonpositive_log_eig_fraction"] = "0.0"
+        exact["outside_collocation_fraction_fd"] = "0.0"
+        exact["outside_collocation_y_fraction_fd"] = "0.0"
+        exact["outside_collocation_x_fraction_fd"] = "0.0"
+        exact["min_linear_system_lu_pivot_ratio"] = "1.0"
         if undefined and outer == 1:
             exact["rho_exact"] = "nan"
         exact_rows.append(exact)
@@ -104,6 +121,7 @@ def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
         e4["source_min_log_joint_eig"] = "0.01"
         e4["source_min_original_joint_eig"] = "0.001"
         e4["source_nonpositive_log_eig_fraction"] = "0.0"
+        e4["source_outside_collocation_fraction_fd"] = "0.0"
         e4_rows.append(e4)
     write_csv(directory / "exact_map_ratios.csv", exact_rows)
     write_csv(directory / "e4_approximation_errors.csv", e4_rows)
@@ -111,8 +129,13 @@ def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
     write_csv(directory / "e4_approximation_refinement.csv", e4_rows)
     undefined_outers = [1] if undefined else []
     (directory / "exact_map_status.json").write_text(json.dumps({
-        "status": "success", "n_exact_rows": 2, "n_e4_rows": 2,
+        "status": "success", "analysis_mode": analysis_mode,
+        "paper_aggregation_eligible": True,
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "n_exact_rows": 2, "n_e4_rows": 2,
         "n_refinement_rows": 2, "n_e4_refinement_rows": 2,
+        "e4_status": "computed",
         "all_denominators_defined": not undefined,
         "undefined_denominator_outers": undefined_outers,
         "all_refinement_pass": True,
@@ -120,12 +143,16 @@ def make_result(root: Path, seed: int, *, undefined: bool = False) -> Path:
         "all_e4_source_policies_elliptic": True,
         "nonelliptic_e4_targets": [],
     }), encoding="utf-8")
-    source_root = Path(__file__).resolve().parents[1]
+    here = Path(__file__).resolve().parent
     (directory / "exact_map_config.json").write_text(json.dumps({
         "protocol_hash": "same-protocol",
+        "analysis_mode": analysis_mode,
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "whole_space_map_claim": whole_space_map_claim,
         "implementation_hashes": {
-            "driver": sha256_file(source_root / "liu_exact_map_fd.py"),
-            "core": sha256_file(source_root / "liu_exact_map_core.py"),
+            "driver": sha256_file(here / "liu_exact_map_fd.py"),
+            "core": sha256_file(here / "liu_exact_map_core.py"),
         },
         "config_path": str(source_config), "config_sha256": sha256_file(source_config),
         "market_path": str(market_path), "market_file_sha256": sha256_file(market_path),

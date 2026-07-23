@@ -386,7 +386,7 @@ status, missing evaluation memory, mixed GPU capacities, and mixed markets.
 With one seed, SD and CI fields are `NaN`; use multiple timing seeds if the
 paper will report timing variability rather than a single-run measurement.
 
-## 8. Optional Liu M=1 exact PI-map and E4 FD audit
+## 8. Optional Liu M=1 finite-domain PI-map and E4 FD audit
 
 For each saved PI-PINN checkpoint `k`, the Liu evaluator differentiates the
 network to form the greedy policy `alpha_k`, freezes that policy, and solves
@@ -394,6 +394,14 @@ the two-dimensional `(log wealth, factor)` linear PDE by finite differences.
 The exact-map numerator is therefore `E(alpha_k)`, not neural checkpoint
 `k+1`. The same solves provide the shifted E4 reference
 `E(alpha_(k-1))` for checkpoint `k`.
+
+By default, the normalized neural policy is projected to the nearest point of
+the saved nominal collocation rectangle before it is used outside that
+rectangle. The computed object is therefore a
+`finite_domain_boundary_projected_policy_extension`, not the whole-space exact
+PI map in the theorem. Raw neural extrapolation is available only through
+`--policy-extension neural-extrapolation` as a separate sensitivity run and
+must not be pooled with the projected result.
 
 Run a full one-seed audit only for an affine `M=1` PI-PINN run with all outer
 checkpoints:
@@ -406,8 +414,38 @@ python3 Liu/liu_exact_map_fd.py \
   --grid-factors 1,2 \
   --domain-factors 1.5,2.0 \
   --boundaries linearity,exact-dirichlet \
-  --verify-checkpoints all
+  --verify-checkpoints all \
+  --policy-extension boundary-projection \
+  --linear-residual-tolerance 1e-8 \
+  --boundary-condition-limit 1e12
 ```
+
+Before this full run, a sparse domain pilot can be performed without
+retraining:
+
+```bash
+python3 Liu/liu_exact_map_fd.py \
+  --run-dir /path/to/M1_seed_run \
+  --output /path/to/derived/exact_map_domain_pilot_seed1 \
+  --device cuda:0 \
+  --checkpoints 1,5,10,15,20 \
+  --skip-e4 \
+  --grid-factors 1,2 \
+  --domain-factors 1.05,1.10,1.25,1.50 \
+  --boundaries linearity,exact-dirichlet \
+  --verify-checkpoints all \
+  --policy-extension boundary-projection
+```
+
+This is exact-map-only pilot output and is not eligible for paper aggregation.
+Select a final protocol only after guard and clipping fractions are zero,
+ellipticity has a comfortable positive margin, the boundary block is full
+rank and acceptably conditioned, every normalized linear residual is at most
+\(10^{-8}\), LU pivots are nondegenerate, and grid/domain/boundary changes are
+small. Never choose the factor solely by the smallest observed ratio. If one
+variant aborts the staged run, repeat factors in separate output directories
+to identify the failure; do not discard the failed variant and aggregate the
+survivors. See `Liu/LIU_EXACT_MAP.md` for the isolated-loop command.
 
 After running every seed, aggregate only common, fully checked schedules:
 
@@ -423,10 +461,18 @@ python3 Liu/aggregate_liu_exact_map.py \
 The norm is identical in numerator and denominator:
 `sup|V| + sup sqrt(V_w^2+V_ww^2+V_wx^2)`, with derivatives converted back to
 the original wealth coordinate. Grid, enlarged-domain, boundary, ellipticity,
-Peclet, guard, clipping, and linear-solve diagnostics are preserved. A guard
-or clip activation is labelled as the implemented modified map, and no
-finite-domain result is promoted to a whole-space proof. See
-`Liu/LIU_EXACT_MAP.md` for the indexing and numerical protocol.
+Peclet, guard, clipping, boundary rank/condition, LU-pivot, and linear-solve
+diagnostics are preserved. The normalized residual has a hard \(10^{-8}\)
+default gate; boundary rank deficiency or excessive condition number also
+fails before a result is committed. A guard or clip activation is labelled as
+the implemented modified map, and no finite-domain result is promoted to a
+whole-space proof. See `Liu/LIU_EXACT_MAP.md` for the indexing and numerical
+protocol.
+
+If an older `exact_map_ratios.csv` has blank `e_input_*`/`e_map_*` component
+columns, or an older E4 CSV has blank component errors, rerun the evaluator
+with the corrected schema. Post-hoc column renaming is not an acceptable
+repair because the discarded values are absent from the file.
 
 For paper-facing worst-case reporting, use `exact_map_worst_per_seed.csv` and
 `exact_map_worst_summary.csv`. They contain each seed's maximum primary ratio

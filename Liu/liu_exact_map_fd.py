@@ -41,6 +41,7 @@ from liu_exact_map_core import (
 
 CHECKPOINT_RE = re.compile(r"value_net_iter(\d+)\.pt$")
 VWW_GUARD = 1.0e-8
+POLICY_EXTENSIONS = ("boundary-projection", "neural-extrapolation")
 
 ERROR_PREFIXES = ("e_input", "e_map")
 ERROR_COMPONENTS = ("value", "vw", "vww", "vwx", "bundle", "X")
@@ -55,7 +56,11 @@ RATIO_FIELDS = [
     "dt", "is_primary", "is_verification",
     *[f"{prefix}_{component}" for prefix in ERROR_PREFIXES for component in ERROR_COMPONENTS],
     "rho_exact", "denominator_defined", "support_status", "checkpoint_selection",
-    "map_variant", "local_map_unmodified_on_xfd", "whole_space_map_claim",
+    "analysis_mode", "policy_extension", "map_definition",
+    "map_variant", "local_map_unmodified_on_xfd",
+    "local_greedy_unmodified_on_policy_support", "whole_space_map_claim",
+    "outside_collocation_fraction_fd", "outside_collocation_y_fraction_fd",
+    "outside_collocation_x_fraction_fd",
     "guard_frac_fd", "positive_curvature_frac_fd", "theta_any_clip_frac_fd",
     "theta_component_clip_frac_fd", "guard_frac_ev", "positive_curvature_frac_ev",
     "theta_any_clip_frac_ev", "theta_component_clip_frac_ev",
@@ -63,7 +68,10 @@ RATIO_FIELDS = [
     "vartheta_component_max_fd", "min_log_joint_eig", "max_log_joint_eig",
     "min_original_joint_eig", "max_original_joint_eig",
     "nonpositive_log_eig_fraction", "max_peclet_y", "max_peclet_x",
-    "upwind_y_fraction", "upwind_x_fraction", "max_linear_residual", "policy_hash",
+    "upwind_y_fraction", "upwind_x_fraction", "max_linear_residual",
+    "linear_residual_tolerance", "boundary_elimination_size",
+    "boundary_elimination_rank", "boundary_elimination_cond_inf",
+    "min_linear_system_lu_pivot_ratio", "policy_hash",
     "grid_abs_change", "grid_rel_change", "domain_abs_change", "domain_rel_change",
     "boundary_abs_change", "rho_sensitivity_envelope", "refinement_status",
     "contraction_status",
@@ -75,13 +83,15 @@ E4_FIELDS = [
     "policy_source_outer_iter", "checkpoint", "checkpoint_sha256", "market_sha256",
     "source_policy_hash", "fd_reference_source",
     "domain_factor", "boundary", "grid_factor", "ny", "nx", "nt", "is_primary",
-    "is_verification", "e_approx_value", "e_approx_vw", "e_approx_vww",
+    "is_verification", "analysis_mode", "policy_extension", "map_definition",
+    "e_approx_value", "e_approx_vw", "e_approx_vww",
     "e_approx_vwx", "e_approx_bundle", "e_approx_X", "support_status",
     "grid_abs_change", "grid_rel_change", "domain_abs_change", "domain_rel_change",
     "boundary_abs_change", "approx_sensitivity_envelope", "refinement_status",
     "source_min_log_joint_eig", "source_max_log_joint_eig",
     "source_min_original_joint_eig", "source_max_original_joint_eig",
     "source_nonpositive_log_eig_fraction",
+    "source_outside_collocation_fraction_fd",
 ]
 
 
@@ -155,7 +165,7 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[st
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="raise")
         writer.writeheader()
         writer.writerows(rows)
     os.replace(tmp, path)
@@ -363,7 +373,8 @@ class RunSpec:
 
 def load_run(run_dir: Path, *, weight_dir_override: Optional[Path] = None,
              checkpoint_subset: Optional[Sequence[int]] = None,
-             eval_margin_override: Optional[float] = None) -> RunSpec:
+             eval_margin_override: Optional[float] = None,
+             allow_sparse_subset: bool = False) -> RunSpec:
     run_dir = run_dir.expanduser().resolve()
     config_path = run_dir / "config.json"
     market_path = run_dir / "market_params.npz"
@@ -513,7 +524,8 @@ def load_run(run_dir: Path, *, weight_dir_override: Optional[Path] = None,
     if actual != expected:
         raise ValueError(f"Liu exact/E4 audit requires all outer checkpoints; got {actual}, expected {expected}")
     selected = [outer for outer, _path in checkpoints]
-    if checkpoint_subset and selected != list(range(1, selected[-1] + 1)):
+    if (checkpoint_subset and not allow_sparse_subset
+            and selected != list(range(1, selected[-1] + 1))):
         raise ValueError(
             "a checkpoint subset must be the contiguous prefix 1..k because E4 for "
             "checkpoint k reuses the exact-map solve from checkpoint k-1"
@@ -605,6 +617,46 @@ def _natural_key(name: str) -> Tuple[Any, ...]:
     return tuple(int(item) if item.isdigit() else item for item in re.split(r"(\d+)", name))
 
 
+def _policy_extension_coordinates(
+    problem: LiuProblem,
+    y: Array,
+    x: Array,
+    mode: str,
+) -> Tuple[Array, Array, Dict[str, float]]:
+    """Apply the declared finite-domain extension to policy query points.
+
+    ``boundary-projection`` holds the normalized feedback constant outside the
+    saved nominal collocation rectangle.  ``neural-extrapolation`` retains the
+    raw network extrapolation only as an explicit sensitivity mode.
+    """
+
+    normalized = str(mode).strip().lower().replace("_", "-")
+    if normalized not in POLICY_EXTENSIONS:
+        raise ValueError(
+            f"unsupported policy extension {mode!r}; choose from {POLICY_EXTENSIONS}"
+        )
+    yy = np.asarray(y, dtype=np.float64)
+    xx = np.asarray(x, dtype=np.float64)
+    if yy.shape != xx.shape:
+        raise ValueError("policy y/x query arrays must have identical shapes")
+    outside_y = (yy < problem.y_min) | (yy > problem.y_max)
+    outside_x = (xx < problem.x_min) | (xx > problem.x_max)
+    outside_any = outside_y | outside_x
+    if normalized == "boundary-projection":
+        eval_y = np.clip(yy, problem.y_min, problem.y_max)
+        eval_x = np.clip(xx, problem.x_min, problem.x_max)
+    else:
+        eval_y = yy
+        eval_x = xx
+    diagnostics = {
+        "points": float(yy.size),
+        "outside_collocation_count": float(np.count_nonzero(outside_any)),
+        "outside_collocation_y_count": float(np.count_nonzero(outside_y)),
+        "outside_collocation_x_count": float(np.count_nonzero(outside_x)),
+    }
+    return eval_y, eval_x, diagnostics
+
+
 class TorchCheckpointEvaluator:
     """Import-safe adapter for the fixed ``(w,x,tau)->V`` Liu MLP."""
 
@@ -692,19 +744,29 @@ class TorchCheckpointEvaluator:
         return tuple(item.reshape(shape) for item in self.bundle_at_points(tt.ravel(), yy.ravel(), xx.ravel()))  # type: ignore[return-value]
 
     def _policy_arrays(self, tau: Array, y: Array, x: Array,
-                       chunk: int = 32768) -> Tuple[Array, Dict[str, float]]:
+                       chunk: int = 32768,
+                       policy_extension: str = "boundary-projection",
+                       ) -> Tuple[Array, Dict[str, float]]:
         torch = self.torch
         t = np.asarray(tau, dtype=np.float64).reshape(-1)
         yy = np.asarray(y, dtype=np.float64).reshape(-1)
         xx = np.asarray(x, dtype=np.float64).reshape(-1)
+        if not (t.shape == yy.shape == xx.shape):
+            raise ValueError("tau, y, x policy arrays must have equal shape")
+        eval_y, eval_x, extension_diag = _policy_extension_coordinates(
+            self.run.problem, yy, xx, policy_extension
+        )
         result: List[Array] = []
         counts = {"guard_count": 0.0, "positive_curvature_count": 0.0,
-                  "theta_any_clip_count": 0.0, "theta_component_clip_count": 0.0}
+                  "theta_any_clip_count": 0.0, "theta_component_clip_count": 0.0,
+                  "outside_collocation_count": extension_diag["outside_collocation_count"],
+                  "outside_collocation_y_count": extension_diag["outside_collocation_y_count"],
+                  "outside_collocation_x_count": extension_diag["outside_collocation_x_count"]}
         for start in range(0, t.size, int(chunk)):
             stop = min(start + int(chunk), t.size)
-            w_t = torch.as_tensor(np.exp(yy[start:stop, None]), device=self.device,
+            w_t = torch.as_tensor(np.exp(eval_y[start:stop, None]), device=self.device,
                                   dtype=self.dtype).requires_grad_(True)
-            x_t = torch.as_tensor(xx[start:stop, None], device=self.device,
+            x_t = torch.as_tensor(eval_x[start:stop, None], device=self.device,
                                   dtype=self.dtype).requires_grad_(True)
             tau_t = torch.as_tensor(t[start:stop, None], device=self.device, dtype=self.dtype)
             value = self.model(torch.cat([w_t, x_t, tau_t], dim=1))
@@ -746,14 +808,20 @@ class TorchCheckpointEvaluator:
         return vartheta, diag
 
     def precompute_policy(self, tau: Array, y: Array, x: Array,
-                          chunk: int = 32768) -> Tuple[Any, str, Dict[str, float]]:
+                          chunk: int = 32768,
+                          policy_extension: str = "boundary-projection",
+                          ) -> Tuple[Any, str, Dict[str, float]]:
         tau_grid = np.asarray(tau, dtype=np.float64).reshape(-1)
         y_grid = np.asarray(y, dtype=np.float64).reshape(-1)
         x_grid = np.asarray(x, dtype=np.float64).reshape(-1)
         tt, yy, xx = np.meshgrid(tau_grid, y_grid, x_grid, indexing="ij")
-        vartheta, diag = self._policy_arrays(tt.ravel(), yy.ravel(), xx.ravel(), chunk=chunk)
+        vartheta, diag = self._policy_arrays(
+            tt.ravel(), yy.ravel(), xx.ravel(), chunk=chunk,
+            policy_extension=policy_extension,
+        )
         values = vartheta.reshape(tau_grid.size, y_grid.size, x_grid.size, -1)
         digest = hashlib.sha256()
+        digest.update(str(policy_extension).encode("utf-8") + b"\0")
         for item in (tau_grid, y_grid, x_grid, values):
             digest.update(np.asarray(item, dtype="<f8").tobytes())
 
@@ -771,7 +839,8 @@ class TorchCheckpointEvaluator:
             # Counts are recomputed cheaply from the stored aggregate only for reporting;
             # solve-level fractions remain exact over the same tensor grid.
             for key in ("guard_count", "positive_curvature_count", "theta_any_clip_count",
-                        "theta_component_clip_count"):
+                        "theta_component_clip_count", "outside_collocation_count",
+                        "outside_collocation_y_count", "outside_collocation_x_count"):
                 per_time[key] = float(diag[key]) / tau_grid.size
             selected = values[index]
             row_l2 = np.linalg.norm(selected, axis=-1)
@@ -785,35 +854,62 @@ class TorchCheckpointEvaluator:
 
         return policy, digest.hexdigest(), diag
 
-    def policy_diagnostics(self, tau: Array, y: Array, x: Array) -> Dict[str, float]:
-        _policy, _digest, raw = self.precompute_policy(tau, y, x)
+    def policy_diagnostics(
+        self,
+        tau: Array,
+        y: Array,
+        x: Array,
+        policy_extension: str = "boundary-projection",
+    ) -> Dict[str, float]:
+        _policy, _digest, raw = self.precompute_policy(
+            tau, y, x, policy_extension=policy_extension
+        )
         points = max(float(raw["points"]), 1.0)
         return {
             "guard_frac": float(raw["guard_count"]) / points,
             "positive_curvature_frac": float(raw["positive_curvature_count"]) / points,
             "theta_any_clip_frac": float(raw["theta_any_clip_count"]) / points,
             "theta_component_clip_frac": float(raw["theta_component_clip_count"]) / points,
+            "outside_collocation_frac": (
+                float(raw["outside_collocation_count"]) / points
+            ),
+            "outside_collocation_y_frac": (
+                float(raw["outside_collocation_y_count"]) / points
+            ),
+            "outside_collocation_x_frac": (
+                float(raw["outside_collocation_x_count"]) / points
+            ),
         }
 
 
-def _initial_policy(run: RunSpec, tau_grid: Array, y_grid: Array, x_grid: Array) -> Tuple[Any, str]:
+def _initial_policy(
+    run: RunSpec,
+    tau_grid: Array,
+    y_grid: Array,
+    x_grid: Array,
+    policy_extension: str = "boundary-projection",
+) -> Tuple[Any, str]:
     method = str(_pick(run.args, ("theta_init_method",), default="myopic")).lower()
     scale = float(_pick(run.args, ("theta_init_scale",), default=1.0))
     clip_raw = _pick(run.args, ("theta_clip_abs",), default=None)
     clip = None if clip_raw in (None, "", "none", "null") else float(clip_raw)
     tt, yy, xx = np.meshgrid(tau_grid, y_grid, x_grid, indexing="ij")
+    eval_yy, eval_xx, extension_diag = _policy_extension_coordinates(
+        run.problem, yy, xx, policy_extension
+    )
     if method == "myopic":
-        values = scale * run.problem.risk_premium(xx) / run.problem.gamma
+        values = scale * run.problem.risk_premium(eval_xx) / run.problem.gamma
     elif method == "zero":
-        values = np.zeros((*xx.shape, run.problem.n_assets), dtype=np.float64)
+        values = np.zeros((*eval_xx.shape, run.problem.n_assets), dtype=np.float64)
     elif method == "closed_form":
-        values = scale * run.closed_form.optimal_vartheta(tt, xx)
+        values = scale * run.closed_form.optimal_vartheta(tt, eval_xx)
     else:
         raise ValueError(f"unsupported theta_init_method={method!r}")
     if clip is not None:
-        wealth = np.exp(yy)[..., None]
+        wealth = np.exp(eval_yy)[..., None]
         values = np.clip(wealth * values, -clip, clip) / wealth
     digest_builder = hashlib.sha256()
+    digest_builder.update(str(policy_extension).encode("utf-8") + b"\0")
     for item in (tau_grid, y_grid, x_grid, values):
         digest_builder.update(np.asarray(item, dtype="<f8").tobytes())
     digest = digest_builder.hexdigest()
@@ -822,14 +918,42 @@ def _initial_policy(run: RunSpec, tau_grid: Array, y_grid: Array, x_grid: Array)
         index = int(np.argmin(np.abs(tau_grid - float(time_value))))
         if not math.isclose(float(tau_grid[index]), float(time_value), rel_tol=0.0, abs_tol=1e-11):
             raise KeyError("initial policy requested at an unregistered tau node")
-        return values[index], {"points": float(query_y.size)}
+        n_time = max(float(tau_grid.size), 1.0)
+        return values[index], {
+            "points": float(query_y.size),
+            "outside_collocation_count": (
+                float(extension_diag["outside_collocation_count"]) / n_time
+            ),
+            "outside_collocation_y_count": (
+                float(extension_diag["outside_collocation_y_count"]) / n_time
+            ),
+            "outside_collocation_x_count": (
+                float(extension_diag["outside_collocation_x_count"]) / n_time
+            ),
+        }
 
     return policy, digest
 
 
 def _metric_to_row(prefix: str, metric: Mapping[str, float]) -> Dict[str, float]:
-    return {f"{prefix}_{key if key != 'x_norm' else 'X'}": float(value)
-            for key, value in metric.items()}
+    rename = {
+        "value_sup": "value",
+        "vw_sup": "vw",
+        "vww_sup": "vww",
+        "vwx_sup": "vwx",
+        "bundle_sup": "bundle",
+        "x_norm": "X",
+    }
+    missing = sorted(set(rename) - set(metric))
+    extra = sorted(set(metric) - set(rename))
+    if missing or extra:
+        raise ValueError(
+            f"unexpected X-norm component schema: missing={missing}, extra={extra}"
+        )
+    return {
+        f"{prefix}_{rename[key]}": float(metric[key])
+        for key in rename
+    }
 
 
 def _policy_diag_from_fd(fd: Mapping[str, float]) -> Dict[str, float]:
@@ -842,6 +966,9 @@ def _policy_diag_from_fd(fd: Mapping[str, float]) -> Dict[str, float]:
         "l2_max": float(fd.get("policy_vartheta_l2_max", float("nan"))),
         "component_min": float(fd.get("policy_vartheta_component_min", float("nan"))),
         "component_max": float(fd.get("policy_vartheta_component_max", float("nan"))),
+        "outside": float(fd.get("policy_outside_collocation_count", 0.0)),
+        "outside_y": float(fd.get("policy_outside_collocation_y_count", 0.0)),
+        "outside_x": float(fd.get("policy_outside_collocation_x_count", 0.0)),
     }
 
 
@@ -856,11 +983,31 @@ def _map_variant(fd_policy: Mapping[str, float], ev: Mapping[str, float]) -> Tup
     return "locally_unmodified_on_sampled_xfd", 1
 
 
-def _verification_set(checkpoints: Sequence[Tuple[int, Path]], spec: str) -> set[int]:
+def _map_definition(policy_extension: str) -> Tuple[str, str]:
+    normalized = str(policy_extension).strip().lower().replace("_", "-")
+    if normalized == "boundary-projection":
+        return (
+            "finite_domain_boundary_projected_policy_extension",
+            "not_a_whole_space_map",
+        )
+    if normalized == "neural-extrapolation":
+        return (
+            "finite_domain_raw_neural_extrapolation",
+            "not_verified_by_finite_domain",
+        )
+    raise ValueError(f"unsupported policy extension {policy_extension!r}")
+
+
+def _verification_set(
+    checkpoints: Sequence[Tuple[int, Path]],
+    spec: str,
+    *,
+    include_alpha0: bool = True,
+) -> set[int]:
     outers = [outer for outer, _path in checkpoints]
     text = str(spec).strip().lower()
     if text == "all":
-        return set(outers) | {0}
+        return set(outers) | ({0} if include_alpha0 else set())
     if text in {"none", ""}:
         return set()
     out: set[int] = set()
@@ -872,7 +1019,7 @@ def _verification_set(checkpoints: Sequence[Tuple[int, Path]], spec: str) -> set
     unknown = out - set(outers)
     if unknown:
         raise ValueError(f"verification checkpoints are unavailable: {sorted(unknown)}")
-    return out | ({0} if out else set())
+    return out | ({0} if out and include_alpha0 else set())
 
 
 def _variant_schedule(outer: int, verification: set[int], *, finest: int,
@@ -1005,7 +1152,8 @@ def _assess(rows: List[Dict[str, Any]], *, key_name: str, value_name: str,
         row.setdefault("boundary_abs_change", "")
         row.setdefault(envelope_name, "")
         row.setdefault("refinement_status", "variant")
-        row.setdefault("contraction_status", "variant")
+        if value_name == "rho_exact":
+            row.setdefault("contraction_status", "variant")
 
 
 def evaluate_run(run: RunSpec, output: Path, *, device: str,
@@ -1016,7 +1164,12 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                  theta_method: float, startup_be_steps: int,
                  denominator_tolerance: float, refinement_abs_tolerance: float,
                  refinement_rel_tolerance: float,
-                 ellipticity_tolerance: float, overwrite: bool = False,
+                 ellipticity_tolerance: float,
+                 linear_residual_tolerance: float = 1.0e-8,
+                 boundary_condition_limit: float = 1.0e12,
+                 policy_extension: str = "boundary-projection",
+                 skip_e4: bool = False,
+                 overwrite: bool = False,
                  ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     output = output.expanduser().resolve()
     _prepare_output(output, overwrite)
@@ -1035,6 +1188,23 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
         raise ValueError("denominator tolerance must be nonnegative")
     if ellipticity_tolerance < 0.0:
         raise ValueError("ellipticity tolerance must be nonnegative")
+    if not math.isfinite(linear_residual_tolerance) or linear_residual_tolerance <= 0.0:
+        raise ValueError("linear residual tolerance must be finite and positive")
+    if not math.isfinite(boundary_condition_limit) or boundary_condition_limit < 1.0:
+        raise ValueError("boundary condition limit must be finite and at least one")
+    policy_extension = str(policy_extension).strip().lower().replace("_", "-")
+    if policy_extension not in POLICY_EXTENSIONS:
+        raise ValueError(f"unsupported policy extension {policy_extension!r}")
+    if skip_e4 and run.checkpoint_selection == "all":
+        # Supported, but make the exploratory nature explicit in provenance.
+        analysis_mode = "exact_map_only_pilot"
+    elif skip_e4:
+        analysis_mode = "sparse_exact_map_only_pilot"
+    elif run.checkpoint_selection != "all":
+        analysis_mode = "contiguous_prefix_exact_map_and_e4_pilot"
+    else:
+        analysis_mode = "exact_map_and_e4"
+    map_definition, whole_space_claim = _map_definition(policy_extension)
     boundaries = [str(value).replace("_", "-").lower() for value in boundaries]
     if not boundaries or any(value not in {"linearity", "exact-dirichlet"} for value in boundaries):
         raise ValueError("unsupported boundary list")
@@ -1050,19 +1220,26 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
         "base_nt": base_nt, "eval_ny": eval_ny, "eval_nx": eval_nx,
         "grid_factors": list(grid_factors), "domain_factors": list(domain_factors),
         "boundaries": boundaries, "verify": verify_checkpoints,
+        "selected_checkpoints": [outer for outer, _path in run.checkpoints],
+        "analysis_mode": analysis_mode, "skip_e4": bool(skip_e4),
+        "policy_extension": policy_extension,
         "drift_scheme": drift_scheme, "peclet_limit": peclet_limit,
         "theta_method": theta_method, "startup_be_steps": startup_be_steps,
         "denominator_tolerance": denominator_tolerance,
         "refinement_abs_tolerance": refinement_abs_tolerance,
         "refinement_rel_tolerance": refinement_rel_tolerance,
         "ellipticity_tolerance": ellipticity_tolerance,
+        "linear_residual_tolerance": linear_residual_tolerance,
+        "boundary_condition_limit": boundary_condition_limit,
         "implementation_hashes": implementation_hashes,
         "checkpoint_selection": run.checkpoint_selection,
     })[:16]
     finest = max(int(value) for value in grid_factors)
     largest_domain = max(float(value) for value in domain_factors)
     primary_boundary = boundaries[0]
-    verification = _verification_set(run.checkpoints, verify_checkpoints)
+    verification = _verification_set(
+        run.checkpoints, verify_checkpoints, include_alpha0=not skip_e4
+    )
 
     ev_w_min, ev_w_max = run.eval_w_bounds
     ev_x_min, ev_x_max = run.eval_x_bounds
@@ -1101,7 +1278,9 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
         input_bundles[outer] = input_bundle
         input_metric = x_norm_components(*input_bundle, reference)
         input_metrics[outer] = input_metric
-        ev_policy = evaluator.policy_diagnostics(ev_tau, ev_y, ev_x)
+        ev_policy = evaluator.policy_diagnostics(
+            ev_tau, ev_y, ev_x, policy_extension=policy_extension
+        )
         ev_variant_diag = {"guard": ev_policy["guard_frac"],
                            "positive": ev_policy["positive_curvature_frac"],
                            "any_clip": ev_policy["theta_any_clip_frac"],
@@ -1116,7 +1295,9 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
             grid, tau_mid, y_grid, x_grid = grid_spec(factor, domain_factor)
             cache_key = (factor, domain_factor)
             if cache_key not in cache:
-                cache[cache_key] = evaluator.precompute_policy(tau_mid, y_grid, x_grid)[:2]
+                cache[cache_key] = evaluator.precompute_policy(
+                    tau_mid, y_grid, x_grid, policy_extension=policy_extension
+                )[:2]
             policy, policy_hash = cache[cache_key]
             solution = solve_frozen_policy(
                 run.problem, policy, grid, theta_method=theta_method,
@@ -1124,6 +1305,8 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                 peclet_limit=peclet_limit, boundary=boundary,
                 exact_boundary_value=(lambda t, y, x: run.closed_form.value(t, y, x)),
                 ellipticity_tolerance=ellipticity_tolerance,
+                linear_residual_tolerance=linear_residual_tolerance,
+                boundary_condition_limit=boundary_condition_limit,
             )
             map_bundle = evaluate_fd_wealth_bundle(solution, ev_tau, ev_y, ev_x)
             map_metric = x_norm_components(*map_bundle, reference)
@@ -1158,8 +1341,16 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                 "rho_exact": rho, "denominator_defined": int(denominator_defined),
                 "support_status": ("defined" if denominator_defined else "undefined_denominator"),
                 "checkpoint_selection": run.checkpoint_selection,
-                "map_variant": map_variant, "local_map_unmodified_on_xfd": unmodified,
-                "whole_space_map_claim": "not_verified_by_finite_domain",
+                "analysis_mode": analysis_mode,
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
+                "map_variant": map_variant,
+                "local_map_unmodified_on_xfd": unmodified,
+                "local_greedy_unmodified_on_policy_support": unmodified,
+                "whole_space_map_claim": whole_space_claim,
+                "outside_collocation_fraction_fd": fd_policy["outside"],
+                "outside_collocation_y_fraction_fd": fd_policy["outside_y"],
+                "outside_collocation_x_fraction_fd": fd_policy["outside_x"],
                 "guard_frac_fd": fd_policy["guard"],
                 "positive_curvature_frac_fd": fd_policy["positive"],
                 "theta_any_clip_frac_fd": fd_policy["any_clip"],
@@ -1180,7 +1371,15 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                 "max_peclet_y": fd_diag["max_peclet_y"], "max_peclet_x": fd_diag["max_peclet_x"],
                 "upwind_y_fraction": fd_diag["upwind_y_fraction"],
                 "upwind_x_fraction": fd_diag["upwind_x_fraction"],
-                "max_linear_residual": fd_diag["max_linear_residual"], "policy_hash": policy_hash,
+                "max_linear_residual": fd_diag["max_linear_residual"],
+                "linear_residual_tolerance": linear_residual_tolerance,
+                "boundary_elimination_size": fd_diag["boundary_elimination_size"],
+                "boundary_elimination_rank": fd_diag["boundary_elimination_rank"],
+                "boundary_elimination_cond_inf": fd_diag["boundary_elimination_cond_inf"],
+                "min_linear_system_lu_pivot_ratio": fd_diag[
+                    "min_linear_system_lu_pivot_ratio"
+                ],
+                "policy_hash": policy_hash,
             }
             rows.append(row)
             variants_by_outer[outer][(factor, domain_factor, boundary)] = (map_bundle, row)
@@ -1191,73 +1390,99 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
             envelope_name="rho_sensitivity_envelope",
             abs_tolerance=refinement_abs_tolerance, rel_tolerance=refinement_rel_tolerance)
 
-    # E4: checkpoint k is compared with E(alpha[k-1]).  For k>=2 that FD
-    # solution is exactly the map result stored for checkpoint k-1.  Alpha0
-    # is analytic and requires one additional set of frozen-policy solves.
-    initial_variants: Dict[
-        Tuple[int, float, str],
-        Tuple[Tuple[Array, ...], str, Mapping[str, Any]],
-    ] = {}
-    for factor, domain_factor, boundary in _variant_schedule(
-        0, verification, finest=finest, largest_domain=largest_domain,
-        primary_boundary=primary_boundary, grid_factors=grid_factors,
-        domain_factors=domain_factors, boundaries=boundaries,
-    ):
-        grid, tau_mid, y_grid, x_grid = grid_spec(factor, domain_factor)
-        init_policy, _hash = _initial_policy(run, tau_mid, y_grid, x_grid)
-        solution = solve_frozen_policy(
-            run.problem, init_policy, grid, theta_method=theta_method,
-            startup_be_steps=startup_be_steps, drift_scheme=drift_scheme,
-            peclet_limit=peclet_limit, boundary=boundary,
-            exact_boundary_value=(lambda t, y, x: run.closed_form.value(t, y, x)),
-            ellipticity_tolerance=ellipticity_tolerance,
-        )
-        initial_variants[(factor, domain_factor, boundary)] = (
-            evaluate_fd_wealth_bundle(solution, ev_tau, ev_y, ev_x),
-            _hash,
-            solution.diagnostics.as_dict(),
-        )
-
     e4_rows: List[Dict[str, Any]] = []
-    for target_outer, checkpoint in run.checkpoints:
-        source_outer = _e4_source_outer(target_outer)
-        source_variants = initial_variants if source_outer == 0 else {
-            key: (value[0], str(value[1]["policy_hash"]), value[1])
-            for key, value in variants_by_outer[source_outer].items()
-        }
-        for variant, (fd_bundle, source_policy_hash, source_diag) in source_variants.items():
-            factor, domain_factor, boundary = variant
-            grid, _tau_mid, _y_grid, _x_grid = grid_spec(factor, domain_factor)
-            metric = x_norm_components(*input_bundles[target_outer], fd_bundle)
-            primary = variant == (finest, largest_domain, primary_boundary)
-            e4_rows.append({
-                "problem": "liu", "group": run.group, "protocol_hash": protocol_hash,
-                "model_type": "pipinn", "n_assets": run.problem.n_assets, "m_states": 1,
-                "seed": run.seed, "market_seed": run.market_seed,
-                "target_outer_iter": target_outer, "frozen_policy_iter": source_outer,
-                "policy_source_outer_iter": source_outer,
-                "checkpoint": str(checkpoint), "checkpoint_sha256": checkpoint_hashes[target_outer],
-                "market_sha256": run.market_hash, "domain_factor": domain_factor,
-                "source_policy_hash": source_policy_hash,
-                "fd_reference_source": ("analytic_alpha0_fd_solve" if source_outer == 0
-                                        else f"reused_exact_map_source_outer_{source_outer}"),
-                "boundary": boundary, "grid_factor": factor,
-                "ny": grid.ny, "nx": grid.nx, "nt": grid.nt, "is_primary": int(primary),
-                "is_verification": int(source_outer in verification),
-                **_metric_to_row("e_approx", metric), "support_status": "defined",
-                "source_min_log_joint_eig": source_diag["min_log_joint_eig"],
-                "source_max_log_joint_eig": source_diag["max_log_joint_eig"],
-                "source_min_original_joint_eig": source_diag["min_original_joint_eig"],
-                "source_max_original_joint_eig": source_diag["max_original_joint_eig"],
-                "source_nonpositive_log_eig_fraction": source_diag[
-                    "nonpositive_log_eig_fraction"
-                ],
-            })
-    _assess(e4_rows, key_name="target_outer_iter", value_name="e_approx_X", finest=finest,
-            largest_domain=largest_domain, primary_boundary=primary_boundary,
-            grid_factors=grid_factors, domain_factors=domain_factors, boundaries=boundaries,
+    if not skip_e4:
+        # E4: checkpoint k is compared with E(alpha[k-1]).  For k>=2 that FD
+        # solution is exactly the map result stored for checkpoint k-1. Alpha0
+        # is analytic and requires one additional set of frozen-policy solves.
+        initial_variants: Dict[
+            Tuple[int, float, str],
+            Tuple[Tuple[Array, ...], str, Mapping[str, Any]],
+        ] = {}
+        for factor, domain_factor, boundary in _variant_schedule(
+            0, verification, finest=finest, largest_domain=largest_domain,
+            primary_boundary=primary_boundary, grid_factors=grid_factors,
+            domain_factors=domain_factors, boundaries=boundaries,
+        ):
+            grid, tau_mid, y_grid, x_grid = grid_spec(factor, domain_factor)
+            init_policy, _hash = _initial_policy(
+                run, tau_mid, y_grid, x_grid,
+                policy_extension=policy_extension,
+            )
+            solution = solve_frozen_policy(
+                run.problem, init_policy, grid, theta_method=theta_method,
+                startup_be_steps=startup_be_steps, drift_scheme=drift_scheme,
+                peclet_limit=peclet_limit, boundary=boundary,
+                exact_boundary_value=(lambda t, y, x: run.closed_form.value(t, y, x)),
+                ellipticity_tolerance=ellipticity_tolerance,
+                linear_residual_tolerance=linear_residual_tolerance,
+                boundary_condition_limit=boundary_condition_limit,
+            )
+            initial_variants[(factor, domain_factor, boundary)] = (
+                evaluate_fd_wealth_bundle(solution, ev_tau, ev_y, ev_x),
+                _hash,
+                solution.diagnostics.as_dict(),
+            )
+
+        for target_outer, checkpoint in run.checkpoints:
+            source_outer = _e4_source_outer(target_outer)
+            source_variants = initial_variants if source_outer == 0 else {
+                key: (value[0], str(value[1]["policy_hash"]), value[1])
+                for key, value in variants_by_outer[source_outer].items()
+            }
+            for variant, (fd_bundle, source_policy_hash, source_diag) in source_variants.items():
+                factor, domain_factor, boundary = variant
+                grid, _tau_mid, _y_grid, _x_grid = grid_spec(factor, domain_factor)
+                metric = x_norm_components(*input_bundles[target_outer], fd_bundle)
+                primary = variant == (finest, largest_domain, primary_boundary)
+                e4_rows.append({
+                    "problem": "liu", "group": run.group, "protocol_hash": protocol_hash,
+                    "model_type": "pipinn", "n_assets": run.problem.n_assets, "m_states": 1,
+                    "seed": run.seed, "market_seed": run.market_seed,
+                    "target_outer_iter": target_outer, "frozen_policy_iter": source_outer,
+                    "policy_source_outer_iter": source_outer,
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_sha256": checkpoint_hashes[target_outer],
+                    "market_sha256": run.market_hash, "domain_factor": domain_factor,
+                    "source_policy_hash": source_policy_hash,
+                    "fd_reference_source": (
+                        "analytic_alpha0_fd_solve" if source_outer == 0
+                        else f"reused_exact_map_source_outer_{source_outer}"
+                    ),
+                    "boundary": boundary, "grid_factor": factor,
+                    "ny": grid.ny, "nx": grid.nx, "nt": grid.nt,
+                    "is_primary": int(primary),
+                    "is_verification": int(source_outer in verification),
+                    "analysis_mode": analysis_mode,
+                    "policy_extension": policy_extension,
+                    "map_definition": map_definition,
+                    **_metric_to_row("e_approx", metric),
+                    "support_status": "defined",
+                    "source_min_log_joint_eig": source_diag["min_log_joint_eig"],
+                    "source_max_log_joint_eig": source_diag["max_log_joint_eig"],
+                    "source_min_original_joint_eig": source_diag[
+                        "min_original_joint_eig"
+                    ],
+                    "source_max_original_joint_eig": source_diag[
+                        "max_original_joint_eig"
+                    ],
+                    "source_nonpositive_log_eig_fraction": source_diag[
+                        "nonpositive_log_eig_fraction"
+                    ],
+                    "source_outside_collocation_fraction_fd": source_diag.get(
+                        "outside_collocation_fraction_fd",
+                        source_diag.get("policy_outside_collocation_count", 0.0),
+                    ),
+                })
+        _assess(
+            e4_rows, key_name="target_outer_iter", value_name="e_approx_X",
+            finest=finest, largest_domain=largest_domain,
+            primary_boundary=primary_boundary, grid_factors=grid_factors,
+            domain_factors=domain_factors, boundaries=boundaries,
             envelope_name="approx_sensitivity_envelope",
-            abs_tolerance=refinement_abs_tolerance, rel_tolerance=refinement_rel_tolerance)
+            abs_tolerance=refinement_abs_tolerance,
+            rel_tolerance=refinement_rel_tolerance,
+        )
 
     primary_rows = [row for row in rows if int(row["is_primary"]) == 1]
     primary_e4 = [row for row in e4_rows if int(row["is_primary"]) == 1]
@@ -1275,6 +1500,16 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
         "group": run.group, "protocol_hash": protocol_hash,
         "implementation_hashes": implementation_hashes,
         "checkpoint_selection": run.checkpoint_selection,
+        "analysis_mode": analysis_mode,
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "whole_space_map_claim": whole_space_claim,
+        "collocation_bounds": {
+            "y_min": run.problem.y_min, "y_max": run.problem.y_max,
+            "w_min": math.exp(run.problem.y_min), "w_max": math.exp(run.problem.y_max),
+            "x_min": run.problem.x_min, "x_max": run.problem.x_max,
+            "interpretation": "saved nominal training bounds",
+        },
         "checkpoint_schedule": [outer for outer, _path in run.checkpoints],
         "checkpoint_file_hashes": {str(outer): checkpoint_hashes[outer]
                                    for outer, _path in run.checkpoints},
@@ -1283,11 +1518,14 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                  "grid_factors": list(grid_factors), "domain_factors": list(domain_factors),
                  "boundaries": boundaries, "verify_checkpoints": verify_checkpoints,
                  "drift_scheme": drift_scheme, "peclet_limit": peclet_limit,
-                 "theta_method": theta_method, "startup_be_steps": startup_be_steps},
+                 "theta_method": theta_method, "startup_be_steps": startup_be_steps,
+                 "linear_residual_tolerance": linear_residual_tolerance,
+                 "boundary_condition_limit": boundary_condition_limit},
         "refinement_abs_tolerance": refinement_abs_tolerance,
         "refinement_rel_tolerance": refinement_rel_tolerance,
         "denominator_tolerance": denominator_tolerance,
         "ellipticity_tolerance": ellipticity_tolerance,
+        "e4_status": ("skipped_by_exact_map_pilot" if skip_e4 else "computed"),
         "norm": "sup|V| + sup sqrt(Vw^2+Vww^2+Vwx^2)",
         "indexing": "checkpoint k ~= E(alpha[k-1]); map(checkpoint k)=E(alpha[k])",
     }
@@ -1303,9 +1541,16 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
         )
     }
     status_payload = {
-        "status": "success", "n_exact_rows": len(primary_rows),
+        "status": "success", "analysis_mode": analysis_mode,
+        "paper_aggregation_eligible": bool(
+            not skip_e4 and run.checkpoint_selection == "all"
+        ),
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "n_exact_rows": len(primary_rows),
         "n_refinement_rows": len(rows), "n_e4_rows": len(primary_e4),
         "n_e4_refinement_rows": len(e4_rows),
+        "e4_status": ("skipped_by_exact_map_pilot" if skip_e4 else "computed"),
         "all_denominators_defined": all(int(row["denominator_defined"]) for row in primary_rows),
         "undefined_denominator_outers": [int(row["source_outer_iter"]) for row in primary_rows
                                          if not int(row["denominator_defined"])],
@@ -1315,10 +1560,12 @@ def evaluate_run(run: RunSpec, output: Path, *, device: str,
                                       if row["refinement_status"] != "pass"],
         "e4_refinement_failures": [int(row["target_outer_iter"]) for row in primary_e4
                                    if row["refinement_status"] != "pass"],
-        "all_e4_source_policies_elliptic": all(
-            float(row["source_min_log_joint_eig"]) > ellipticity_tolerance
-            and float(row["source_nonpositive_log_eig_fraction"]) == 0.0
-            for row in primary_e4
+        "all_e4_source_policies_elliptic": (
+            None if skip_e4 else all(
+                float(row["source_min_log_joint_eig"]) > ellipticity_tolerance
+                and float(row["source_nonpositive_log_eig_fraction"]) == 0.0
+                for row in primary_e4
+            )
         ),
         "nonelliptic_e4_targets": [
             int(row["target_outer_iter"])
@@ -1348,7 +1595,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--checkpoints", default="", help="Exploratory comma-separated subset; paper mode uses all")
+    parser.add_argument(
+        "--checkpoints", default="",
+        help=(
+            "Exploratory comma-separated subset. Arbitrary sparse subsets require "
+            "--skip-e4; paper mode uses all checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--skip-e4", action="store_true",
+        help=(
+            "Exact-map-only pilot mode. This permits sparse --checkpoints and "
+            "does not produce paper-eligible E4 results."
+        ),
+    )
     parser.add_argument("--eval-margin", type=float, default=None)
     parser.add_argument("--base-ny", type=int, default=41)
     parser.add_argument("--base-nx", type=int, default=41)
@@ -1363,6 +1623,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peclet-limit", type=float, default=1.0)
     parser.add_argument("--theta-method", type=float, default=0.5)
     parser.add_argument("--startup-be-steps", type=int, default=2)
+    parser.add_argument(
+        "--linear-residual-tolerance", type=float, default=1e-8,
+        help="Hard upper bound for every normalized sparse linear-solve residual.",
+    )
+    parser.add_argument(
+        "--boundary-condition-limit", type=float, default=1e12,
+        help="Hard upper bound for the boundary-elimination infinity-norm condition number.",
+    )
+    parser.add_argument(
+        "--policy-extension", choices=POLICY_EXTENSIONS,
+        default="boundary-projection",
+        help=(
+            "Define the frozen policy outside saved nominal collocation bounds. "
+            "boundary-projection is the finite-domain paper diagnostic; "
+            "neural-extrapolation is sensitivity-only."
+        ),
+    )
     parser.add_argument("--denominator-tolerance", type=float, default=1e-12)
     parser.add_argument("--refinement-abs-tolerance", type=float, default=1e-2)
     parser.add_argument("--refinement-rel-tolerance", type=float, default=2e-2)
@@ -1392,6 +1669,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 weight_dir_override=args.weight_dir,
                 checkpoint_subset=subset,
                 eval_margin_override=args.eval_margin,
+                allow_sparse_subset=bool(args.skip_e4),
             )
             evaluate_run(
                 run, stage, device=args.device, base_ny=args.base_ny,
@@ -1407,6 +1685,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 refinement_abs_tolerance=args.refinement_abs_tolerance,
                 refinement_rel_tolerance=args.refinement_rel_tolerance,
                 ellipticity_tolerance=args.ellipticity_tolerance,
+                linear_residual_tolerance=args.linear_residual_tolerance,
+                boundary_condition_limit=args.boundary_condition_limit,
+                policy_extension=args.policy_extension,
+                skip_e4=bool(args.skip_e4),
                 overwrite=True,
             )
         except Exception as exc:

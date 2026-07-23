@@ -1,6 +1,7 @@
 """Import-safe driver tests that do not require PyTorch."""
 from __future__ import annotations
 
+import csv
 import json
 import unittest
 import tempfile
@@ -9,9 +10,12 @@ from unittest import mock
 
 import numpy as np
 
+from liu_exact_map_core import LiuProblem
 from liu_exact_map_fd import (
     _assess,
     _e4_source_outer,
+    _metric_to_row,
+    _policy_extension_coordinates,
     _variant_schedule,
     _verification_set,
     _resolve_weight_dir,
@@ -19,6 +23,7 @@ from liu_exact_map_fd import (
     _prepare_output,
     load_run,
     main,
+    write_csv,
 )
 
 
@@ -91,6 +96,85 @@ class LiuExactMapDriverTests(unittest.TestCase):
         self.assertEqual(len(variants), 8)
         self.assertIn((2, 2.0, "linearity"), variants)
         self.assertIn((1, 1.5, "exact-dirichlet"), variants)
+
+    def test_sparse_exact_map_verification_does_not_inject_alpha0(self) -> None:
+        checkpoints = [
+            (1, Path("iter1.pt")),
+            (5, Path("iter5.pt")),
+            (10, Path("iter10.pt")),
+            (15, Path("iter15.pt")),
+            (20, Path("iter20.pt")),
+        ]
+        self.assertEqual(
+            _verification_set(checkpoints, "all", include_alpha0=False),
+            {1, 5, 10, 15, 20},
+        )
+
+    def test_boundary_projection_clips_both_policy_coordinates(self) -> None:
+        p = LiuProblem(
+            horizon=0.5, y_min=-1.0, y_max=1.0, x_min=-0.5, x_max=0.5,
+            gamma=3.0, risk_free=0.02, K=0.8, k0=0.1, Q=0.04,
+            Gamma=np.asarray([0.04, -0.02]),
+            lam0=np.asarray([0.08, 0.04]),
+            Lam=np.asarray([0.05, -0.03]),
+        )
+        y = np.asarray([-2.0, 0.0, 2.0, 0.0])
+        x = np.asarray([0.0, -1.0, 0.0, 1.0])
+        projected_y, projected_x, diag = _policy_extension_coordinates(
+            p, y, x, "boundary-projection"
+        )
+        np.testing.assert_array_equal(projected_y, [-1.0, 0.0, 1.0, 0.0])
+        np.testing.assert_array_equal(projected_x, [0.0, -0.5, 0.0, 0.5])
+        self.assertEqual(diag["outside_collocation_count"], 4.0)
+        self.assertEqual(diag["outside_collocation_y_count"], 2.0)
+        self.assertEqual(diag["outside_collocation_x_count"], 2.0)
+
+        raw_y, raw_x, raw_diag = _policy_extension_coordinates(
+            p, y, x, "neural-extrapolation"
+        )
+        np.testing.assert_array_equal(raw_y, y)
+        np.testing.assert_array_equal(raw_x, x)
+        self.assertEqual(raw_diag, diag)
+
+    def test_x_norm_components_are_mapped_to_declared_csv_fields(self) -> None:
+        metric = {
+            "value_sup": 1.0,
+            "vw_sup": 2.0,
+            "vww_sup": 3.0,
+            "vwx_sup": 4.0,
+            "bundle_sup": 5.0,
+            "x_norm": 6.0,
+        }
+        mapped = _metric_to_row("e_input", metric)
+        self.assertEqual(
+            mapped,
+            {
+                "e_input_value": 1.0,
+                "e_input_vw": 2.0,
+                "e_input_vww": 3.0,
+                "e_input_vwx": 4.0,
+                "e_input_bundle": 5.0,
+                "e_input_X": 6.0,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "components.csv"
+            write_csv(path, [mapped], list(mapped))
+            with path.open(newline="", encoding="utf-8") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertTrue(all(row[key] != "" for key in mapped))
+
+    def test_csv_writer_rejects_unknown_component_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "strict.csv"
+            with self.assertRaises(ValueError):
+                write_csv(
+                    path,
+                    [{"e_input_value": 1.0, "e_input_value_sup": 1.0}],
+                    ["e_input_value"],
+                )
+            self.assertFalse(path.exists())
 
     def test_e4_source_target_shift_is_explicit(self) -> None:
         self.assertEqual(_e4_source_outer(1), 0)

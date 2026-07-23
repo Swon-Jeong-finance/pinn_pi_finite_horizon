@@ -58,6 +58,9 @@ EXACT_METRICS = (
     "min_original_joint_eig", "nonpositive_log_eig_fraction",
     "max_peclet_y", "max_peclet_x",
     "upwind_y_fraction", "upwind_x_fraction", "max_linear_residual",
+    "outside_collocation_fraction_fd", "outside_collocation_y_fraction_fd",
+    "outside_collocation_x_fraction_fd", "boundary_elimination_cond_inf",
+    "min_linear_system_lu_pivot_ratio",
 )
 E4_METRICS = (
     "e_approx_value", "e_approx_vw", "e_approx_vww", "e_approx_vwx",
@@ -65,6 +68,7 @@ E4_METRICS = (
     "source_min_log_joint_eig", "source_max_log_joint_eig",
     "source_min_original_joint_eig", "source_max_original_joint_eig",
     "source_nonpositive_log_eig_fraction",
+    "source_outside_collocation_fraction_fd",
 )
 
 
@@ -91,6 +95,21 @@ def _matching_artifact(candidates: Sequence[Path], expected_hash: str, label: st
 def _validate_provenance(directory: Path, config: Mapping[str, Any],
                          exact_rows: Sequence[Mapping[str, str]],
                          e4_rows: Sequence[Mapping[str, str]]) -> None:
+    if str(config.get("analysis_mode", "")) != "exact_map_and_e4":
+        raise ValueError(
+            f"{directory}: paper aggregation requires analysis_mode='exact_map_and_e4'; "
+            f"got {config.get('analysis_mode')!r}"
+        )
+    policy_extension = str(config.get("policy_extension", ""))
+    if policy_extension != "boundary-projection":
+        raise ValueError(
+            f"{directory}: paper aggregation requires the declared finite-domain "
+            f"boundary-projection policy extension; got {policy_extension!r}"
+        )
+    if str(config.get("map_definition", "")) != (
+        "finite_domain_boundary_projected_policy_extension"
+    ):
+        raise ValueError(f"{directory}: map-definition provenance is missing or inconsistent")
     selection = str(config.get("checkpoint_selection", ""))
     if selection != "all":
         raise ValueError(
@@ -204,6 +223,8 @@ def _validate_provenance(directory: Path, config: Mapping[str, Any],
             raise ValueError(f"{directory}: exact-map greedy-policy index mismatch at outer={outer}")
         if _integer(row, "target_value_outer_iter", directory / EXACT_INPUT) != outer + 1:
             raise ValueError(f"{directory}: exact-map target index mismatch at outer={outer}")
+        if str(row.get("policy_extension", "")) != policy_extension:
+            raise ValueError(f"{directory}: exact-map policy-extension mismatch at outer={outer}")
         expected = str(recorded_hashes.get(str(outer), ""))
         if not expected or str(row.get("checkpoint_sha256", "")) != expected:
             raise ValueError(f"{directory}: checkpoint provenance mismatch at outer={outer}")
@@ -220,6 +241,8 @@ def _validate_provenance(directory: Path, config: Mapping[str, Any],
             raise ValueError(f"{directory}: E4 frozen-policy index mismatch at target={target}")
         if _integer(row, "policy_source_outer_iter", directory / E4_INPUT) != source:
             raise ValueError(f"{directory}: E4 policy-source index mismatch at target={target}")
+        if str(row.get("policy_extension", "")) != policy_extension:
+            raise ValueError(f"{directory}: E4 policy-extension mismatch at target={target}")
         if str(row.get("checkpoint_sha256", "")) != str(exact_by_outer[target]["checkpoint_sha256"]):
             raise ValueError(f"{directory}: E4 target checkpoint hash mismatch at target={target}")
         source_hash = str(row.get("source_policy_hash", ""))
@@ -280,7 +303,7 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[st
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="raise")
         writer.writeheader()
         writer.writerows(rows)
     os.replace(tmp, path)
@@ -823,6 +846,8 @@ def aggregate(result_dirs: Sequence[Path], output: Path, *, expected_seeds: Sequ
             records.append({
                 "seed": seed, "directory": str(directory), "group": group,
                 "protocol_hash": protocol, "market_sha256": market,
+                "policy_extension": str(config.get("policy_extension", "")),
+                "map_definition": str(config.get("map_definition", "")),
                 "exact_schedule": exact_schedule, "e4_schedule": e4_schedule,
                 "undefined_outers": undefined,
             })
@@ -832,7 +857,10 @@ def aggregate(result_dirs: Sequence[Path], output: Path, *, expected_seeds: Sequ
             raise ValueError(f"found {len(seeds)} seeds, fewer than --min-seeds={min_seeds}: {seeds}")
         if expected_seeds and seeds != sorted(set(int(value) for value in expected_seeds)):
             raise ValueError(f"seed set mismatch: found {seeds}, expected {sorted(set(expected_seeds))}")
-        for field in ("group", "protocol_hash", "market_sha256", "exact_schedule", "e4_schedule"):
+        for field in (
+            "group", "protocol_hash", "market_sha256", "policy_extension",
+            "map_definition", "exact_schedule", "e4_schedule",
+        ):
             serialized = {json.dumps(record[field], sort_keys=True) for record in records}
             if len(serialized) != 1:
                 raise ValueError(f"cross-seed {field} mismatch: {serialized}")
@@ -935,8 +963,9 @@ def aggregate(result_dirs: Sequence[Path], output: Path, *, expected_seeds: Sequ
         elif global_envelope is not None and global_envelope >= 1.0:
             blockers.append("global_sensitivity_envelope_not_below_one")
         claim_text = (
-            "All tested primary exact-map ratios and their finite-domain sampled-map "
-            "sensitivity envelopes remained below one."
+            "All tested primary finite-domain boundary-projected extension-map "
+            "ratios and their sampled grid/domain/boundary sensitivity envelopes "
+            "remained below one."
             if finite_domain_below_one else None
         )
         payload = {
@@ -944,6 +973,8 @@ def aggregate(result_dirs: Sequence[Path], output: Path, *, expected_seeds: Sequ
             "n_seeds": len(seeds), "seeds": seeds,
             "group": records[0]["group"], "protocol_hash": records[0]["protocol_hash"],
             "market_sha256": records[0]["market_sha256"],
+            "policy_extension": records[0]["policy_extension"],
+            "map_definition": records[0]["map_definition"],
             "checkpoint_schedule": records[0]["exact_schedule"],
             "result_dirs": [record["directory"] for record in records],
             "undefined_denominators": {
@@ -977,7 +1008,8 @@ def aggregate(result_dirs: Sequence[Path], output: Path, *, expected_seeds: Sequ
             "finite_domain_ratio_claim_blockers": blockers,
             "finite_domain_ratio_claim_text": claim_text,
             "interpretation": (
-                "finite-domain sampled-map audit; no whole-space contraction claim"
+                "finite-domain boundary-projected extension-map audit; "
+                "no whole-space exact-map or contraction claim"
             ),
         }
         output.parent.mkdir(parents=True, exist_ok=True)
