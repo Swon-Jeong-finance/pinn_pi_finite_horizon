@@ -70,6 +70,7 @@ from matplotlib.colors import TwoSlopeNorm
 
 import market_setup  # <-- keep as requested
 import merton_experiment_utils as mxu
+import merton_evaluation_metrics as mem
 
 
 # =============================================================================
@@ -174,7 +175,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-tau", type=int, default=100)
     p.add_argument("--n-x", type=int, default=100)
     # Logging / output
-    p.add_argument("--print-every-outer", type=int, default=10)
+    p.add_argument(
+        "--print-every-outer",
+        type=int,
+        default=10,
+        help="Periodic outer-loop logging interval; 0 disables it after the first three outers.",
+    )
     p.add_argument("--print-every-eval", type=int, default=0)
     p.add_argument("--output-root", type=str, default="outputs_merton")
     p.add_argument("--weight-root", type=str, default=None)
@@ -223,6 +229,8 @@ if ARGS.sel_patience < 0 or ARGS.pe_resample_every < 0:
     raise ValueError("--sel-patience and --pe-resample-every must be nonnegative")
 if ARGS.diag_points < 0 or ARGS.diag_every < 1:
     raise ValueError("require --diag-points >= 0 and --diag-every >= 1")
+if ARGS.print_every_outer < 0:
+    raise ValueError("--print-every-outer must be nonnegative")
 if ARGS.eval_epochs < 0 or ARGS.outer_iters < 1 or ARGS.batch_size < 1:
     raise ValueError("require eval_epochs >= 0, outer_iters >= 1, and batch_size >= 1")
 if ARGS.e3b_checkpoints and ARGS.timing_mode:
@@ -235,6 +243,50 @@ if (ARGS.policy_bounds_mode == "stabilized" and
 if ARGS.pi_clip_abs is not None and (
         not math.isfinite(ARGS.pi_clip_abs) or ARGS.pi_clip_abs <= 0.0):
     raise ValueError("--pi-clip-abs must be finite and positive, or none")
+
+
+# Q_res is fixed for the entire run.  Q_sel is instead regenerated once per
+# frozen PDE and then held fixed throughout that inner policy-evaluation solve.
+# Keeping outer 1 on the historical stream (market_seed * 7919 + 101) makes the
+# protocol change minimally disruptive while giving every later outer its own
+# deterministic, training-seed-independent selection set.
+PI_PINN_QSEL_MARKET_MULTIPLIER = 7_919
+PI_PINN_QSEL_SEED_OFFSET = 101
+PI_PINN_QSEL_OUTER_STRIDE = 104_729
+PI_PINN_QSEL_SEED_MODULUS = 2**63 - 1
+
+
+def qsel_seed_for_outer(market_seed: int, outer_iter: int) -> int:
+    """Deterministic seed for the outer-specific, inner-fixed Q_sel set."""
+    outer_iter = int(outer_iter)
+    if outer_iter < 1:
+        raise ValueError("outer_iter must use one-based indexing")
+    return int(
+        (
+            int(market_seed) * PI_PINN_QSEL_MARKET_MULTIPLIER
+            + PI_PINN_QSEL_SEED_OFFSET
+            + (outer_iter - 1) * PI_PINN_QSEL_OUTER_STRIDE
+        )
+        % PI_PINN_QSEL_SEED_MODULUS
+    )
+
+
+def should_print_outer(outer_iter: int, print_every_outer: int) -> bool:
+    """Return whether the PI outer iteration should emit its summary."""
+    outer_iter = int(outer_iter)
+    print_every_outer = int(print_every_outer)
+    if outer_iter < 1:
+        raise ValueError("outer_iter must use one-based indexing")
+    if print_every_outer < 0:
+        raise ValueError("print_every_outer must be nonnegative")
+    return bool(
+        outer_iter <= 3
+        or (
+            print_every_outer > 0
+            and outer_iter % print_every_outer == 0
+        )
+    )
+
 
 # =============================================================================
 # 0) Reproducibility + Device
@@ -369,17 +421,64 @@ Sigma = torch.tensor(Sigma_np, device=device, dtype=torch.float32)              
 Sigma_inv_mu = torch.tensor(Sigma_inv_mu_np, device=device, dtype=torch.float32)   # (N,)
 pi_star = torch.tensor(pi_star_np, device=device, dtype=torch.float32)             # (N,)
 
+INITIAL_DIFFUSION_VARIANCE_TOL = 1e-12
+_init_method = str(ARGS.pi_init_method).lower()
+_initial_pi_for_audit: Optional[np.ndarray]
+if _init_method == "myopic":
+    _initial_pi_for_audit = float(ARGS.pi_init_scale) * pi_star_np
+elif _init_method == "zero":
+    _initial_pi_for_audit = np.zeros_like(pi_star_np)
+else:
+    _initial_pi_for_audit = None
+if _initial_pi_for_audit is not None and pi_clip_abs is not None:
+    _initial_pi_for_audit = np.clip(
+        _initial_pi_for_audit, -float(pi_clip_abs), float(pi_clip_abs)
+    )
+if _initial_pi_for_audit is None:
+    initial_policy_diffusion_variance = float("nan")
+    initial_policy_degenerate = None
+else:
+    initial_policy_diffusion_variance = float(
+        _initial_pi_for_audit @ Sigma_np @ _initial_pi_for_audit
+    )
+    initial_policy_degenerate = bool(
+        initial_policy_diffusion_variance <= INITIAL_DIFFUSION_VARIANCE_TOL
+    )
+ARGS.initial_policy_diffusion_variance_analytic = (
+    None if not math.isfinite(initial_policy_diffusion_variance)
+    else initial_policy_diffusion_variance
+)
+ARGS.initial_policy_degenerate = initial_policy_degenerate
+ARGS.initial_policy_degeneracy_tolerance = INITIAL_DIFFUSION_VARIANCE_TOL
+
 # Machine-readable trainer contract consumed by the exact-map evaluator.  Keep
 # this description literal: the current G implementation clamps both V_y and
 # V_y-V_yy from below, so it is deliberately not labelled as an unguarded or
 # log-concavity-only map.
 TRAINER_METADATA = {
-    "trainer_protocol": "merton-pipinn-heldout-selection-v1",
-    "trainer_protocol_version": 1,
-    "inner_selection_restore_contract": "model-plus-optimizer-when-enabled",
+    "trainer_protocol": "merton-pipinn-heldout-selection-v2",
+    "trainer_protocol_version": 2,
+    "inner_selection_restore_contract": (
+        "heldout-qsel-best-model-plus-optimizer;when-pres-target-is-set-"
+        "only-same-state-qres-eligible-checkpoints"
+    ),
+    "carry_lr_restore_contract": (
+        "restore-selected-model-and-adam-state;"
+        "lr_carry=max(effective_floor,min(lr_best,lr_inner_end));"
+        "next_outer_applies_carry_lr_max"
+    ),
     "checkpoint_timing_contract": "post-policy-evaluation-after-optional-heldout-restore",
+    "q_res_role": "pres_target_and_official_post_restore_residual",
+    "q_res_seed": int(MARKET_SEED),
+    "q_res_lifetime": "run-fixed",
+    "q_sel_role": "inner_checkpoint_selection_and_carry_plateau_scheduler",
+    "q_sel_lifetime": "outer-specific-and-inner-fixed",
+    "q_sel_seed_source": "market_seed_and_one_based_outer_iter",
+    "q_sel_seed_formula": (
+        "(market_seed*7919+101+(outer_iter-1)*104729) mod (2^63-1)"
+    ),
     "trainer_source": "merton_ND/merton_nd_consumption_pi_pinn.py",
-    "trainer_source_marker": "merton-pipinn-logw-trainer-one-sided-v1",
+    "trainer_source_marker": "merton-pipinn-logw-trainer-one-sided-selection-v2",
     "network_time_coordinate": "t",
     "network_input_order": "t,y",
     "network_input_transform": "identity",
@@ -408,6 +507,12 @@ TRAINER_METADATA = {
     "policy_c_min": c_min_bound,
     "policy_c_max": c_max_bound,
     "eval_margin_coordinate": "y",
+    "initial_policy_diffusion_variance_analytic": (
+        None if not math.isfinite(initial_policy_diffusion_variance)
+        else initial_policy_diffusion_variance
+    ),
+    "initial_policy_degenerate": initial_policy_degenerate,
+    "initial_policy_degeneracy_tolerance": INITIAL_DIFFUSION_VARIANCE_TOL,
 }
 TRAINER_METADATA["trainer_source_sha256"] = mxu.sha256_file(os.path.abspath(__file__))
 
@@ -424,6 +529,26 @@ print(f"  pi clip abs: {pi_clip_abs}"
       + (f" (componentwise [{pi_min_bound},{pi_max_bound}])" if pi_clip_abs is not None else " (unconstrained)"))
 print(f"  kappa=c/W bounds: [{kappa_min_bound},{kappa_max_bound}]")
 print(f"  ||pi*||_2 = {np.linalg.norm(pi_star_np):.4f}, max|pi*_i|={np.max(np.abs(pi_star_np)):.4f}")
+if initial_policy_degenerate:
+    print(
+        "[warning] Degenerate initial portfolio: "
+        f"pi_0^T Sigma pi_0={initial_policy_diffusion_variance:.3e} <= "
+        f"{INITIAL_DIFFUSION_VARIANCE_TOL:.1e}. This violates the intended "
+        "nondegenerate frozen-PDE initialization; use myopic initialization "
+        "with a positive, non-negligible pi_init_scale."
+    )
+elif initial_policy_degenerate is None:
+    print(
+        f"[warning] pi_init_method={_init_method!r} has no deterministic analytic "
+        "ellipticity pre-check; inspect diffusion_var_min_init in status.json."
+    )
+if ARGS.lr_schedule == "carry_plateau" and ARGS.adam_reset == "full":
+    print(
+        "[warning] carry_plateau with adam_reset=full discards the restored "
+        "held-out-best Adam moments at every outer boundary. The carried scalar "
+        "LR is preserved, but adam_reset=keep is the model+optimizer carry "
+        "protocol used for the paper runs."
+    )
 print(f"  cond(Sigma_safe) = {market_params['cond_Sigma_safe']:.2f}, max|rho_ij|={market_params['max_abs_rho']:.3f}")
 print(f"{'='*70}\n")
 
@@ -434,19 +559,15 @@ print(f"{'='*70}\n")
 def closed_form_c(t: np.ndarray, W: np.ndarray) -> np.ndarray:
     """Same functional form as 1D, with multi-asset nu."""
     tau = T_FINAL - t
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    return (nu / denom) * W
+    scale = mem.crra_homothetic_scale(tau, nu, gamma_risk, epsilon)
+    return W / scale
 
 
 def closed_form_V(t: np.ndarray, W: np.ndarray) -> np.ndarray:
     """CRRA value function V(t,W)=A(t) W^{1-gamma}/(1-gamma)."""
     tau = T_FINAL - t
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    A_t = (denom / nu) ** gamma_risk
+    scale = mem.crra_homothetic_scale(tau, nu, gamma_risk, epsilon)
+    A_t = scale ** gamma_risk
     return A_t * (W ** (1.0 - gamma_risk)) / (1.0 - gamma_risk)
 
 def closed_form_pi(t: np.ndarray, W: np.ndarray) -> np.ndarray:
@@ -653,10 +774,8 @@ def build_diag_set(n_points: int, margin: float) -> Dict[str, torch.Tensor]:
 def closed_form_wealth_bundle(t_np: np.ndarray, w_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Closed-form (V,V_w,V_ww), used by the paper X_ev diagnostic."""
     tau = T_FINAL - t_np
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    A_t = (denom / nu) ** gamma_risk
+    scale = mem.crra_homothetic_scale(tau, nu, gamma_risk, epsilon)
+    A_t = scale ** gamma_risk
     V = A_t * w_np ** (1.0 - gamma_risk) / (1.0 - gamma_risk)
     V_w = A_t * w_np ** (-gamma_risk)
     V_ww = -gamma_risk * A_t * w_np ** (-gamma_risk - 1.0)
@@ -664,9 +783,7 @@ def closed_form_wealth_bundle(t_np: np.ndarray, w_np: np.ndarray) -> Tuple[np.nd
 
 
 def _relative_l2(pred: np.ndarray, ref: np.ndarray) -> float:
-    den = float(np.sum(np.asarray(ref, dtype=np.float64) ** 2))
-    num = float(np.sum((np.asarray(pred, dtype=np.float64) - np.asarray(ref, dtype=np.float64)) ** 2))
-    return float(np.sqrt(num / max(den, np.finfo(np.float64).tiny)))
+    return mem.relative_l2(pred, ref)
 
 
 def _diffusion_variance(pi: torch.Tensor) -> torch.Tensor:
@@ -1014,6 +1131,12 @@ class PIPINN_MultiAsset_Consumption_LogW:
         resample_every: int = 0,
         resample_fn=None,
     ) -> Tuple[List[Dict], float, Optional[Dict[str, torch.Tensor]], int, float, Dict]:
+        if pres_target is not None and val_fn is None:
+            raise ValueError("pres_target requires a fixed Q_res validation function")
+        if pres_target is not None and restore_best and sel_fn is None:
+            raise ValueError(
+                "target-eligible held-out restore requires a fixed Q_sel function")
+
         loss_history: List[Dict] = []
         best_loss = float("inf")
         best_state = None
@@ -1022,11 +1145,15 @@ class PIPINN_MultiAsset_Consumption_LogW:
         c_fixed = c_n.detach()
         pi_fixed = pi_n.detach()
 
-        target_reached = False
+        # Keep the training-time crossing separate from the official outcome.
+        # The former controls early stopping; the latter is computed only on
+        # the state that remains after the optional held-out restore.
+        training_target_crossed = False
         epochs_used = 0
         last_val = None
         last_val_epoch = -1
         val_pres_at_stop = ""
+        val_pres_at_stop_epoch = ""
         n_resamples = 0
 
         best_sel_pres = float("inf")
@@ -1034,25 +1161,54 @@ class PIPINN_MultiAsset_Consumption_LogW:
         best_sel_epoch = -1
         sel_no_improve = 0
         sel_checks = 0
+        sel_eligible_checks = 0
+        sel_ineligible_checks = 0
         sel_stopped = False
+        selection_requires_target = bool(restore_best and pres_target is not None)
 
-        def run_val_check(epoch_idx: int):
-            nonlocal last_val, last_val_epoch, target_reached, val_pres_at_stop
+        def run_val_check(epoch_idx: int, detect_training_crossing: bool = True):
+            nonlocal last_val, last_val_epoch
+            nonlocal training_target_crossed, val_pres_at_stop
+            nonlocal val_pres_at_stop_epoch
             value = val_fn()
             last_val, last_val_epoch = value, int(epoch_idx)
-            if (not target_reached and pres_target is not None
+            if (detect_training_crossing and not training_target_crossed
+                    and pres_target is not None
                     and value[2] <= float(pres_target)):
-                target_reached = True
+                training_target_crossed = True
                 val_pres_at_stop = float(value[2])
+                val_pres_at_stop_epoch = int(epoch_idx)
             return value
 
         def run_sel_check(epoch_idx: int):
             nonlocal best_sel_pres, best_sel_state, best_sel_epoch
             nonlocal sel_no_improve, sel_checks, sel_stopped
+            nonlocal sel_eligible_checks, sel_ineligible_checks
             value = sel_fn()
             sel_checks += 1
             if self.lr_schedule == "carry_plateau" and self.scheduler is not None:
                 self.scheduler.step(float(value[2]))
+
+            # Q_sel remains the ranking score.  For an E6 target run, however,
+            # a restorable candidate must meet the Q_res target on this exact
+            # same model state.  Because this is a genuine fixed-Q_res
+            # evaluation, a crossing observed here is also a training-time
+            # crossing and triggers the same early-stop contract.
+            qres_value = None
+            eligible = True
+            if selection_requires_target:
+                if last_val_epoch == int(epoch_idx) and last_val is not None:
+                    qres_value = last_val
+                else:
+                    qres_value = run_val_check(
+                        epoch_idx, detect_training_crossing=True)
+                eligible = bool(qres_value[2] <= float(pres_target))
+
+            if not eligible:
+                sel_ineligible_checks += 1
+                return value
+
+            sel_eligible_checks += 1
             if value[2] < best_sel_pres:
                 best_sel_pres = float(value[2])
                 best_sel_epoch = int(epoch_idx)
@@ -1063,6 +1219,9 @@ class PIPINN_MultiAsset_Consumption_LogW:
                     "lr": float(self.optimizer.param_groups[0]["lr"]),
                     "epoch": int(epoch_idx),
                     "pres": float(value[2]),
+                    "qres_pres": (
+                        float(qres_value[2]) if qres_value is not None else ""
+                    ),
                 }
                 sel_no_improve = 0
             else:
@@ -1077,7 +1236,7 @@ class PIPINN_MultiAsset_Consumption_LogW:
             run_sel_check(0)
 
         for epoch in range(1, epochs + 1):
-            if target_reached or sel_stopped:
+            if training_target_crossed or sel_stopped:
                 break
             if (resample_fn is not None and resample_every > 0 and epoch > 1
                     and (epoch - 1) % int(resample_every) == 0):
@@ -1196,45 +1355,91 @@ class PIPINN_MultiAsset_Consumption_LogW:
             value = run_sel_check(epochs_used)
             loss_history[-1]["sel_pres"] = value[2]
 
-        lr_end_before_restore = ""
+        # Capture the true end-of-inner LR before any held-out restore.  A
+        # restored Adam state contains the LR from the selected checkpoint, but
+        # carry_plateau must never undo a later within-inner LR reduction.
+        end_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
+        lr_end_before_restore = end_lrs[0]
         lr_best_checkpoint = ""
-        lr_after_restore = ""
+        lr_after_restore = end_lrs[0]
         if restore_best and best_sel_state is not None:
-            end_lrs = [float(group["lr"]) for group in self.optimizer.param_groups]
             self.value_net.load_state_dict(best_sel_state["model"])
             self.optimizer.load_state_dict(best_sel_state["optimizer"])
-            floor_lr = self._effective_min_lr()
-            for group, end_lr in zip(self.optimizer.param_groups, end_lrs):
-                group["lr"] = max(floor_lr, min(float(group["lr"]), end_lr))
-            lr_end_before_restore = end_lrs[0]
             lr_best_checkpoint = float(best_sel_state["lr"])
+            if self.lr_schedule == "carry_plateau":
+                # Liu carry rule: restore the selected model and Adam moments,
+                # then carry the lower of the selected-checkpoint and inner-end
+                # LRs, subject to the configured scheduler/carry floor.
+                floor_lr = self._effective_min_lr()
+                for group, end_lr in zip(self.optimizer.param_groups, end_lrs):
+                    best_lr = float(group["lr"])
+                    group["lr"] = max(floor_lr, min(best_lr, end_lr))
             lr_after_restore = float(self.optimizer.param_groups[0]["lr"])
             last_val_epoch = -1
 
+        lr_carried_next = ""
+        if self.lr_schedule == "carry_plateau":
+            # This is the scalar LR prepare_optimizer_for_outer() will actually
+            # use at the next outer, including both the floor and ceiling.  It
+            # remains meaningful when selection is disabled or no checkpoint
+            # was eligible/restored.
+            lr_carried_next = min(
+                self.carry_lr_max,
+                max(self._effective_min_lr(), float(self.optimizer.param_groups[0]["lr"])),
+            )
+
         if val_fn is not None and last_val_epoch != epochs_used:
-            # This is explicitly post-restore.  target_reached remains the
-            # sticky training-stop fact requested by the paper protocol.
+            # This is explicitly post-restore.  The training crossing remains
+            # a separate sticky diagnostic and is never used as the official
+            # residual achieved by the restored model.
             last_val = val_fn()
             last_val_epoch = epochs_used
+
+        if (selection_requires_target and best_sel_state is not None
+                and last_val is not None
+                and float(last_val[2])
+                > float(pres_target) * (1.0 + 1e-6)):
+            raise RuntimeError(
+                "target-eligible Q_sel checkpoint failed deterministic "
+                "post-restore Q_res remeasurement: "
+                f"selected={best_sel_state['qres_pres']}, "
+                f"restored={float(last_val[2]):.6e}, "
+                f"target={float(pres_target):.6e}"
+            )
+
+        official_target_reached = bool(
+            pres_target is not None
+            and last_val is not None
+            and float(last_val[2]) <= float(pres_target)
+        )
 
         info = {
             "epochs_used": int(epochs_used),
             "n_resamples": int(n_resamples),
-            "target_reached": bool(target_reached),
+            # Back-compatible name, now intentionally carrying the official
+            # post-restore meaning required by E6.
+            "target_reached": official_target_reached,
+            "target_reached_post_restore": official_target_reached,
+            "training_target_crossed": bool(training_target_crossed),
             "val_pres_at_stop": val_pres_at_stop,
+            "val_pres_at_stop_epoch": val_pres_at_stop_epoch,
             "val_pde_rms_post_restore": last_val[0] if last_val else "",
             "val_terminal_rms_post_restore": last_val[1] if last_val else "",
             "val_pres_post_restore": last_val[2] if last_val else "",
             "sel_best_pres": best_sel_state["pres"] if best_sel_state else "",
+            "sel_best_qres_pres": (
+                best_sel_state["qres_pres"] if best_sel_state else ""
+            ),
             "sel_best_epoch": best_sel_state["epoch"] if best_sel_state else "",
             "sel_best_lr": best_sel_state["lr"] if best_sel_state else "",
             "sel_checks": int(sel_checks), "sel_stopped": int(bool(sel_stopped)),
+            "sel_eligible_checks": int(sel_eligible_checks),
+            "sel_ineligible_checks": int(sel_ineligible_checks),
             "sel_restored": int(bool(restore_best and best_sel_state is not None)),
             "lr_end_before_restore": lr_end_before_restore,
             "lr_best_checkpoint": lr_best_checkpoint,
             "lr_after_restore": lr_after_restore,
-            "lr_carried_next": min(self.carry_lr_max, lr_after_restore)
-                if self.lr_schedule == "carry_plateau" and lr_after_restore != "" else "",
+            "lr_carried_next": lr_carried_next,
         }
         return loss_history, best_loss, best_state, best_epoch, float(loss_history[-1]["total"]), info
 
@@ -1276,6 +1481,9 @@ class PIPINN_MultiAsset_Consumption_LogW:
         recorder=None,
         stopper=None,
     ) -> Dict:
+        print_every_outer = int(print_every_outer)
+        if print_every_outer < 0:
+            raise ValueError("print_every_outer must be nonnegative")
         print(f"\n{'='*70}")
         print(f"PI-PINN Algorithm 2 (multi-asset, logW, with consumption): {outer_iters} outer iterations")
         print(f"  Eval epochs per iter: {eval_epochs}")
@@ -1301,6 +1509,8 @@ class PIPINN_MultiAsset_Consumption_LogW:
             "total_optimizer_steps": 0,
             "target_reached": False,
             "target_flags": [],
+            "training_target_crossed": False,
+            "training_target_flags": [],
             "val_pres": [],
             "inner_epochs_used": [],
         }
@@ -1348,9 +1558,18 @@ class PIPINN_MultiAsset_Consumption_LogW:
             "inner_selection_restore_contract": TRAINER_METADATA[
                 "inner_selection_restore_contract"
             ],
+            "carry_lr_restore_contract": TRAINER_METADATA[
+                "carry_lr_restore_contract"
+            ],
             "checkpoint_timing_contract": TRAINER_METADATA[
                 "checkpoint_timing_contract"
             ],
+            "q_res_role": TRAINER_METADATA["q_res_role"],
+            "q_res_seed": TRAINER_METADATA["q_res_seed"],
+            "q_res_lifetime": TRAINER_METADATA["q_res_lifetime"],
+            "q_sel_role": TRAINER_METADATA["q_sel_role"],
+            "q_sel_lifetime": TRAINER_METADATA["q_sel_lifetime"],
+            "q_sel_seed_formula": TRAINER_METADATA["q_sel_seed_formula"],
             "requested_outer_iters": int(outer_iters),
             "checkpoint_policy": {
                 "e3b_checkpoints": bool(e3b_checkpoints),
@@ -1366,9 +1585,17 @@ class PIPINN_MultiAsset_Consumption_LogW:
                     "model-plus-optimizer"
                     if inner_best_restore else "final-inner-iterate"
                 ),
+                "target_eligible_selection": (
+                    "same-state-fixed-qres-at-or-below-target"
+                    if inner_best_restore and pres_target is not None
+                    else "not-applied"
+                ),
                 "checkpoint_timing": (
                     "post-policy-evaluation-after-optional-heldout-restore"
                 ),
+                "q_res": "run-fixed-market-seed-stream",
+                "q_sel": "outer-specific-market-seed-stream-fixed-within-inner",
+                "q_sel_seed_formula": TRAINER_METADATA["q_sel_seed_formula"],
             },
             "indexing": {
                 "checkpoint_outer_index_base": 1,
@@ -1442,11 +1669,6 @@ class PIPINN_MultiAsset_Consumption_LogW:
         val_set = None
         if val_points > 0 and not (timing_mode and pres_target is None):
             val_set = build_validation_set(val_points, max(1, val_terminal_points), self.device, val_seed)
-        sel_set = None
-        if inner_best_restore and sel_points > 0:
-            sel_set = build_validation_set(
-                sel_points, max(1, sel_terminal_points), self.device,
-                int(val_seed) * 7919 + 101)
         diag = None
         diag_col = None
         if diag_points > 0 and not timing_mode:
@@ -1471,7 +1693,7 @@ class PIPINN_MultiAsset_Consumption_LogW:
                 results["stopped_early"] = True
                 results["stop_info"] = meta
                 break
-            verbose = (it % print_every_outer == 0) or (it <= 3)
+            verbose = should_print_outer(it, print_every_outer)
             if verbose:
                 print(f"\n[Outer Iteration {it}/{outer_iters}]")
                 print("-" * 40)
@@ -1507,6 +1729,21 @@ class PIPINN_MultiAsset_Consumption_LogW:
             if val_set is not None:
                 c_val, pi_val = frozen_policy(val_set["t_int"], val_set["y_int"])
                 val_fn = lambda _c=c_val, _p=pi_val: self.evaluate_heldout_pres(_c, _p, val_set)
+
+            # Q_sel,n is independent across frozen PDEs and fixed throughout
+            # this inner solve.  The dedicated CPU generator inside
+            # build_validation_set means this does not advance the training
+            # RNG and therefore depends on market_seed/outer_iter only.
+            q_sel_seed = ""
+            sel_set = None
+            if inner_best_restore and sel_points > 0:
+                q_sel_seed = qsel_seed_for_outer(val_seed, it)
+                sel_set = build_validation_set(
+                    sel_points,
+                    max(1, sel_terminal_points),
+                    self.device,
+                    q_sel_seed,
+                )
             sel_fn = None
             if sel_set is not None:
                 c_sel, pi_sel = frozen_policy(sel_set["t_int"], sel_set["y_int"])
@@ -1547,10 +1784,17 @@ class PIPINN_MultiAsset_Consumption_LogW:
             results["total_optimizer_steps"] += int(eval_info["epochs_used"])
             results["target_reached"] = results["target_reached"] or bool(eval_info["target_reached"])
             results["target_flags"].append(bool(eval_info["target_reached"]))
+            results["training_target_crossed"] = (
+                results["training_target_crossed"]
+                or bool(eval_info["training_target_crossed"])
+            )
+            results["training_target_flags"].append(
+                bool(eval_info["training_target_crossed"])
+            )
             results["inner_epochs_used"].append(int(eval_info["epochs_used"]))
-            achieved_pres = eval_info["val_pres_at_stop"]
-            if not isinstance(achieved_pres, (int, float)):
-                achieved_pres = eval_info["val_pres_post_restore"]
+            # E6's official achieved residual belongs to the exact model state
+            # used for the outer checkpoint and downstream error evaluation.
+            achieved_pres = eval_info["val_pres_post_restore"]
             if isinstance(achieved_pres, (int, float)):
                 results["val_pres"].append(float(achieved_pres))
             for hist_row in eval_loss_hist:
@@ -1699,16 +1943,25 @@ class PIPINN_MultiAsset_Consumption_LogW:
                 "val_terminal_rms": eval_info["val_terminal_rms_post_restore"],
                 "val_pres": eval_info["val_pres_post_restore"],
                 "val_pres_at_stop": eval_info["val_pres_at_stop"],
+                "val_pres_at_stop_epoch": eval_info["val_pres_at_stop_epoch"],
                 "val_pres_post_restore": eval_info["val_pres_post_restore"],
                 "achieved_pres": achieved_pres,
                 "inner_epochs_used": eval_info["epochs_used"],
                 "n_resamples": eval_info["n_resamples"],
                 "target_reached": int(eval_info["target_reached"]),
+                "target_reached_post_restore": int(
+                    eval_info["target_reached_post_restore"]),
+                "training_target_crossed": int(
+                    eval_info["training_target_crossed"]),
                 "sel_best_pres": eval_info["sel_best_pres"],
+                "sel_best_qres_pres": eval_info["sel_best_qres_pres"],
                 "sel_best_epoch": eval_info["sel_best_epoch"],
                 "sel_best_lr": eval_info["sel_best_lr"],
                 "sel_checks": eval_info["sel_checks"], "sel_stopped": eval_info["sel_stopped"],
+                "sel_eligible_checks": eval_info["sel_eligible_checks"],
+                "sel_ineligible_checks": eval_info["sel_ineligible_checks"],
                 "sel_restored": eval_info["sel_restored"],
+                "q_sel_seed": q_sel_seed,
                 "lr_end_before_restore": eval_info["lr_end_before_restore"],
                 "lr_best_checkpoint": eval_info["lr_best_checkpoint"],
                 "lr_after_restore": eval_info["lr_after_restore"],
@@ -1756,6 +2009,10 @@ class PIPINN_MultiAsset_Consumption_LogW:
         results["pres_max"] = max(results["val_pres"]) if results["val_pres"] else None
         results["total_inner_steps"] = int(sum(results["inner_epochs_used"]))
         results["all_targets_reached"] = bool(results["target_flags"]) and all(results["target_flags"])
+        results["all_training_targets_crossed"] = (
+            bool(results["training_target_flags"])
+            and all(results["training_target_flags"])
+        )
         final_state = None
         final_it = 0
         final_state_sha256 = None
@@ -1823,6 +2080,7 @@ class PIPINN_MultiAsset_Consumption_LogW:
             "checkpoint_manifest_path": manifest_path,
             "checkpoint_manifest_sha256": mxu.sha256_file(manifest_path),
             "checkpoint_manifest_schema_version": checkpoint_manifest["schema_version"],
+            "completed_outer_iters": len(results["outer_rows"]),
             "final_outer_iter": final_it,
             "final_checkpoint_state_sha256": final_state_sha256,
             "final_checkpoint_file_sha256": final_file_sha256,
@@ -1884,56 +2142,81 @@ def eval_pinn_on_grid_margin(
     return tt, ww, V_grid, c_grid, pi_grid, pi_norm_grid
 
 
-def compute_metrics(V_pinn, c_pinn, pi_pinn, V_cf, c_cf, pi_cf) -> Dict[str, float]:
-    """Paper metrics: standard relative L2, with MSE/max diagnostics."""
-    mse_V = np.mean((V_pinn - V_cf) ** 2)
-    mse_c = np.mean((c_pinn - c_cf) ** 2)
-    mse_pi = np.mean((pi_pinn - pi_cf) ** 2)
+def compute_metrics(
+    V_pinn, c_pinn, pi_pinn, V_cf, c_cf, pi_cf, *,
+    Vw_pinn, Vww_pinn, Vw_cf, Vww_cf,
+) -> Dict[str, float]:
+    """Common all-margin value/bundle/control metrics.
 
-    rel_l2_V = _relative_l2(V_pinn, V_cf)
-    rel_l2_c = _relative_l2(c_pinn, c_cf)
-    rel_l2_pi = _relative_l2(pi_pinn, pi_cf)
+    The bundle is the reduced wealth-coordinate pair ``(V_w,V_ww)``.  This
+    Merton problem has no additional factor coordinate and hence no ``V_wx``.
+    """
+    return mem.full_window_metrics(
+        V_pinn, c_pinn, pi_pinn, Vw_pinn, Vww_pinn,
+        V_cf, c_cf, pi_cf, Vw_cf, Vww_cf,
+    )
 
-    max_V_err = np.max(np.abs(V_pinn - V_cf))
-    max_c_err = np.max(np.abs(c_pinn - c_cf))
-    max_pi_err = np.max(np.abs(pi_pinn - pi_cf))
 
-    return {
-        "MSE_V": float(mse_V),
-        "MSE_c": float(mse_c),
-        "MSE_pi": float(mse_pi),
-        "RelL2_V": float(rel_l2_V),
-        "RelL2_c": float(rel_l2_c),
-        "RelL2_pi": float(rel_l2_pi),
-        "MaxErr_V": float(max_V_err),
-        "MaxErr_c": float(max_c_err),
-        "MaxErr_pi": float(max_pi_err),
-    }
+def eval_model_bundle_on_points(
+    value_net: nn.Module, t_np: np.ndarray, w_np: np.ndarray, chunk: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate ``V,V_w,V_ww,c,pi`` on arbitrary paired points."""
+    was_training = value_net.training
+    value_net.eval()
+    V_parts, Vw_parts, Vww_parts, c_parts, pi_parts = [], [], [], [], []
+    t_np = np.asarray(t_np, dtype=np.float32).reshape(-1, 1)
+    w_np = np.asarray(w_np, dtype=np.float32).reshape(-1, 1)
+    for start in range(0, len(t_np), chunk):
+        t = torch.tensor(t_np[start:start + chunk], device=device)
+        y = torch.tensor(
+            np.log(w_np[start:start + chunk]), device=device, requires_grad=True)
+        V = value_net(t, y)
+        V_y = torch.autograd.grad(
+            V, y, torch.ones_like(V), create_graph=True, retain_graph=True)[0]
+        V_yy = torch.autograd.grad(
+            V_y, y, torch.ones_like(V_y), create_graph=False, retain_graph=True)[0]
+        W = torch.exp(y)
+        V_w = V_y / W
+        V_ww = (V_yy - V_y) / (W ** 2)
+        c = compute_c_from_foc_log(V_y, y)
+        pi = compute_pi_from_foc_log_multi(V_y, V_yy, Sigma_inv_mu)
+        V_parts.append(V.detach().cpu().numpy())
+        Vw_parts.append(V_w.detach().cpu().numpy())
+        Vww_parts.append(V_ww.detach().cpu().numpy())
+        c_parts.append(c.detach().cpu().numpy())
+        pi_parts.append(pi.detach().cpu().numpy())
+    if was_training:
+        value_net.train()
+    return (
+        np.concatenate(V_parts), np.concatenate(Vw_parts),
+        np.concatenate(Vww_parts), np.concatenate(c_parts),
+        np.concatenate(pi_parts),
+    )
 
 
 def eval_model_on_points(
     value_net: nn.Module, t_np: np.ndarray, w_np: np.ndarray, chunk: int = 4096,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate V,c,pi on arbitrary paired points."""
-    was_training = value_net.training
-    value_net.eval()
-    V_parts, c_parts, pi_parts = [], [], []
-    t_np = np.asarray(t_np, dtype=np.float32).reshape(-1, 1)
-    w_np = np.asarray(w_np, dtype=np.float32).reshape(-1, 1)
-    for start in range(0, len(t_np), chunk):
-        t = torch.tensor(t_np[start:start + chunk], device=device, requires_grad=True)
-        y = torch.tensor(np.log(w_np[start:start + chunk]), device=device, requires_grad=True)
-        V = value_net(t, y)
-        V_y = torch.autograd.grad(V, y, torch.ones_like(V), create_graph=True, retain_graph=True)[0]
-        V_yy = torch.autograd.grad(V_y, y, torch.ones_like(V_y), create_graph=False, retain_graph=True)[0]
-        c = compute_c_from_foc_log(V_y, y)
-        pi = compute_pi_from_foc_log_multi(V_y, V_yy, Sigma_inv_mu)
-        V_parts.append(V.detach().cpu().numpy())
-        c_parts.append(c.detach().cpu().numpy())
-        pi_parts.append(pi.detach().cpu().numpy())
-    if was_training:
-        value_net.train()
-    return np.concatenate(V_parts), np.concatenate(c_parts), np.concatenate(pi_parts)
+    V, _Vw, _Vww, c, pi = eval_model_bundle_on_points(
+        value_net, t_np, w_np, chunk=chunk)
+    return V, c, pi
+
+
+def eval_metrics_on_points(
+    value_net: nn.Module, t_np: np.ndarray, w_np: np.ndarray,
+) -> Dict[str, float]:
+    """Evaluate the common E9 metric schema on one fixed point set."""
+    t_eval = np.asarray(t_np, dtype=np.float64).reshape(-1, 1)
+    w_eval = np.asarray(w_np, dtype=np.float64).reshape(-1, 1)
+    V, Vw, Vww, c, pi = eval_model_bundle_on_points(value_net, t_eval, w_eval)
+    V_cf, Vw_cf, Vww_cf = closed_form_wealth_bundle(t_eval, w_eval)
+    c_cf = closed_form_c(t_eval, w_eval)
+    pi_cf = np.broadcast_to(pi_star_np.reshape(1, -1), pi.shape)
+    return compute_metrics(
+        V, c, pi, V_cf, c_cf, pi_cf,
+        Vw_pinn=Vw, Vww_pinn=Vww, Vw_cf=Vw_cf, Vww_cf=Vww_cf,
+    )
 
 
 def eval_fulldim_test_metrics(
@@ -1949,11 +2232,7 @@ def eval_fulldim_test_metrics(
         y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
         y_np = y_lo + u_y * (y_hi - y_lo)
         w_np = np.exp(y_np)
-        V, c, pi = eval_model_on_points(value_net, t_np, w_np)
-        V_cf = closed_form_V(t_np, w_np)
-        c_cf = closed_form_c(t_np, w_np)
-        pi_cf = np.broadcast_to(pi_star_np.reshape(1, -1), pi.shape)
-        output[float(margin)] = compute_metrics(V, c, pi, V_cf, c_cf, pi_cf)
+        output[float(margin)] = eval_metrics_on_points(value_net, t_np, w_np)
     return output
 
 def plot_convergence(results: Dict, save_path: str | None = None, show: bool = True):
@@ -2118,10 +2397,16 @@ def plot_comparison_heatmaps(
 # 11) Main
 # =============================================================================
 def main():
+    # Timing runs must suppress final figures automatically; persisting the
+    # effective flag lets the E8 aggregator verify that evaluation peak memory
+    # was not contaminated by plotting allocations.
+    ARGS.skip_figures_requested = bool(ARGS.skip_figures)
+    ARGS.skip_figures = bool(
+        ARGS.skip_figures or ARGS.skip_plots or ARGS.timing_mode)
     out_dir = os.path.join(ARGS.output_root, ARGS.run_tag)
     weight_dir = ARGS.weight_root or os.path.join(out_dir, "weights")
     recorder = mxu.ExperimentRecorder(out_dir, weight_dir, ARGS)
-    skip_figures = bool(ARGS.skip_figures or ARGS.skip_plots)
+    skip_figures = bool(ARGS.skip_figures)
     metrics_final_path = recorder.metrics_csv
     if ARGS.eval_only and not ARGS.skip_eval:
         recorder.metrics_csv = metrics_final_path + ".eval_tmp"
@@ -2248,9 +2533,12 @@ def main():
                     "timestamp", "model_type", "run_tag", "outer_iter", "total_loss", "pde_loss",
                     "terminal_loss", "monotonicity_loss", "concavity_loss", "eta_loss", "train_pres",
                     "val_pde_rms", "val_terminal_rms", "val_pres", "val_pres_at_stop",
+                    "val_pres_at_stop_epoch",
                     "val_pres_post_restore", "achieved_pres", "inner_epochs_used", "n_resamples", "target_reached",
-                    "sel_best_pres", "sel_best_epoch", "sel_best_lr", "sel_checks", "sel_stopped",
-                    "sel_restored", "lr_end_before_restore", "lr_best_checkpoint", "lr_after_restore",
+                    "target_reached_post_restore", "training_target_crossed",
+                    "sel_best_pres", "sel_best_qres_pres", "sel_best_epoch", "sel_best_lr",
+                    "sel_checks", "sel_eligible_checks", "sel_ineligible_checks", "sel_stopped",
+                    "sel_restored", "q_sel_seed", "lr_end_before_restore", "lr_best_checkpoint", "lr_after_restore",
                     "lr_carried_next", "pi_diff", "c_diff", "pi_vs_closed_form", "c_vs_closed_form",
                     "control_metric_scope", "control_metric_points",
                     "e_V_sup", "e_bundle_sup", "e_Xev", "diag_RelL2_V", "diag_RelL2_pi",
@@ -2273,7 +2561,26 @@ def main():
                     "stopped_early", elapsed_sec=elapsed,
                     final_weight_path=os.path.join(weight_dir, "value_net_final.pt"),
                     train_gpu_peak_mem_bytes=train_gpu_peak,
+                    pres_target=ARGS.pres_target, pres_max=results["pres_max"],
+                    any_target_reached=bool(results["target_reached"]),
+                    target_reached=bool(results["all_targets_reached"]),
+                    target_reached_semantics=(
+                        "all_outer_post_restore_fixed_qres_at_or_below_target"
+                    ),
+                    any_training_target_crossed=bool(
+                        results["training_target_crossed"]),
+                    training_target_crossed=bool(
+                        results["all_training_targets_crossed"]),
+                    training_target_crossed_semantics=(
+                        "all_outer_training_time_fixed_qres_crossings_before_restore"
+                    ),
+                    pres_max_semantics="max_outer_post_restore_fixed_qres",
                     policy_bounds_mode=policy_bounds_mode,
+                    initial_policy_diffusion_variance_analytic=(
+                        ARGS.initial_policy_diffusion_variance_analytic),
+                    initial_policy_degenerate=ARGS.initial_policy_degenerate,
+                    initial_policy_degeneracy_tolerance=(
+                        ARGS.initial_policy_degeneracy_tolerance),
                     **results.get("checkpoint_provenance", {}),
                     **results.get("stop_info", {}))
                 print("[early-stop] training stopped; evaluation and success marker skipped.")
@@ -2318,13 +2625,24 @@ def main():
                     pres_target=ARGS.pres_target, pres_max=results["pres_max"],
                     any_target_reached=bool(results["target_reached"]),
                     target_reached=bool(results["all_targets_reached"]),
-                    target_reached_semantics="all_outer_training_validation_crossings",
+                    target_reached_semantics="all_outer_post_restore_fixed_qres_at_or_below_target",
+                    any_training_target_crossed=bool(results["training_target_crossed"]),
+                    training_target_crossed=bool(results["all_training_targets_crossed"]),
+                    training_target_crossed_semantics=(
+                        "all_outer_training_time_fixed_qres_crossings_before_restore"
+                    ),
+                    pres_max_semantics="max_outer_post_restore_fixed_qres",
                     train_gpu_peak_mem_bytes=train_gpu_peak,
                     policy_bounds_mode=policy_bounds_mode,
                     policy_pi_min=pi_min_bound, policy_pi_max=pi_max_bound,
                     policy_kappa_min=kappa_min_bound,
                     policy_kappa_max=kappa_max_bound,
                     policy_c_min=c_min_bound, policy_c_max=c_max_bound,
+                    initial_policy_diffusion_variance_analytic=(
+                        ARGS.initial_policy_diffusion_variance_analytic),
+                    initial_policy_degenerate=ARGS.initial_policy_degenerate,
+                    initial_policy_degeneracy_tolerance=(
+                        ARGS.initial_policy_degeneracy_tolerance),
                     **results.get("checkpoint_provenance", {}))
             return
 
@@ -2337,11 +2655,12 @@ def main():
         else:
             metrics_by_margin = {}
             for margin in margins:
-                tt, ww, V_pred, c_pred, pi_pred, _ = eval_pinn_on_grid_margin(
-                    solver.value_net, Nt=Nt, Nw=Nw, margin=margin)
-                V_cf, c_cf, pi_cf = closed_form_numpy(tt, ww)
-                metrics_by_margin[float(margin)] = compute_metrics(
-                    V_pred, c_pred, pi_pred, V_cf, c_cf, pi_cf)
+                y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
+                t_vals = np.linspace(t_min, t_max - 1e-3, Nt)
+                w_vals = np.exp(np.linspace(y_lo, y_hi, Nw))
+                tt, ww = np.meshgrid(t_vals, w_vals, indexing="ij")
+                metrics_by_margin[float(margin)] = eval_metrics_on_points(
+                    solver.value_net, tt, ww)
 
         metric_rows = []
         for margin in margins:
@@ -2403,7 +2722,13 @@ def main():
                 total_inner_steps=results["total_inner_steps"],
                 any_target_reached=bool(results["target_reached"]),
                 target_reached=bool(results["all_targets_reached"]),
-                target_reached_semantics="all_outer_training_validation_crossings",
+                target_reached_semantics="all_outer_post_restore_fixed_qres_at_or_below_target",
+                any_training_target_crossed=bool(results["training_target_crossed"]),
+                training_target_crossed=bool(results["all_training_targets_crossed"]),
+                training_target_crossed_semantics=(
+                    "all_outer_training_time_fixed_qres_crossings_before_restore"
+                ),
+                pres_max_semantics="max_outer_post_restore_fixed_qres",
                 pi_init_scale=float(ARGS.pi_init_scale),
                 pi_clip_abs=pi_clip_abs,
                 policy_bounds_mode=policy_bounds_mode,
@@ -2413,6 +2738,11 @@ def main():
                 policy_c_min=c_min_bound, policy_c_max=c_max_bound,
                 diffusion_var_min_init=first_outer.get("diffusion_var_min_frozen", ""),
                 diffusion_var_max_init=first_outer.get("diffusion_var_max_frozen", ""),
+                initial_policy_diffusion_variance_analytic=(
+                    ARGS.initial_policy_diffusion_variance_analytic),
+                initial_policy_degenerate=ARGS.initial_policy_degenerate,
+                initial_policy_degeneracy_tolerance=(
+                    ARGS.initial_policy_degeneracy_tolerance),
                 train_gpu_peak_mem_bytes=train_gpu_peak,
                 eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins,
                 **results.get("checkpoint_provenance", {}))

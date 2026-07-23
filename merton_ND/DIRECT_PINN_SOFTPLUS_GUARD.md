@@ -57,11 +57,28 @@ the baseline guard values in the launcher itself.
 The active mode, temperatures, and raw sign-violation fractions are written to
 `config.json`, `train_history.csv`, and `outer_history.csv`.
 
+## Direct-PINN scheduler held-out contract
+
+`ReduceLROnPlateau` is driven only by the fixed held-out selection score
+
+\[
+s_{\rm sel}=\operatorname{RMS}_{Q_{\rm sel}}(r)
+ +\operatorname{RMS}_{\rm terminal}(\eta).
+\]
+
+It is evaluated every `val_every` optimizer steps. `scheduler_patience` is
+therefore measured in **Q_sel checks**, not stochastic training steps. The
+optional `pres_target` continues to use a distinct fixed set (Q_{\rm res});
+its score is never sent to the scheduler.
+
+Both sets use `val_points` and `val_terminal_points`. Their RNG streams are
+deterministic for a fixed market seed: `Q_res` uses `market_seed`, while
+`Q_sel` uses `market_seed + 1000003`. The roles, seeds, score formula, check
+count, and last selection score are recorded in `config.json` and
+`status.json`; selection scores also appear in the two history CSVs.
+
 ## Deliberately unchanged
 
 - The auxiliary eta penalty still uses its historical `abs(V_y)` denominator.
 - Evaluation-only FOC policy extraction still uses one-sided hard clamps.
 - PI-PINN and exact-map policy guards remain one-sided hard clamps.
-- The direct PINN plateau scheduler still observes training total loss.  Moving
-  it to a fixed held-out score requires a separate cadence/patience change and
-  is not part of this guard-only variant.

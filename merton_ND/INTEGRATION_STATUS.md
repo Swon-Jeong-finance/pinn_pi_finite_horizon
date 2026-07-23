@@ -1,72 +1,143 @@
-# Merton exact-map integration status
+# Merton integration status
 
-The exact-map pipeline is integrated with the current Merton PI-PINN trainer
-and launcher in this package.
+The current package covers the training-time changes and the paper-facing
+post-processing requested for the Merton experiment.
 
-## Integrated contract
+## Training contract
 
-- `tune_merton.sh` applies global overrides, gives per-run overrides higher
-  precedence, supports boolean `e3b_checkpoints`, honors `N_ASSETS_LIST`, and
-  rejects duplicate resolved run tags.
-- `merton_nd_consumption_pi_pinn.py` records the `trainer-one-sided` /
-  `merton-logw-v1` policy contract, network metadata, resolved policy bounds,
-  full training arguments, trainer source hash, and `Sigma_inv_mu`.
-- E3b checkpoints are saved after optional held-out model+optimizer restore.
-  The manifest records outer `K` as paper source `K-1` and target policy `K`.
-- New same-tag training archives stale logs/checkpoints. A pre-existing shared
-  stop flag is checked before archive rotation.
-- The manifest and `status.json` expose file hashes and canonical tensor-state
-  hashes. The exact loader validates schedule, completion, per-checkpoint
-  provenance, and final/last/final-iterate state equality.
-- `merton_exact_map_fd.py` reproduces the current guarded/clipped greedy map,
-  solves the independent frozen-policy FD equation, applies the manuscript's
-  wealth-coordinate norm, audits grid/domain/boundary sensitivity, and
-  aggregates seedwise ratios.
-- The exact evaluation grid excludes the terminal face `t=T`, matching the
-  trainer's `[0,T)` convention. Paper aggregation retains every finite
-  checkpoint by default and carries an explicit ellipticity gate/summary.
+- Direct PINN uses a smooth one-sided HJB guard plus the existing sign/shape
+  penalties. Its plateau scheduler is driven only by a deterministic fixed
+  `Q_sel` score; the independent `Q_res` stream is reserved for target and
+  official residual reporting. The Q_sel rescue restores model+Adam, resets
+  the scheduler, and refreshes the batch. Its paper-launcher LR factor is
+  `1.0`, meaning no additional emergency LR multiplication while retaining
+  the non-increasing LR cap.
+- PI-PINN held-out selection restores model and Adam state together. When a
+  residual target is active, only checkpoints that meet that target on the
+  same fixed `Q_res` state are selection-eligible.
+- PI-PINN accepts `print_every_outer=0`: outer iterations 1--3 are still
+  printed, while later periodic outer-loop logging is disabled without a
+  modulo-by-zero path.
+- Official PI-PINN residuals and `target_reached` are measured after restore.
+  Training-time crossings are retained in separate diagnostic fields.
+- `policy_bounds_mode=stabilized` keeps the safety bounds and records all
+  activation fractions. `policy_bounds_mode=none` nulls every finite action
+  bound, including the portfolio box, while retaining derivative guards.
+- E1 records raw portfolio/consumption ranges, separate kappa and level-bound
+  activation, guard fractions, and min/max `pi.T Sigma pi` on fixed diagnostic
+  sets. CUDA training and evaluation peak allocation are written to status.
+- Official models are final iterates. Diagnostic-best states are never used as
+  the paper model.
 
-Required artifacts for a new paper-facing run are:
+## Post-processing contract
+
+- `postprocess_contraction.py`: empirical Figure 2 from outer 1--20
+  relative L2 Value/Policy errors, seed mean plus/minus one sample SD, no
+  `e_Xev` ratio or floor filter.
+- `postprocess_pipinn_figure1.py`: two-panel PI-PINN control convergence from
+  the four already-squared fixed-Q_ev control diagnostics, using pointwise
+  seed mean plus/minus one sample SD. Requested diagnostic points and realized
+  tensor-grid points are recorded separately; exact raw zeros are retained and
+  floored only for logarithmic display.
+- `evaluate_welfare.py`: total discounted consumption-plus-bequest objective,
+  optimal-MC denominator, CRN, CE0/WL, paired SEs, and seed t-intervals.
+  Seed discovery is non-prescriptive by default; an explicit
+  `--expected-seeds` list enables exact-set validation and `--min-seeds`
+  independently controls the minimum selected panel size.
+- `merton_exact_map_fd.py`: independent FD exact-map ratio, kept separate from
+  Figure 2. It uses the manuscript wealth-coordinate norm and audits numerical
+  grid/domain/boundary sensitivity. Its aggregate artifacts are named
+  `exact_map_ratio_summary.csv` and `exact_map_contraction.<format>`; seed-set
+  validation is opt-in and the independent minimum defaults to two seeds.
+- The exact-map loader resolves legacy relative checkpoint paths against the
+  launch `cwd` recorded in `config.json`. Its public self-test now includes a
+  nonoptimal constant-proportional frozen policy with non-unit bequest, so
+  source/drift signs and time orientation are checked independently of the
+  optimal-policy formula.
+- The FD paper primary is the homogeneous CRRA Robin closure. The retained
+  `exact-dirichlet` CLI label is explicitly metadata-labelled as an
+  optimal-reference Dirichlet sensitivity audit, not an exact boundary oracle
+  for a nonoptimal neural policy.
+- E4 now includes `delta_0` from the configured initial policy and every
+  adjacent `delta_n`, saves hash-verified evaluated bundles, and attaches each
+  defect to outer `n+1`'s official post-restore residual. A separate
+  `exact_map_defect_refinement.csv` recomputes the defects across FD
+  grid/domain/boundary variants; paper aggregation requires passing evidence
+  for delta0, first/last adjacent, and the worst defect.
+- `postprocess_regularity_transfer.py` requires checkpoints 1--N and defect
+  indices 0--N-1, rejects mixed FD protocols and legacy residual semantics,
+  rejects mixed primary evaluation windows or eval-only relabelling, and
+  reports `p_hat_X`, its residual scaling, and `C_num`.
+- `aggregate_e6.py` uses final `e_Xev` as primary and RelL2 control errors as
+  secondary. It recomputes `pres_max` from post-restore outer history and
+  refuses a missing/nonfinite final diagnostic. Training-time `e_Xev` uses
+  only raw config/status margin provenance; guarded eval-only overlays are
+  confined to final `metrics.csv` values, and mixed provenance is fatal. It
+  preserves the non-pooled scatter/geometric-mean/fitted-slope figure and
+  additionally writes the manuscript-style target mean plus/minus sample-SD
+  figure with a slope-one reference. `settings.csv` exposes `N`, outer budget,
+  and the full target-independent configuration; `--outer-iters` selects a
+  paper panel.
+- `aggregate_compute.py` turns successful clean timing-mode runs into the E8
+  compute table and error-versus-wall-clock/steps/memory figures. It requires
+  the four named status measurements, exact primary-margin `metrics.csv`
+  errors, canonical market/config panels, and never backfills `e_Xev` from
+  outer-history diagnostics.
+  Outer-20 and outer-30 timing budgets remain separate settings.
+- Direct PINN and PI-PINN use the shared `merton_evaluation_metrics.py`
+  formulas at every configured evaluation margin. E9 records value,
+  wealth-coordinate derivative-bundle `(V_w,V_ww)`, and control errors;
+  `aggregate_seeds.py --e9-margins 0.05,0.10,0.20,0.30` creates the strict
+  nested-window `summary_e9.csv` paper table while the long table retains all
+  configured margins.
+- Seed aggregation remains configuration-strict by default. The explicit
+  `--merge-config-groups` recovery option combines split groups only within a
+  common method/N/M cell, keeps newest-run deduplication and market/metric
+  validation, and records every source group/configuration for audit.
+
+## Checkpoint rule
+
+For complete E4 evidence train with:
 
 ```text
-run/config.json
-run/market_params.npz
-run/status.json
-weights/checkpoint_manifest.json
-weights/value_net_final.pt
-weights/value_net_last.pt
-weights/iterates/value_net_iterNNNN.pt
+e3b_checkpoints=false
+save_iterate_every=1
 ```
 
-## Validation performed in this workspace
+The sparse E3b schedule is still supported for exploratory exact-map ratios,
+but cannot be described as `max_n` E4 evidence.
 
-- Python compile checks passed for trainer, utility, policy, FD core, driver,
-  and test modules.
+## Validation in this workspace
+
+- Auxiliary regression files live under `auxiliary_tests/`; the source root
+  contains only experiment, evaluation, aggregation, and documentation files.
+  Run them from this directory with
+  `python3 -m unittest discover -s auxiliary_tests -t . -p 'test_*.py' -q`.
+- Python compilation passed for trainers and all post-processors.
 - `bash -n tune_merton.sh` passed.
-- Launcher dry-runs verified E3b boolean propagation, global/per-run override
-  precedence, `N_ASSETS_LIST` filtering, and duplicate-tag rejection.
-- The exact-map unit suite contains 17 tests. In the lightweight environment,
-  12 CPU tests pass and 5 Torch-only parity/provenance tests are skipped because
-  PyTorch is not installed.
-- The independent FD self-test passes; the 161/81 wealth-norm error ratio is
-  approximately `0.0818`.
+- `tune_merton.sh` exports `PYTHONUNBUFFERED=1`, so redirected Python training
+  logs are flushed without waiting for a large I/O buffer.
+- 144 tests were discovered: 138 passed and 6 Torch-only checkpoint/parity
+  tests were skipped because PyTorch is unavailable in this environment.
+- The PyTorch-free FD manufactured refinement self-tests passed for both the
+  optimal policy (`fine/coarse X-error = 0.0818`) and an independent
+  nonoptimal constant-proportional policy (`0.2040`).
+- The user-approved `tune_merton.sh` baseline and active run list are protected
+  by a regression snapshot test; a two-job `/bin/true` launcher dry-run passed.
+- Figure PNG/EPS rendering, manufactured FD checks, welfare objective oracles,
+  and deterministic optimal-discretization convergence were exercised.
 
-## Remaining run-time checks
+## Required training-environment checks
 
-No production checkpoint was trained or differentiated in this lightweight
-environment. Before treating Figure 2 as final, run the Torch parity tests in
-the training environment, then inspect each exact-map output for:
+Before the main paper sweep or post-processing, run the complete test suite in
+the Torch environment and execute one small real-checkpoint smoke for:
 
-- a complete manifest and successful training marker;
-- nonzero guard/clip activation fractions and the resulting `map_variant`;
-- positive frozen diffusion variance over the sampled FD/evaluation domains;
-- passed grid/domain/boundary sensitivity on every regular checkpoint;
-- a defined denominator and stable ratio under the requested numerical
-  variants;
-- a sampled diffusion-variance minimum above the declared ellipticity
-  tolerance.
+1. PI-PINN target-eligible restore and post-restore `Q_res`;
+2. exact-map `delta_0` plus one adjacent defect bundle;
+3. welfare policy reconstruction and CRN simulation;
+4. Figure 2 discovery against a real 10-seed output tree.
 
-The FD calculation is finite-domain evidence. Even a passed sensitivity audit
-does not certify a whole-space contraction theorem, and the wealth-coordinate
-second-derivative norm can have a more demanding numerical floor near small
-wealth than the former log-coordinate diagnostic.
+FD results remain finite-domain numerical evidence, not a proof of a
+whole-space contraction theorem. The exact-map defect table currently labels
+its `delta_X` values as primary-grid measurements; the exact-ratio sensitivity
+audit is not silently reused as a defect-specific error bound.

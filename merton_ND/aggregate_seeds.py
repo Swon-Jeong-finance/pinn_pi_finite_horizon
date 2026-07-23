@@ -4,6 +4,7 @@ Usage:
     python3 aggregate_seeds.py --out-root <OUT_ROOT>
     python3 aggregate_seeds.py --out-root <OUT_ROOT> --include-stopped
     python3 aggregate_seeds.py --out-root <OUT_ROOT> --output <dir>
+    python3 aggregate_seeds.py --out-root <OUT_ROOT> --merge-config-groups
 
 The script walks OUT_ROOT for run directories (anything containing a
 config.json written by ExperimentRecorder plus a metrics.csv), groups runs
@@ -16,12 +17,18 @@ The 95% CI uses the Student-t critical value with df = n - 1 (scipy when
 available, a built-in t-table fallback otherwise), matching the paper
 protocol "mean +- std over seeds; 95% CIs in the supplementary material".
 
+``--merge-config-groups`` is an explicit recovery mode for sweeps that were
+resumed under slightly different recorded configurations.  In that mode,
+full configuration hashes are retained as provenance, while aggregation is
+performed per (model_type, n_assets, m_states) panel.
+
 Outputs (under <OUT_ROOT>/seed_summary by default):
     runs_index.csv        every run found, with status and group hash
     groups.json           group hash -> shared configuration
     summary_long.csv      one row per (group, model_type, eval_margin, metric)
     summary_headline.csv  compact table of headline metrics with
                           "mean +- std" and "[ci_lo, ci_hi]" strings
+    summary_e9.csv        paper-ready nested-window value/bundle/control table
 
 This file is standalone on purpose: it does not import torch or the
 training scripts, so it can run on any machine that has the outputs.
@@ -32,7 +39,7 @@ import argparse
 import csv
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 import os
 import re
@@ -69,9 +76,20 @@ GROUP_IGNORE_KEYS = {
 
 HEADLINE_METRICS = [
     "RelL2_V",
+    "RelL2_D",
     "RelL2_pi",
     "RelL2_c",
 ]
+
+# E9 is the nested-window sensitivity table.  D=(V_w,V_ww) is the reduced
+# wealth-coordinate bundle; the Merton benchmark has no V_wx component.
+E9_METRICS = (
+    "RelL2_V",
+    "RelL2_D",
+    "e_D_sup",
+    "RelL2_pi",
+    "RelL2_c",
+)
 
 # Canonical economic snapshot shared by direct PINN and PI-PINN.  ``seed``
 # is deliberately excluded: it is training randomness, not part of the
@@ -201,6 +219,22 @@ def _overlay_eval_config(run_dir: str, args: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def parse_float_spec(text: str, *, label: str) -> List[float]:
+    out: List[float] = []
+    for token in re.split(r"[\s,]+", str(text or "").strip()):
+        if not token:
+            continue
+        try:
+            value = float(token)
+        except ValueError as exc:
+            raise ValueError(f"{label}: invalid number {token!r}") from exc
+        if not math.isfinite(value) or value < 0.0 or value >= 0.5:
+            raise ValueError(f"{label}: margins must be finite and in [0,0.5): {value}")
+        if not any(math.isclose(value, seen, rel_tol=0.0, abs_tol=1e-12) for seen in out):
+            out.append(value)
+    return out
+
+
 def run_updated_at(run_dir: str) -> str:
     """status.json updated_at (fallback: config.json mtime) for rerun dedup."""
     path = os.path.join(run_dir, "status.json")
@@ -212,8 +246,10 @@ def run_updated_at(run_dir: str) -> str:
     except Exception:
         pass
     try:
-        return datetime.utcfromtimestamp(
-            os.path.getmtime(os.path.join(run_dir, "config.json"))).isoformat()
+        return datetime.fromtimestamp(
+            os.path.getmtime(os.path.join(run_dir, "config.json")),
+            tz=timezone.utc,
+        ).isoformat()
     except Exception:
         return ""
 
@@ -333,6 +369,41 @@ def as_int(value: Any) -> Optional[int]:
         return None
 
 
+def aggregation_panel_key(args: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Return a stable merge panel keyed only by method, N, and M.
+
+    The explicit field set is intentionally narrow.  In particular, a panel
+    can never combine different methods, risky-asset dimensions, or
+    PDE-state dimensions, even when ``--merge-config-groups`` is enabled.
+    Integer-like strings are normalized so ``"10"`` and ``10`` describe the
+    same dimension.
+    """
+    def _positive_int(field: str) -> int:
+        value = args.get(field)
+        if isinstance(value, bool):
+            raise ValueError(f"{field} must be a positive integer, got {value!r}")
+        parsed = as_int(value)
+        if parsed is None or parsed <= 0:
+            raise ValueError(f"{field} must be a positive integer, got {value!r}")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError(f"{field} must be a positive integer, got {value!r}")
+        return parsed
+
+    model_type = str(args.get("model_type", "")).strip()
+    if not model_type:
+        raise ValueError("model_type must be non-empty")
+    n_assets = _positive_int("n_assets")
+    m_states = _positive_int("m_states")
+    core = {
+        "model_type": model_type,
+        "n_assets": n_assets,
+        "m_states": m_states,
+    }
+    canon = json.dumps(core, sort_keys=True, default=str)
+    digest = hashlib.sha1(canon.encode("utf-8")).hexdigest()[:12]
+    return f"panel_{digest}", core
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Aggregate per-seed metrics into mean/std/95% CI tables.")
     ap.add_argument("--out-root", type=str, required=True, help="Sweep output root (the OUT_ROOT of tune_merton.sh).")
@@ -359,20 +430,45 @@ def main() -> None:
     ap.add_argument(
         "--strict-market-snapshots", action="store_true",
         help="Require one canonical market hash across methods/seeds within each N. "
-             "Enabled automatically by --expected-seeds.",
+             "Enabled automatically by --expected-seeds or "
+             "--merge-config-groups.",
+    )
+    ap.add_argument(
+        "--merge-config-groups", action="store_true",
+        help=(
+            "Opt in to aggregating different configuration hashes together "
+            "within each (model_type, n_assets, m_states) panel. Full source "
+            "hashes remain recorded in runs_index.csv and groups.json."
+        ),
     )
     ap.add_argument("--headline-margin", type=float, default=0.10)
+    ap.add_argument(
+        "--e9-margins", type=str, default="",
+        help=(
+            "Optional exact E9 margin set to require and retain in summary_e9.csv, "
+            "e.g. 0.05,0.10,0.20,0.30. Empty keeps every evaluated margin."
+        ),
+    )
     args = ap.parse_args()
 
     expected_seeds = set(parse_seed_spec(args.expected_seeds))
     expected_n_assets = set(parse_int_spec(args.expected_n_assets, label="--expected-n-assets"))
     expected_m_states = set(parse_int_spec(args.expected_m_states, label="--expected-m-states"))
     expected_models = {x.strip() for x in args.expected_models.split(",") if x.strip()}
-    strict_market = bool(args.strict_market_snapshots or expected_seeds)
+    requested_e9_margins = parse_float_spec(args.e9_margins, label="--e9-margins")
+    strict_market = bool(
+        args.strict_market_snapshots or expected_seeds or args.merge_config_groups
+    )
 
     out_root = os.path.abspath(args.out_root)
     summary_dir = args.output or os.path.join(out_root, "seed_summary")
     os.makedirs(summary_dir, exist_ok=True)
+    if args.merge_config_groups:
+        print(
+            "[warn] --merge-config-groups is active: configuration hashes are "
+            "being combined within each model_type x n_assets x m_states panel; "
+            "source hashes remain in runs_index.csv and groups.json."
+        )
 
     accepted_status = {"success"}
     if args.include_stopped:
@@ -388,6 +484,7 @@ def main() -> None:
 
     runs_index_rows = []
     groups_config: Dict[str, str] = {}
+    aggregation_panels: Dict[str, Dict[str, Any]] = {}
     # values[(group, model_type, eval_margin, metric)] ->
     #     list of (seed, value, selected-run timestamp)
     values: Dict[Tuple[str, str, float, str], List[Tuple[Any, float, str]]] = defaultdict(list)
@@ -412,8 +509,69 @@ def main() -> None:
         ghash_train, canon_train = group_key(raw_cfg)
         groups_config.setdefault(ghash_train, canon_train)
         group_dims.setdefault(ghash_train, (raw_cfg.get("n_assets"), raw_cfg.get("m_states")))
-        model_type = str(cfg.get("model_type", ""))
+        if args.merge_config_groups:
+            try:
+                aggregate_group, panel_core = aggregation_panel_key(cfg)
+                aggregate_group_train, panel_core_train = aggregation_panel_key(raw_cfg)
+            except ValueError as exc:
+                raise SystemExit(
+                    f"--merge-config-groups: invalid panel identity in "
+                    f"{os.path.relpath(run_dir, out_root)}: {exc}"
+                ) from exc
+            # config_eval.json overlays are not permitted to change these
+            # identity fields. Keep the check explicit so an invalid artifact
+            # cannot silently cross an N/method/M panel boundary.
+            if aggregate_group != aggregate_group_train:
+                raise SystemExit(
+                    "--merge-config-groups: "
+                    f"run={os.path.relpath(run_dir, out_root)}: training/evaluation "
+                    f"panel mismatch ({panel_core_train!r} vs {panel_core!r})"
+                )
+            group_dims.setdefault(
+                aggregate_group,
+                (panel_core["n_assets"], panel_core["m_states"]),
+            )
+            group_dims.setdefault(
+                aggregate_group_train,
+                (panel_core_train["n_assets"], panel_core_train["m_states"]),
+            )
+            panel_meta = aggregation_panels.setdefault(
+                aggregate_group,
+                {
+                    **panel_core,
+                    "source_training_groups": set(),
+                    "source_evaluation_groups": set(),
+                },
+            )
+            panel_meta["source_training_groups"].add(ghash_train)
+            panel_meta["source_evaluation_groups"].add(ghash)
+        else:
+            aggregate_group = ghash
+            aggregate_group_train = ghash_train
+            panel_core = {
+                "n_assets": cfg.get("n_assets"),
+                "m_states": cfg.get("m_states"),
+            }
+        model_type = (
+            str(panel_core["model_type"])
+            if args.merge_config_groups
+            else str(cfg.get("model_type", ""))
+        )
         seed = cfg.get("seed")
+        if args.merge_config_groups:
+            parsed_seed = as_int(seed)
+            if (
+                isinstance(seed, bool)
+                or parsed_seed is None
+                or (isinstance(seed, float) and not seed.is_integer())
+            ):
+                raise SystemExit(
+                    "--merge-config-groups: invalid integer seed in "
+                    f"{os.path.relpath(run_dir, out_root)}: {seed!r}"
+                )
+            # A single normalized identity makes seed=1 and seed="1" obey the
+            # same panel-wide newest-run selection rule.
+            seed = parsed_seed
         market_path = os.path.join(run_dir, "market_params.npz")
         market_hash = ""
         market_error = ""
@@ -425,11 +583,13 @@ def main() -> None:
         runs_index_rows.append({
             "run_dir": os.path.relpath(run_dir, out_root),
             "updated_at": run_updated_at(run_dir),
-            "group_train": ghash_train,
-            "group": ghash,
+            "group_train": aggregate_group_train,
+            "group": aggregate_group,
+            "source_group_train": ghash_train,
+            "source_group": ghash,
             "model_type": model_type,
-            "n_assets": cfg.get("n_assets"),
-            "m_states": cfg.get("m_states"),
+            "n_assets": panel_core["n_assets"],
+            "m_states": panel_core["m_states"],
             "seed": seed,
             "status": status,
             # Set only after newest-per-(training group, method, seed)
@@ -439,7 +599,13 @@ def main() -> None:
             "market_error": market_error,
         })
 
-    # ---- success rates per (group, model_type), on UNIQUE SEEDS: the same
+    # ---- success rates per (aggregation group, model_type), on UNIQUE SEEDS:
+    #      in merge mode, duplicate seeds across source hashes are reruns in
+    #      one N/method/M panel and therefore participate in one newest-run
+    #      selection.
+    #
+    #      In the default mode, aggregation group == the original group hash,
+    #      preserving the historical behavior exactly. The same
     #      seed rerun keeps only its NEWEST run's status, so a failed old
     #      attempt followed by a successful rerun counts as 1/1, not 1/2.
     #      Divergence-stop censoring is reported, never silently dropped ----
@@ -470,6 +636,12 @@ def main() -> None:
         if row["status"] not in accepted_status:
             continue
         row["used"] = 1
+        if args.merge_config_groups:
+            panel_meta = aggregation_panels[row["group"]]
+            panel_meta.setdefault("selected_source_training_groups", set()).add(
+                row["source_group_train"])
+            panel_meta.setdefault("selected_source_evaluation_groups", set()).add(
+                row["source_group"])
         run_dir = os.path.join(out_root, str(row["run_dir"]))
         market_rows.append({
             "run_dir": row["run_dir"], "model_type": row["model_type"],
@@ -546,9 +718,9 @@ def main() -> None:
                 if mm == model
                 and as_int(group_dims.get(group, (None, None))[0]) == n_assets
             ]
-            if len(matching) != 1:
+            if not matching:
                 validation_errors.append(
-                    f"expected exactly one group for model={model}, N={n_assets}; "
+                    f"expected at least one group for model={model}, N={n_assets}; "
                     f"found {matching}"
                 )
 
@@ -598,38 +770,61 @@ def main() -> None:
                 if mm == model
                 and as_int(group_dims.get(group, (None, None))[0]) == n_assets
             }
-            if len(candidate_groups) != 1:
+            if not candidate_groups:
                 validation_errors.append(
-                    f"headline model={model}, N={n_assets}: expected one group, "
+                    f"headline model={model}, N={n_assets}: expected at least one group, "
                     f"found {sorted(candidate_groups)}"
                 )
                 continue
-            train_group = next(iter(candidate_groups))
-            eval_groups = eval_groups_by_train.get((train_group, model), set())
-            if len(eval_groups) != 1:
-                validation_errors.append(
-                    f"headline training-group={train_group} model={model}, N={n_assets}: "
-                    f"expected one common evaluation configuration, found {sorted(eval_groups)}"
-                )
-                continue
-            group = next(iter(eval_groups))
-            for metric in HEADLINE_METRICS:
-                matches = [
-                    pairs for (gg, mm, margin, name), pairs in values.items()
-                    if gg == group and mm == model and name == metric
-                    and math.isclose(float(margin), float(args.headline_margin),
-                                     rel_tol=0.0, abs_tol=1e-12)
-                ]
-                if len(matches) != 1:
+            for train_group in sorted(candidate_groups):
+                eval_groups = eval_groups_by_train.get((train_group, model), set())
+                if len(eval_groups) != 1:
                     validation_errors.append(
-                        f"headline group={group} model={model}, N={n_assets}: "
-                        f"missing/ambiguous {metric} at margin={args.headline_margin:g}"
+                        f"headline training-group={train_group} model={model}, N={n_assets}: "
+                        f"expected one common evaluation configuration, found "
+                        f"{sorted(eval_groups)}"
                     )
-                elif {int(seed) for seed, _value, _ts in matches[0]} != expected_seeds:
-                    validation_errors.append(
-                        f"headline group={group} model={model}, N={n_assets}, metric={metric}: "
-                        "incomplete seed set"
-                    )
+                    continue
+                group = next(iter(eval_groups))
+                for metric in HEADLINE_METRICS:
+                    matches = [
+                        pairs for (gg, mm, margin, name), pairs in values.items()
+                        if gg == group and mm == model and name == metric
+                        and math.isclose(float(margin), float(args.headline_margin),
+                                         rel_tol=0.0, abs_tol=1e-12)
+                    ]
+                    if len(matches) != 1:
+                        validation_errors.append(
+                            f"headline group={group} model={model}, N={n_assets}: "
+                            f"missing/ambiguous {metric} at margin={args.headline_margin:g}"
+                        )
+                    elif {int(seed) for seed, _value, _ts in matches[0]} != expected_seeds:
+                        validation_errors.append(
+                            f"headline group={group} model={model}, N={n_assets}, "
+                            f"metric={metric}: incomplete seed set"
+                        )
+
+    # When paper E9 margins are explicitly requested, require every selected
+    # method/configuration to carry the full value/bundle/control schema at
+    # each margin.  The generic summary still retains all margins by default.
+    if requested_e9_margins:
+        eval_group_models = sorted({
+            (group, model) for group, model, _margin, _metric in values
+        })
+        for group, model in eval_group_models:
+            for margin in requested_e9_margins:
+                for metric in E9_METRICS:
+                    matches = [
+                        pairs for (gg, mm, observed_margin, name), pairs in values.items()
+                        if gg == group and mm == model and name == metric
+                        and math.isclose(float(observed_margin), margin,
+                                         rel_tol=0.0, abs_tol=1e-12)
+                    ]
+                    if len(matches) != 1:
+                        validation_errors.append(
+                            f"E9 group={group} model={model}: missing/ambiguous "
+                            f"{metric} at margin={margin:g}"
+                        )
 
     error_path = os.path.join(summary_dir, "validation_errors.txt")
     if validation_errors:
@@ -660,10 +855,14 @@ def main() -> None:
     # ---- runs_index.csv ----
     idx_path = os.path.join(summary_dir, "runs_index.csv")
     with open(idx_path, "w", encoding="utf-8", newline="") as f:
-        wtr = csv.DictWriter(f, fieldnames=[
+        index_fields = [
             "run_dir", "updated_at", "group_train", "group", "model_type",
             "n_assets", "m_states", "seed", "status", "used",
-            "market_hash", "market_error"])
+            "market_hash", "market_error",
+        ]
+        if args.merge_config_groups:
+            index_fields[4:4] = ["source_group_train", "source_group"]
+        wtr = csv.DictWriter(f, fieldnames=index_fields, extrasaction="ignore")
         wtr.writeheader()
         for row in runs_index_rows:
             wtr.writerow(row)
@@ -678,8 +877,37 @@ def main() -> None:
             wtr.writerow(row)
 
     # ---- groups.json ----
+    groups_payload: Dict[str, Any] = {
+        h: json.loads(c) for h, c in groups_config.items()
+    }
+    if args.merge_config_groups:
+        panels_payload: Dict[str, Dict[str, Any]] = {}
+        for panel, metadata in sorted(aggregation_panels.items()):
+            panel_payload = {
+                key: sorted(value) if isinstance(value, set) else value
+                for key, value in metadata.items()
+            }
+            source_ids = sorted(set(
+                panel_payload["source_training_groups"]
+            ) | set(panel_payload["source_evaluation_groups"]))
+            panel_payload.update({
+                "aggregation_mode": "model_type+n_assets+m_states",
+                "source_group_configs": {
+                    source: json.loads(groups_config[source])
+                    for source in source_ids
+                },
+            })
+            panels_payload[panel] = panel_payload
+            # Make the group identifier used by summary_*.csv directly
+            # resolvable while retaining every original hash/config entry.
+            groups_payload[panel] = panel_payload
+        groups_payload["_aggregation"] = {
+            "merge_config_groups": True,
+            "panel_key_fields": ["model_type", "n_assets", "m_states"],
+            "panel_ids": sorted(panels_payload),
+        }
     with open(os.path.join(summary_dir, "groups.json"), "w", encoding="utf-8") as f:
-        json.dump({h: json.loads(c) for h, c in groups_config.items()}, f, indent=2, sort_keys=True)
+        json.dump(groups_payload, f, indent=2, sort_keys=True)
 
     # ---- summary_long.csv ----
     long_path = os.path.join(summary_dir, "summary_long.csv")
@@ -751,6 +979,71 @@ def main() -> None:
                 "mean_pm_std": pm, "ci95": ci,
             })
 
+    # ---- summary_e9.csv (nested-window value/bundle/control view) ----
+    # summary_long.csv remains the lossless long table.  This pivot exists so
+    # the supplement's E9 table can be consumed directly without hand-joining
+    # metrics.  Empty --e9-margins keeps every configured evaluation window.
+    e9_path = os.path.join(summary_dir, "summary_e9.csv")
+    e9_index: Dict[Tuple[Any, ...], Dict[str, Dict[str, Any]]] = defaultdict(dict)
+    for row in long_rows:
+        if row["metric"] not in E9_METRICS:
+            continue
+        margin = float(row["eval_margin"])
+        if requested_e9_margins and not any(
+            math.isclose(margin, wanted, rel_tol=0.0, abs_tol=1e-12)
+            for wanted in requested_e9_margins
+        ):
+            continue
+        key = (
+            row["group"], row["model_type"], row["n_assets"],
+            row["m_states"], margin,
+        )
+        e9_index[key][row["metric"]] = row
+
+    e9_fields = [
+        "group", "model_type", "n_assets", "m_states", "eval_margin",
+        "n", "seeds",
+    ]
+    for metric in E9_METRICS:
+        e9_fields.extend([
+            f"{metric}_mean", f"{metric}_std",
+            f"{metric}_ci95_lo", f"{metric}_ci95_hi",
+        ])
+    with open(e9_path, "w", encoding="utf-8", newline="") as f:
+        wtr = csv.DictWriter(f, fieldnames=e9_fields)
+        wtr.writeheader()
+        for key in sorted(e9_index, key=lambda item: (
+            str(item[0]), str(item[1]), str(item[2]), float(item[4])
+        )):
+            metric_rows = e9_index[key]
+            missing = [metric for metric in E9_METRICS if metric not in metric_rows]
+            if missing:
+                print(
+                    f"[warn] E9 group={key[0]} model={key[1]} "
+                    f"margin={key[4]:g}: missing {missing}; row omitted"
+                )
+                continue
+            counts = {str(metric_rows[metric]["n"]) for metric in E9_METRICS}
+            seed_sets = {str(metric_rows[metric]["seeds"]) for metric in E9_METRICS}
+            if len(counts) != 1 or len(seed_sets) != 1:
+                raise SystemExit(
+                    f"E9 group={key[0]} model={key[1]} margin={key[4]:g}: "
+                    "metric seed panels do not match"
+                )
+            first = metric_rows[E9_METRICS[0]]
+            out = {
+                "group": key[0], "model_type": key[1],
+                "n_assets": key[2], "m_states": key[3],
+                "eval_margin": key[4], "n": first["n"], "seeds": first["seeds"],
+            }
+            for metric in E9_METRICS:
+                source = metric_rows[metric]
+                out[f"{metric}_mean"] = source["mean"]
+                out[f"{metric}_std"] = source["std"]
+                out[f"{metric}_ci95_lo"] = source["ci95_lo"]
+                out[f"{metric}_ci95_hi"] = source["ci95_hi"]
+            wtr.writerow(out)
+
     n_groups = len({r["group"] for r in long_rows})
     print(f"[aggregate] runs found: {len(runs_index_rows)} | used: {n_used} | groups: {n_groups}")
     print(f"[aggregate] wrote: {idx_path}")
@@ -758,6 +1051,7 @@ def main() -> None:
     print(f"[aggregate] wrote: {market_path}")
     print(f"[aggregate] wrote: {long_path}")
     print(f"[aggregate] wrote: {head_path}")
+    print(f"[aggregate] wrote: {e9_path}")
 
 
 if __name__ == "__main__":

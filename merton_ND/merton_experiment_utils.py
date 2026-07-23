@@ -235,6 +235,7 @@ class ExperimentRecorder:
             "value_net_final.pt",
             "value_net_last.pt",
             "value_net_best_diag.pt",
+            "value_net_failed_last_admissible.pt",
         )
         for name in names:
             path = os.path.join(self.weight_dir, name)

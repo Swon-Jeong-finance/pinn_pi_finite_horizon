@@ -46,6 +46,7 @@ Author: derived from your uploaded scripts (no new theory introduced).
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import time
@@ -61,6 +62,42 @@ from matplotlib.colors import TwoSlopeNorm
 
 import market_setup  # keep as requested
 import merton_experiment_utils as mxu
+import merton_evaluation_metrics as mem
+
+
+# Direct PINN uses two fixed held-out streams with deliberately separate roles:
+# Q_res controls an optional p_res stopping target, while Q_sel alone drives
+# ReduceLROnPlateau and the same-metric emergency rollback. The offset is fixed
+# and recorded in config/status so the split is deterministic across training
+# seeds for a fixed market seed.
+DIRECT_PINN_QSEL_SEED_OFFSET = 1_000_003
+HELDOUT_SCORE_FORMULA = "RMS(PDE_residual)+RMS(terminal_error)"
+SCHEDULER_STATUS_FIELDS = (
+    "q_res_role", "q_res_seed", "q_sel_role", "q_sel_seed", "q_sel_active",
+    "heldout_score_formula", "scheduler_metric", "scheduler_patience_unit",
+    "scheduler_patience_checks",
+    "scheduler_check_every_optimizer_steps", "scheduler_checks",
+    "scheduler_lr_reductions", "sel_pde_rms_last",
+    "sel_terminal_rms_last", "sel_pres_last", "scheduler_score_last",
+    "sel_pres_best", "sel_check_epoch_last",
+)
+QSEL_ROLLBACK_STATUS_FIELDS = (
+    "qsel_rollback_active", "qsel_rollback_factor",
+    "qsel_rollback_lr_factor", "qsel_rollback_max_rescues",
+    "qsel_rollback_triggers", "qsel_rollback_rescues_used",
+    "qsel_rollback_scheduler_resets", "qsel_rollback_last_epoch",
+    "qsel_rollback_last_observed_pres",
+    "qsel_rollback_baseline_epoch", "qsel_rollback_baseline_pres",
+    "qsel_rollback_last_admissible_epoch",
+    "qsel_rollback_last_admissible_pres",
+    "qsel_rollback_last_restored_epoch",
+    "qsel_rollback_last_restored_pres", "qsel_rollback_failed",
+    "qsel_rollback_failure_reason",
+)
+RESAMPLING_STATUS_FIELDS = (
+    "resample_every_optimizer_steps", "training_batch_resamples_total",
+    "training_batches_sampled_total",
+)
 
 
 # =============================================================================
@@ -112,13 +149,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Number of training blocks (kept name-compatible with Liu).")
     p.add_argument("--eval-epochs", type=int, default=200,
                    help="Optimizer steps per block.")
-    p.add_argument("--resample-every", type=int, default=0,
-                   help="Deprecated compatibility knob. Direct PINN resamples once per eval-epochs block.")
-    p.add_argument("--scheduler-patience", type=int, default=5000)
+    p.add_argument(
+        "--resample-every", type=int, default=0,
+        help=(
+            "Refresh the interior and terminal training batch after this many "
+            "inner optimizer steps; 0 keeps the outer-start batch fixed for "
+            "the entire block."
+        ),
+    )
+    p.add_argument(
+        "--scheduler-patience", type=int, default=5000,
+        help="ReduceLROnPlateau patience measured in fixed-Q_sel checks (not optimizer steps).")
     p.add_argument("--scheduler-factor", type=float, default=0.5)
     p.add_argument("--scheduler-min-lr", type=float, default=1e-8)
     p.add_argument("--lr-schedule", type=str, default="plateau",
                    choices=["plateau", "fixed"])
+    p.add_argument(
+        "--qsel-rollback-factor", type=float, default=10.0,
+        help=(
+            "Restore the last admissible model+Adam state when fixed-Q_sel "
+            "p_sel exceeds this multiple of its best prior value."
+        ),
+    )
+    p.add_argument(
+        "--qsel-rollback-lr-factor", type=float, default=1.0,
+        help=(
+            "Emergency LR multiplier in (0, 1] applied after a Q_sel "
+            "rollback; 1 keeps the non-increasing rollback LR unchanged."
+        ),
+    )
+    p.add_argument(
+        "--qsel-rollback-max-rescues", type=int, default=2,
+        help=(
+            "Maximum successful Q_sel rollback rescues; 0 disables the "
+            "rollback mechanism."
+        ),
+    )
     # Nonlinear-HJB positivity continuation.  ``softplus`` is the new paper
     # candidate; ``abs`` reproduces the historical PINN and ``hard``
     # reproduces the unsuccessful hard one-sided pilot.
@@ -153,9 +219,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # Held-out residual target and fixed diagnostics (same roles as Liu).
     p.add_argument("--pres-target", type=mxu.none_or_float, default=None)
-    p.add_argument("--val-points", type=int, default=100000)
-    p.add_argument("--val-terminal-points", type=int, default=10000)
-    p.add_argument("--val-every", type=int, default=1)
+    p.add_argument(
+        "--val-points", type=int, default=100000,
+        help="Interior points in each fixed held-out set Q_res and Q_sel.")
+    p.add_argument(
+        "--val-terminal-points", type=int, default=10000,
+        help="Terminal points in each fixed held-out set Q_res and Q_sel.")
+    p.add_argument(
+        "--val-every", type=int, default=1,
+        help="Optimizer-step interval for Q_sel scheduler checks and active Q_res target checks.")
     p.add_argument("--save-iterate-every", type=int, default=0)
     p.add_argument("--diag-points", type=int, default=4096)
     p.add_argument("--diag-every", type=int, default=1)
@@ -203,12 +275,39 @@ if ARGS.pi_clip_abs is not None and (
     raise ValueError("--pi-clip-abs must be finite and positive, or none")
 if ARGS.val_every < 1:
     raise ValueError("--val-every must be positive")
+if ARGS.resample_every < 0:
+    raise ValueError("--resample-every must be nonnegative")
 if ARGS.scheduler_patience < 0 or not (0.0 < ARGS.scheduler_factor < 1.0):
     raise ValueError("require scheduler_patience >= 0 and 0 < scheduler_factor < 1")
 if ARGS.scheduler_min_lr <= 0.0:
     raise ValueError("--scheduler-min-lr must be positive")
+if ARGS.lr_schedule == "plateau" and ARGS.lr < ARGS.scheduler_min_lr:
+    raise ValueError("--lr must not be below --scheduler-min-lr")
+if (not math.isfinite(ARGS.qsel_rollback_factor)
+        or ARGS.qsel_rollback_factor <= 1.0):
+    raise ValueError("--qsel-rollback-factor must be finite and greater than 1")
+if (not math.isfinite(ARGS.qsel_rollback_lr_factor)
+        or not (0.0 < ARGS.qsel_rollback_lr_factor <= 1.0)):
+    raise ValueError(
+        "--qsel-rollback-lr-factor must lie in (0, 1]")
+if ARGS.qsel_rollback_max_rescues < 0:
+    raise ValueError("--qsel-rollback-max-rescues must be nonnegative")
+if (not ARGS.eval_only and ARGS.lr_schedule == "plateau"
+        and ARGS.qsel_rollback_max_rescues > 0
+        and ARGS.eval_epochs % ARGS.val_every != 0):
+    raise ValueError(
+        "Q_sel rollback requires --eval-epochs divisible by --val-every "
+        "so every official outer iterate is checked")
 if ARGS.pres_target is not None and ARGS.val_points <= 0:
     raise ValueError("--pres-target requires --val-points > 0")
+if (not ARGS.eval_only and ARGS.lr_schedule == "plateau"
+        and ARGS.val_points <= 0):
+    raise ValueError("--lr-schedule plateau requires --val-points > 0 for fixed Q_sel")
+if (not ARGS.eval_only
+        and (ARGS.pres_target is not None or ARGS.lr_schedule == "plateau")
+        and ARGS.val_terminal_points <= 0):
+    raise ValueError(
+        "held-out Q_res/Q_sel scoring requires --val-terminal-points > 0")
 for _name in ("hjb_vy_guard_eps", "hjb_denom_guard_eps",
               "hjb_vy_guard_tau", "hjb_denom_guard_tau",
               "hjb_vy_guard_tau_min", "hjb_denom_guard_tau_min"):
@@ -335,19 +434,17 @@ print(f"{'='*70}\n")
 def closed_form_c(t: np.ndarray, W: np.ndarray) -> np.ndarray:
     """c*(t,W) = m(t) W with multi-asset nu."""
     tau = T_FINAL - t
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon_bequest - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    return (nu / denom) * W
+    scale = mem.crra_homothetic_scale(
+        tau, nu, gamma_risk, epsilon_bequest)
+    return W / scale
 
 
 def closed_form_V(t: np.ndarray, W: np.ndarray) -> np.ndarray:
     """V(t,W)=A(t) W^{1-gamma}/(1-gamma)."""
     tau = T_FINAL - t
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon_bequest - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    A_t = (denom / nu) ** gamma_risk
+    scale = mem.crra_homothetic_scale(
+        tau, nu, gamma_risk, epsilon_bequest)
+    A_t = scale ** gamma_risk
     return A_t * (W ** (1.0 - gamma_risk)) / (1.0 - gamma_risk)
 
 
@@ -404,6 +501,60 @@ def sample_terminal(n: int, device: torch.device) -> Tuple[torch.Tensor, torch.T
     t = torch.full((n, 1), T_FINAL, device=device)
     y = y_min + torch.rand(n, 1, device=device) * (y_max - y_min)
     return t, y
+
+
+def _resample_before_inner_step(inner_epoch: int, resample_every: int) -> bool:
+    """Return whether a fresh batch is due before ``inner_epoch``.
+
+    The outer-start batch is used for steps 1 through K.  With K > 0, the
+    first refresh therefore occurs immediately before step K+1.  K=0 fixes
+    the outer-start batch for the entire inner loop.
+    """
+    every = int(resample_every)
+    if every < 0:
+        raise ValueError("resample_every must be nonnegative")
+    epoch = int(inner_epoch)
+    return every > 0 and epoch > 1 and (epoch - 1) % every == 0
+
+
+def _qsel_rollback_triggered(
+    current_pres: float,
+    best_pres: float,
+    factor: float,
+) -> bool:
+    """Apply the sole emergency criterion: current Q_sel versus prior best.
+
+    A non-finite Q_sel score is treated as an infinite score.  The caller
+    fails cleanly if this happens before any admissible baseline exists.
+    """
+    multiplier = float(factor)
+    if not math.isfinite(multiplier) or multiplier <= 1.0:
+        raise ValueError("qsel rollback factor must be finite and greater than 1")
+    if not math.isfinite(float(current_pres)):
+        return True
+    if not math.isfinite(float(best_pres)):
+        return False
+    return float(current_pres) > multiplier * float(best_pres)
+
+
+def _qsel_rollback_lr(
+    current_lr: float,
+    restored_lr: float,
+    min_lr: float,
+    factor: float,
+) -> float:
+    """Return an emergency LR that never exceeds the pre-rollback LR."""
+    current = float(current_lr)
+    restored = float(restored_lr)
+    floor = float(min_lr)
+    multiplier = float(factor)
+    if current <= 0.0 or restored <= 0.0 or floor <= 0.0:
+        raise ValueError("rollback learning rates must be positive")
+    if not (0.0 < multiplier <= 1.0):
+        raise ValueError("rollback LR factor must lie in (0, 1]")
+    base = min(current, restored)
+    candidate = max(floor, multiplier * base)
+    return min(current, candidate)
 
 
 # =============================================================================
@@ -576,6 +727,17 @@ def _clamp_optional(
 
 
 POLICY_METADATA = {
+    "trainer_protocol": "merton-direct-pinn-heldout-scheduler-v1",
+    "trainer_protocol_version": 1,
+    "trainer_source": "merton_ND/merton_nd_consumption_pinn.py",
+    "trainer_source_marker": "merton-direct-pinn-logw-heldout-scheduler-v1",
+    "trainer_source_sha256": mxu.sha256_file(os.path.abspath(__file__)),
+    "network_time_coordinate": "t",
+    "network_input_order": "t,y",
+    "network_input_transform": "identity",
+    "network_activation": "tanh",
+    "activation": "tanh",
+    "network_dtype": "float32",
     "policy_bounds_mode": policy_bounds_mode,
     "policy_pi_min": None if pi_clip_abs is None else -float(pi_clip_abs),
     "policy_pi_max": None if pi_clip_abs is None else float(pi_clip_abs),
@@ -739,10 +901,9 @@ def closed_form_wealth_bundle(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Closed-form (V,V_w,V_ww) for the paper X_ev norm."""
     tau = T_FINAL - t_np
-    exp_term = np.exp(-nu * tau)
-    denom = 1.0 + (nu * epsilon_bequest - 1.0) * exp_term
-    denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-    A_t = (denom / nu) ** gamma_risk
+    scale = mem.crra_homothetic_scale(
+        tau, nu, gamma_risk, epsilon_bequest)
+    A_t = scale ** gamma_risk
     V = A_t * w_np ** (1.0 - gamma_risk) / (1.0 - gamma_risk)
     V_w = A_t * w_np ** (-gamma_risk)
     V_ww = -gamma_risk * A_t * w_np ** (-gamma_risk - 1.0)
@@ -750,11 +911,7 @@ def closed_form_wealth_bundle(
 
 
 def _relative_l2(pred: np.ndarray, ref: np.ndarray) -> float:
-    pred64 = np.asarray(pred, dtype=np.float64)
-    ref64 = np.asarray(ref, dtype=np.float64)
-    den = float(np.sum(ref64 ** 2))
-    num = float(np.sum((pred64 - ref64) ** 2))
-    return float(np.sqrt(num / max(den, np.finfo(np.float64).tiny)))
+    return mem.relative_l2(pred, ref)
 
 
 def _diffusion_variance(pi: torch.Tensor) -> torch.Tensor:
@@ -886,6 +1043,9 @@ def train_pinn_hybrid_reduced_logw_multi(
     scheduler_factor: float = 0.5,
     scheduler_min_lr: float = 1e-8,
     lr_schedule: str = "plateau",
+    qsel_rollback_factor: float = 10.0,
+    qsel_rollback_lr_factor: float = 1.0,
+    qsel_rollback_max_rescues: int = 2,
     hjb_guard_mode: str = "softplus",
     hjb_vy_guard_eps: float = 1e-8,
     hjb_denom_guard_eps: float = 1e-8,
@@ -912,10 +1072,42 @@ def train_pinn_hybrid_reduced_logw_multi(
 ) -> Tuple[List[Dict[str, float]], optim.Optimizer, Dict[str, object]]:
     """Train the direct nonlinear PINN in Liu-style pseudo-outer blocks.
 
-    Each block uses one newly sampled training batch. A fixed, disjoint set
-    supplies held-out p_res. Reaching pres_target ends the single nonlinear
-    solve globally; it is a successful tolerance stop, not divergence.
+    Each block starts with a newly sampled training batch.  When
+    ``resample_every=K>0``, both the interior and terminal samples are
+    refreshed after each K inner optimizer steps; ``K=0`` keeps that batch
+    fixed for the full block.  Fixed held-out Q_res supplies the optional
+    stopping residual, while an independently seeded fixed Q_sel supplies the
+    *only* ReduceLROnPlateau score.  Reaching pres_target ends the single
+    nonlinear solve globally; it is a successful tolerance stop, not
+    divergence.  When plateau scheduling is active, the optional Q_sel
+    rollback restores the last Q_sel-admissible model and Adam state if and
+    only if the raw current Q_sel p_sel exceeds its configured multiple of
+    the prior best.
     """
+    if int(val_every) < 1:
+        raise ValueError("val_every must be positive")
+    if int(resample_every) < 0:
+        raise ValueError("resample_every must be nonnegative")
+    if (not math.isfinite(float(qsel_rollback_factor))
+            or float(qsel_rollback_factor) <= 1.0):
+        raise ValueError(
+            "qsel_rollback_factor must be finite and greater than 1")
+    if (not math.isfinite(float(qsel_rollback_lr_factor))
+            or not (0.0 < float(qsel_rollback_lr_factor) <= 1.0)):
+        raise ValueError(
+            "qsel_rollback_lr_factor must lie in (0, 1]")
+    if int(qsel_rollback_max_rescues) < 0:
+        raise ValueError("qsel_rollback_max_rescues must be nonnegative")
+    if (lr_schedule == "plateau" and int(qsel_rollback_max_rescues) > 0
+            and int(eval_epochs) % int(val_every) != 0):
+        raise ValueError(
+            "Q_sel rollback requires eval_epochs divisible by val_every")
+    if lr_schedule == "plateau" and float(lr) < float(scheduler_min_lr):
+        raise ValueError("lr must not be below scheduler_min_lr")
+    if lr_schedule == "plateau" and (
+            int(val_points) <= 0 or int(val_terminal_points) <= 0):
+        raise ValueError(
+            "plateau scheduling requires positive fixed-Q_sel point counts")
     os.makedirs(weight_dir, exist_ok=True)
     best_model_path = os.path.join(weight_dir, "value_net_best_diag.pt")
     last_model_path = os.path.join(weight_dir, "value_net_last.pt")
@@ -941,13 +1133,44 @@ def train_pinn_hybrid_reduced_logw_multi(
     best_iter = 0
     total_optimizer_steps = 0
     completed_outers = 0
+    scheduler_checks = 0
+    scheduler_lr_reductions = 0
+    training_batch_resamples_total = 0
+    training_batches_sampled_total = 0
+    last_sel: Optional[Tuple[float, float, float]] = None
+    last_sel_epoch = -1
+    best_sel_pres = float("inf")
+    qsel_rollback_active = bool(
+        scheduler is not None and int(qsel_rollback_max_rescues) > 0)
+    qsel_rollback_triggers = 0
+    qsel_rollback_rescues_used = 0
+    qsel_rollback_scheduler_resets = 0
+    qsel_rollback_last_epoch = -1
+    qsel_rollback_last_observed_pres: Optional[float] = None
+    qsel_rollback_baseline_epoch = -1
+    qsel_rollback_baseline_pres: Optional[float] = None
+    qsel_rollback_last_restored_epoch = -1
+    qsel_rollback_last_restored_pres: Optional[float] = None
+    qsel_rollback_failed = False
+    qsel_rollback_failure_reason = ""
+    last_admissible_model_state: Optional[Dict[str, torch.Tensor]] = None
+    last_admissible_optimizer_state: Optional[Dict[str, object]] = None
+    last_admissible_epoch = -1
+    last_admissible_pres: Optional[float] = None
 
-    # Dedicated held-out streams do not advance the training RNG. The market
-    # seed makes these sets identical across training seeds and both methods.
+    # Dedicated held-out streams do not advance the training RNG. Q_res and
+    # Q_sel have separate deterministic streams, and both are identical across
+    # training seeds when the market seed is fixed.  Q_res is never passed to
+    # the scheduler; Q_sel is never used to declare pres_target success.
     val_set = None
     if val_points > 0 and not (timing_mode and pres_target is None):
         val_set = build_validation_set(
             int(val_points), max(1, int(val_terminal_points)), device, int(val_seed))
+    sel_seed = int(val_seed) + DIRECT_PINN_QSEL_SEED_OFFSET
+    sel_set = None
+    if scheduler is not None:
+        sel_set = build_validation_set(
+            int(val_points), max(1, int(val_terminal_points)), device, sel_seed)
     diag = None
     diag_col = None
     if diag_points > 0 and not timing_mode:
@@ -959,7 +1182,13 @@ def train_pinn_hybrid_reduced_logw_multi(
         "timestamp", "model_type", "run_tag", "epoch", "outer_iter", "inner_epoch",
         "total_loss", "pde_loss", "terminal_loss", "monotonicity_loss",
         "concavity_loss", "eta_loss", "train_pres", "val_pde_rms",
-        "val_terminal_rms", "val_pres", "hjb_guard_mode",
+        "val_terminal_rms", "val_pres", "sel_pde_rms",
+        "sel_terminal_rms", "sel_pres", "scheduler_score",
+        "scheduler_check", "qsel_rollback_triggered",
+        "qsel_rollback_rescued", "qsel_rollback_failed",
+        "qsel_rollback_observed_pres", "qsel_rollback_restored_pres",
+        "qsel_rollback_restored_epoch", "qsel_rollback_rescues_used",
+        "hjb_guard_mode",
         "hjb_guard_tau_vy", "hjb_guard_tau_denom",
         "hjb_guard_frac_vy", "hjb_guard_frac_denom",
         "lr", "best_loss", "elapsed_sec",
@@ -969,7 +1198,21 @@ def train_pinn_hybrid_reduced_logw_multi(
         "timestamp", "model_type", "run_tag", "outer_iter", "epoch", "total_loss",
         "pde_loss", "terminal_loss", "monotonicity_loss", "concavity_loss",
         "eta_loss", "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
-        "inner_epochs_used", "target_reached", "e_V_sup", "e_bundle_sup", "e_Xev",
+        "sel_pde_rms", "sel_terminal_rms", "sel_pres", "scheduler_score",
+        "sel_check_epoch", "scheduler_checks",
+        "qsel_rollback_triggers", "qsel_rollback_rescues_used",
+        "qsel_rollback_scheduler_resets", "qsel_rollback_last_epoch",
+        "qsel_rollback_last_observed_pres",
+        "qsel_rollback_baseline_epoch", "qsel_rollback_baseline_pres",
+        "qsel_rollback_last_admissible_epoch",
+        "qsel_rollback_last_admissible_pres",
+        "qsel_rollback_last_restored_epoch",
+        "qsel_rollback_last_restored_pres", "qsel_rollback_failed",
+        "qsel_rollback_failure_reason",
+        "training_batch_resamples_outer", "training_batches_sampled_outer",
+        "training_batch_resamples_total", "training_batches_sampled_total",
+        "inner_epochs_used", "target_reached", "control_metric_scope",
+        "control_metric_points", "e_V_sup", "e_bundle_sup", "e_Xev",
         "diag_RelL2_V", "diag_RelL2_pi", "diag_RelL2_c", "m_Vw",
         "m_minus_Vww", "m_curvature_y", "m_y", "M_y", "m_c",
         "pi_component_min_greedy", "pi_component_max_greedy",
@@ -1000,6 +1243,11 @@ def train_pinn_hybrid_reduced_logw_multi(
     print("Training PINN (Reduced-form HJB, logW, hybrid sampling)")
     print(f"  outer_iters={outer_iters}, eval_epochs={eval_epochs}, epochs={epochs}")
     print(f"  batch={batch_size}, terminal_frac={terminal_frac}, lr={lr}")
+    print(
+        "  training batch="
+        + ("fixed within each outer block" if int(resample_every) == 0 else
+           f"refreshed every {int(resample_every)} inner optimizer steps")
+    )
     print(f"  w_terminal={w_terminal}, w_shape={w_shape}, w_eta={w_eta}")
     print(
         f"  policy bounds={policy_bounds_mode}; pi=[{POLICY_METADATA['policy_pi_min']},"
@@ -1012,11 +1260,20 @@ def train_pinn_hybrid_reduced_logw_multi(
         f"tau0=({hjb_vy_guard_tau:g},{hjb_denom_guard_tau:g}), "
         f"anneal_every={hjb_guard_anneal_every}"
     )
+    if scheduler is not None:
+        print(
+            f"  scheduler=fixed Q_sel {HELDOUT_SCORE_FORMULA}; "
+            f"every {val_every} optimizer steps; patience={scheduler_patience} Q_sel checks; "
+            f"Q_res seed={int(val_seed)}, Q_sel seed={sel_seed}"
+        )
+        if qsel_rollback_active:
+            print(
+                "  Q_sel rollback="
+                f"p_sel > {float(qsel_rollback_factor):g} * best; "
+                f"lr_factor={float(qsel_rollback_lr_factor):g}; "
+                f"max_rescues={int(qsel_rollback_max_rescues)}"
+            )
     print(f"{'='*70}\n")
-    if resample_every not in (0, eval_epochs):
-        print("[warn] --resample-every is deprecated for direct PINN; "
-              "the batch is refreshed once at each eval-epochs block.")
-
     start_time = time.time()
     last_val: Optional[Tuple[float, float, float]] = None
     current = {
@@ -1037,6 +1294,240 @@ def train_pinn_hybrid_reduced_logw_multi(
             eps_vy=hjb_vy_guard_eps, eps_denom=hjb_denom_guard_eps,
             tau_vy=tau_vy_now, tau_denom=tau_denom_now)
 
+    def _cpu_clone_tree(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: _cpu_clone_tree(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_cpu_clone_tree(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_cpu_clone_tree(item) for item in value)
+        return copy.deepcopy(value)
+
+    def _establish_qsel_rollback_baseline(
+        tau_vy_now: float,
+        tau_denom_now: float,
+        epoch_idx: int,
+    ) -> bool:
+        """Snapshot epoch-0/stage-start safety state without stepping LR."""
+        nonlocal best_sel_pres
+        nonlocal last_admissible_model_state
+        nonlocal last_admissible_optimizer_state
+        nonlocal last_admissible_epoch, last_admissible_pres
+        nonlocal qsel_rollback_baseline_epoch
+        nonlocal qsel_rollback_baseline_pres
+        nonlocal qsel_rollback_triggers, qsel_rollback_last_epoch
+        nonlocal qsel_rollback_last_observed_pres
+        nonlocal qsel_rollback_failed, qsel_rollback_failure_reason
+        if not qsel_rollback_active or sel_set is None:
+            return True
+        baseline = evaluate_heldout_pres_pinn(
+            value_net, sel_set, guard_mode=hjb_guard_mode,
+            eps_vy=hjb_vy_guard_eps, eps_denom=hjb_denom_guard_eps,
+            tau_vy=tau_vy_now, tau_denom=tau_denom_now)
+        baseline_pres = float(baseline[2])
+        qsel_rollback_baseline_epoch = int(epoch_idx)
+        qsel_rollback_baseline_pres = baseline_pres
+        if not math.isfinite(baseline_pres):
+            qsel_rollback_triggers += 1
+            qsel_rollback_last_epoch = int(epoch_idx)
+            qsel_rollback_last_observed_pres = baseline_pres
+            qsel_rollback_failed = True
+            qsel_rollback_failure_reason = (
+                "qsel_rollback_no_finite_admissible_checkpoint")
+            return False
+        best_sel_pres = baseline_pres
+        last_admissible_model_state = {
+            key: tensor.detach().cpu().clone()
+            for key, tensor in value_net.state_dict().items()
+        }
+        last_admissible_optimizer_state = _cpu_clone_tree(
+            optimizer.state_dict())
+        last_admissible_epoch = int(epoch_idx)
+        last_admissible_pres = baseline_pres
+        return True
+
+    def _scheduler_check(
+        tau_vy_now: float,
+        tau_denom_now: float,
+        epoch_idx: int,
+    ) -> Optional[Dict[str, object]]:
+        """Evaluate fixed Q_sel, rescue if needed, then seed/step the scheduler."""
+        nonlocal scheduler
+        nonlocal scheduler_checks, scheduler_lr_reductions
+        nonlocal last_sel, last_sel_epoch, best_sel_pres
+        nonlocal qsel_rollback_triggers, qsel_rollback_rescues_used
+        nonlocal qsel_rollback_scheduler_resets, qsel_rollback_last_epoch
+        nonlocal qsel_rollback_last_observed_pres
+        nonlocal qsel_rollback_last_restored_epoch
+        nonlocal qsel_rollback_last_restored_pres
+        nonlocal qsel_rollback_failed, qsel_rollback_failure_reason
+        nonlocal last_admissible_model_state
+        nonlocal last_admissible_optimizer_state
+        nonlocal last_admissible_epoch, last_admissible_pres
+        if scheduler is None or sel_set is None:
+            return None
+        observed = evaluate_heldout_pres_pinn(
+            value_net, sel_set, guard_mode=hjb_guard_mode,
+            eps_vy=hjb_vy_guard_eps, eps_denom=hjb_denom_guard_eps,
+            tau_vy=tau_vy_now, tau_denom=tau_denom_now)
+        observed_pres = float(observed[2])
+        scheduler_checks += 1
+        triggered = bool(
+            qsel_rollback_active
+            and _qsel_rollback_triggered(
+                observed_pres, best_sel_pres, qsel_rollback_factor)
+        )
+        rescued = False
+        restored: Optional[Tuple[float, float, float]] = None
+        restored_from_epoch: Optional[int] = None
+
+        if triggered:
+            qsel_rollback_triggers += 1
+            qsel_rollback_last_epoch = int(epoch_idx)
+            qsel_rollback_last_observed_pres = observed_pres
+            no_checkpoint = (
+                last_admissible_model_state is None
+                or last_admissible_optimizer_state is None
+            )
+            rescue_limit_hit = (
+                qsel_rollback_rescues_used
+                >= int(qsel_rollback_max_rescues)
+            )
+            if no_checkpoint or rescue_limit_hit:
+                qsel_rollback_failed = True
+                if no_checkpoint:
+                    qsel_rollback_failure_reason = (
+                        "qsel_rollback_no_finite_admissible_checkpoint")
+                else:
+                    qsel_rollback_failure_reason = (
+                        "qsel_rollback_rescue_limit_exceeded")
+                last_sel = observed
+                last_sel_epoch = int(epoch_idx)
+                return {
+                    "observed": observed, "scheduler_value": observed,
+                    "triggered": True, "rescued": False, "failed": True,
+                    "restored": None, "restored_from_epoch": None,
+                }
+
+            lr_before_restore = [
+                float(group["lr"]) for group in optimizer.param_groups
+            ]
+            value_net.load_state_dict(last_admissible_model_state)
+            optimizer.load_state_dict(
+                copy.deepcopy(last_admissible_optimizer_state))
+            restored_from_epoch = int(last_admissible_epoch)
+            for group_idx, group in enumerate(optimizer.param_groups):
+                pre_lr = lr_before_restore[
+                    min(group_idx, len(lr_before_restore) - 1)]
+                group["lr"] = _qsel_rollback_lr(
+                    current_lr=pre_lr,
+                    restored_lr=float(group["lr"]),
+                    min_lr=float(scheduler_min_lr),
+                    factor=float(qsel_rollback_lr_factor),
+                )
+
+            # The plateau history belongs to the discarded trajectory.  Seed
+            # a fresh scheduler with Q_sel re-evaluated at the restored state.
+            scheduler = _make_scheduler()
+            qsel_rollback_scheduler_resets += 1
+            restored = evaluate_heldout_pres_pinn(
+                value_net, sel_set, guard_mode=hjb_guard_mode,
+                eps_vy=hjb_vy_guard_eps, eps_denom=hjb_denom_guard_eps,
+                tau_vy=tau_vy_now, tau_denom=tau_denom_now)
+            if not math.isfinite(float(restored[2])):
+                qsel_rollback_failed = True
+                qsel_rollback_failure_reason = (
+                    "qsel_rollback_restored_state_nonfinite")
+                last_sel = restored
+                last_sel_epoch = int(epoch_idx)
+                return {
+                    "observed": observed, "scheduler_value": restored,
+                    "triggered": True, "rescued": False, "failed": True,
+                    "restored": restored,
+                    "restored_from_epoch": restored_from_epoch,
+                }
+            qsel_rollback_rescues_used += 1
+            qsel_rollback_last_restored_epoch = restored_from_epoch
+            qsel_rollback_last_restored_pres = float(restored[2])
+            rescued = True
+
+        scheduler_value = restored if restored is not None else observed
+        lr_before = float(optimizer.param_groups[0]["lr"])
+        scheduler.step(float(scheduler_value[2]))
+        lr_after = float(optimizer.param_groups[0]["lr"])
+        scheduler_lr_reductions += int(lr_after < lr_before)
+        last_sel = scheduler_value
+        last_sel_epoch = int(epoch_idx)
+        best_sel_pres = min(best_sel_pres, float(scheduler_value[2]))
+
+        # This state is admissible under the sole Q_sel ratio criterion. Save
+        # model and Adam together, after any scheduler LR update, so a future
+        # restore never mixes parameter and moment/LR vintages.
+        last_admissible_model_state = {
+            key: tensor.detach().cpu().clone()
+            for key, tensor in value_net.state_dict().items()
+        }
+        last_admissible_optimizer_state = _cpu_clone_tree(
+            optimizer.state_dict())
+        last_admissible_epoch = int(epoch_idx)
+        last_admissible_pres = float(scheduler_value[2])
+        return {
+            "observed": observed, "scheduler_value": scheduler_value,
+            "triggered": triggered, "rescued": rescued, "failed": False,
+            "restored": restored,
+            "restored_from_epoch": restored_from_epoch,
+        }
+
+    def _sample_training_batch(
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Sample the coupled interior/terminal batch and terminal target."""
+        t_batch, y_batch = sample_interior(int(batch_size), device)
+        t_terminal, y_terminal = sample_terminal(
+            max(1, int(batch_size * terminal_frac)), device)
+        terminal_target = V_terminal_from_y(y_terminal).detach()
+        return t_batch, y_batch, t_terminal, y_terminal, terminal_target
+
+    def _rollback_status() -> Dict[str, object]:
+        return {
+            "qsel_rollback_active": bool(qsel_rollback_active),
+            "qsel_rollback_factor": float(qsel_rollback_factor),
+            "qsel_rollback_lr_factor": float(qsel_rollback_lr_factor),
+            "qsel_rollback_max_rescues":
+                int(qsel_rollback_max_rescues),
+            "qsel_rollback_triggers": int(qsel_rollback_triggers),
+            "qsel_rollback_rescues_used":
+                int(qsel_rollback_rescues_used),
+            "qsel_rollback_scheduler_resets":
+                int(qsel_rollback_scheduler_resets),
+            "qsel_rollback_last_epoch": (
+                None if qsel_rollback_last_epoch < 0
+                else int(qsel_rollback_last_epoch)),
+            "qsel_rollback_last_observed_pres":
+                qsel_rollback_last_observed_pres,
+            "qsel_rollback_baseline_epoch": (
+                None if qsel_rollback_baseline_epoch < 0
+                else int(qsel_rollback_baseline_epoch)),
+            "qsel_rollback_baseline_pres":
+                qsel_rollback_baseline_pres,
+            "qsel_rollback_last_admissible_epoch": (
+                None if last_admissible_epoch < 0
+                else int(last_admissible_epoch)),
+            "qsel_rollback_last_admissible_pres":
+                last_admissible_pres,
+            "qsel_rollback_last_restored_epoch": (
+                None if qsel_rollback_last_restored_epoch < 0
+                else int(qsel_rollback_last_restored_epoch)),
+            "qsel_rollback_last_restored_pres":
+                qsel_rollback_last_restored_pres,
+            "qsel_rollback_failed": bool(qsel_rollback_failed),
+            "qsel_rollback_failure_reason":
+                qsel_rollback_failure_reason,
+        }
+
     previous_guard_taus: Optional[Tuple[float, float]] = None
     tau_vy_now = float(hjb_vy_guard_tau)
     tau_denom_now = float(hjb_denom_guard_tau)
@@ -1053,26 +1544,49 @@ def train_pinn_hybrid_reduced_logw_multi(
         guard_taus = (tau_vy_now, tau_denom_now)
         if (hjb_guard_mode == "softplus" and previous_guard_taus is not None
                 and guard_taus != previous_guard_taus and scheduler is not None):
-            # The surrogate loss changes when tau changes. Reset only the
-            # plateau comparison state; retain Adam moments and the current LR.
+            # The surrogate PDE and therefore Q_sel's scale change with tau.
+            # Never compare a new stage against a prior-stage rollback best.
             scheduler = _make_scheduler()
+            last_sel = None
+            last_sel_epoch = -1
+            best_sel_pres = float("inf")
+            last_admissible_model_state = None
+            last_admissible_optimizer_state = None
+            last_admissible_epoch = -1
+            last_admissible_pres = None
             print(
                 f"[guard] stage={guard_stage}: tau_vy={tau_vy_now:.3e}, "
-                f"tau_denom={tau_denom_now:.3e}; plateau state reset"
+                f"tau_denom={tau_denom_now:.3e}; "
+                "plateau and Q_sel rollback baseline reset"
             )
         previous_guard_taus = guard_taus
-        # Hybrid sampling: several updates on one batch, then refresh at the
-        # next pseudo-outer block while solving the same nonlinear PDE.
-        t_int, y_int = sample_interior(int(batch_size), device)
-        t_term, y_term = sample_terminal(
-            max(1, int(batch_size * terminal_frac)), device)
-        V_T_target = V_terminal_from_y(y_term).detach()
+        # Every block starts with a fresh batch.  Optional inner-loop
+        # resampling below refreshes this same coupled interior/terminal set.
+        t_int, y_int, t_term, y_term, V_T_target = _sample_training_batch()
+        training_batches_sampled_total += 1
+        training_batch_resamples_outer = 0
+        training_batches_sampled_outer = 1
         pending_rows: List[Dict[str, object]] = []
         epochs_used = 0
         target_reached = False
+        steps_since_batch_refresh = 0
+        rollback_terminal_failure = False
+
+        # Establish an epoch-0 admissible baseline before the first update of
+        # the run (and after every tau-stage reset). This makes the very first
+        # Q_sel interval rescuable and snapshots model+Adam on CPU.
+        if qsel_rollback_active and last_admissible_model_state is None:
+            rollback_terminal_failure = not _establish_qsel_rollback_baseline(
+                tau_vy_now, tau_denom_now, total_optimizer_steps)
+            if rollback_terminal_failure:
+                print(
+                    "[rollback:failed] unable to establish finite Q_sel "
+                    f"baseline at step={total_optimizer_steps}: "
+                    f"{qsel_rollback_failure_reason}"
+                )
 
         # A state already at tolerance must not be perturbed by another step.
-        if pres_target is not None:
+        if pres_target is not None and not rollback_terminal_failure:
             last_val = _heldout(tau_vy_now, tau_denom_now)
             target_reached = bool(last_val is not None and last_val[2] <= float(pres_target))
             if target_reached:
@@ -1144,6 +1658,17 @@ def train_pinn_hybrid_reduced_logw_multi(
                             current["pde"], current["terminal"]),
                         "val_pde_rms": last_val[0],
                         "val_terminal_rms": last_val[1], "val_pres": last_val[2],
+                        "sel_pde_rms": "", "sel_terminal_rms": "",
+                        "sel_pres": "", "scheduler_score": "",
+                        "scheduler_check": 0,
+                        "qsel_rollback_triggered": 0,
+                        "qsel_rollback_rescued": 0,
+                        "qsel_rollback_failed": 0,
+                        "qsel_rollback_observed_pres": "",
+                        "qsel_rollback_restored_pres": "",
+                        "qsel_rollback_restored_epoch": "",
+                        "qsel_rollback_rescues_used":
+                            qsel_rollback_rescues_used,
                         "hjb_guard_mode": hjb_guard_mode,
                         "hjb_guard_tau_vy": tau_vy_now,
                         "hjb_guard_tau_denom": tau_denom_now,
@@ -1155,8 +1680,19 @@ def train_pinn_hybrid_reduced_logw_multi(
                     })
 
         for inner_epoch in range(1, int(eval_epochs) + 1):
-            if target_reached:
+            if target_reached or rollback_terminal_failure:
                 break
+            # The current batch receives exactly ``resample_every`` updates.
+            # Refresh before K+1 (and 2K+1, ...) rather than after computing
+            # that step's loss.  Zero intentionally disables inner refreshes.
+            if _resample_before_inner_step(
+                    steps_since_batch_refresh + 1, int(resample_every)):
+                t_int, y_int, t_term, y_term, V_T_target = _sample_training_batch()
+                steps_since_batch_refresh = 0
+                training_batch_resamples_outer += 1
+                training_batches_sampled_outer += 1
+                training_batch_resamples_total += 1
+                training_batches_sampled_total += 1
             optimizer.zero_grad(set_to_none=True)
             residual, _, V_y, V_yy, denom = reduced_hjb_residual_log_multi(
                 value_net, t_int, y_int, guard_mode=hjb_guard_mode,
@@ -1183,9 +1719,8 @@ def train_pinn_hybrid_reduced_logw_multi(
             torch.nn.utils.clip_grad_norm_(value_net.parameters(), max_norm=1.0)
             optimizer.step()
             total_optimizer_steps += 1
+            steps_since_batch_refresh += 1
             epochs_used = inner_epoch
-            if scheduler is not None:
-                scheduler.step(float(total_loss.detach().cpu()))
 
             current = {
                 "total": float(total_loss.detach().cpu()),
@@ -1201,7 +1736,123 @@ def train_pinn_hybrid_reduced_logw_multi(
             }
             lr_now = float(optimizer.param_groups[0]["lr"])
 
-            if current["total"] < best_loss:
+            row_val: Optional[Tuple[float, float, float]] = None
+            row_sel: Optional[Tuple[float, float, float]] = None
+            rollback_event: Optional[Dict[str, object]] = None
+            if (val_set is not None and pres_target is not None and
+                    total_optimizer_steps % max(1, int(val_every)) == 0):
+                row_val = _heldout(tau_vy_now, tau_denom_now)
+                last_val = row_val
+                if (pres_target is not None and row_val is not None and
+                        row_val[2] <= float(pres_target)):
+                    target_reached = True
+            if (scheduler is not None and
+                    total_optimizer_steps % max(1, int(val_every)) == 0):
+                # Never use the stochastic training loss (or Q_res) here.
+                rollback_event = _scheduler_check(
+                    tau_vy_now, tau_denom_now, total_optimizer_steps)
+                if rollback_event is not None:
+                    row_sel = rollback_event["scheduler_value"]
+                    rollback_terminal_failure = bool(
+                        rollback_event["failed"])
+                    if bool(rollback_event["rescued"]):
+                        # The discarded stochastic batch belongs to the bad
+                        # trajectory. Start a fresh cadence from a coupled
+                        # interior/terminal/target batch.
+                        t_int, y_int, t_term, y_term, V_T_target = (
+                            _sample_training_batch())
+                        steps_since_batch_refresh = 0
+                        training_batch_resamples_outer += 1
+                        training_batches_sampled_outer += 1
+                        training_batch_resamples_total += 1
+                        training_batches_sampled_total += 1
+
+                        # Replace the normal training columns with metrics of
+                        # the restored model on its fresh batch. The raw bad
+                        # Q_sel value remains in dedicated rollback columns.
+                        residual_r, _, vy_r, vyy_r, denom_r = (
+                            reduced_hjb_residual_log_multi(
+                                value_net, t_int, y_int,
+                                guard_mode=hjb_guard_mode,
+                                eps_vy=hjb_vy_guard_eps,
+                                eps_denom=hjb_denom_guard_eps,
+                                tau_vy=tau_vy_now,
+                                tau_denom=tau_denom_now))
+                        with torch.no_grad():
+                            term_r = torch.mean(
+                                (value_net(t_term, y_term) - V_T_target) ** 2)
+                        pde_r = torch.mean(residual_r.detach() ** 2)
+                        mono_r = torch.mean(
+                            torch.relu(-vy_r.detach()) ** 2)
+                        conc_r = torch.mean(
+                            torch.relu(-denom_r.detach()) ** 2)
+                        if w_eta != 0.0 and eta_clip is not None:
+                            eta_r = 1.0 - vyy_r.detach() / torch.clamp(
+                                torch.abs(vy_r.detach()), min=1e-8)
+                            eta_loss_r = torch.mean(torch.clamp(
+                                eta_r - gamma_risk, -float(eta_clip),
+                                float(eta_clip)) ** 2)
+                        else:
+                            eta_loss_r = torch.zeros(
+                                (), device=t_int.device)
+                        current = {
+                            "pde": float(pde_r.item()),
+                            "terminal": float(term_r.item()),
+                            "mono": float(mono_r.item()),
+                            "conc": float(conc_r.item()),
+                            "eta": float(eta_loss_r.item()),
+                            "guard_frac_vy": float(
+                                (vy_r.detach()
+                                 <= float(hjb_vy_guard_eps)).float().mean().item()),
+                            "guard_frac_denom": float(
+                                (denom_r.detach()
+                                 <= float(hjb_denom_guard_eps)).float().mean().item()),
+                        }
+                        current["total"] = float(
+                            current["pde"]
+                            + w_terminal * current["terminal"]
+                            + w_shape * (current["mono"] + current["conc"])
+                            + w_eta * current["eta"])
+
+                        # Any diagnostic-best candidate collected after the
+                        # restored checkpoint belongs to the discarded
+                        # trajectory. Restart that diagnostic selection from
+                        # the restored state; the common block below records
+                        # this freshly measured loss/model together.
+                        best_loss = float("inf")
+                        best_iter = total_optimizer_steps
+                        best_state = None
+
+                        # A Q_res success observed on the discarded state is
+                        # not sticky. Re-evaluate it at the restored model.
+                        if val_set is not None and pres_target is not None:
+                            row_val = _heldout(tau_vy_now, tau_denom_now)
+                            last_val = row_val
+                            target_reached = bool(
+                                row_val is not None
+                                and row_val[2] <= float(pres_target))
+                        print(
+                            f"[rollback] step={total_optimizer_steps}: "
+                            f"raw p_sel={float(rollback_event['observed'][2]):.3e}, "
+                            f"restored step={rollback_event['restored_from_epoch']}, "
+                            f"restored p_sel={float(row_sel[2]):.3e}, "
+                            f"lr={float(optimizer.param_groups[0]['lr']):.2e}, "
+                            f"rescue={qsel_rollback_rescues_used}/"
+                            f"{int(qsel_rollback_max_rescues)}"
+                        )
+                    elif rollback_terminal_failure:
+                        target_reached = False
+                        print(
+                            f"[rollback:failed] step={total_optimizer_steps}: "
+                            f"raw p_sel="
+                            f"{float(rollback_event['observed'][2]):.3e}; "
+                            f"{qsel_rollback_failure_reason}"
+                        )
+
+            # Training-loss best is diagnostic only, but it must never retain
+            # a state that the Q_sel safety rule just discarded.
+            if (not rollback_terminal_failure
+                    and current["total"] < best_loss):
                 best_loss = current["total"]
                 best_iter = total_optimizer_steps
                 if not timing_mode:
@@ -1209,14 +1860,8 @@ def train_pinn_hybrid_reduced_logw_multi(
                         key: val.detach().cpu().clone()
                         for key, val in value_net.state_dict().items()}
 
-            row_val: Optional[Tuple[float, float, float]] = None
-            if (val_set is not None and pres_target is not None and
-                    inner_epoch % max(1, int(val_every)) == 0):
-                row_val = _heldout(tau_vy_now, tau_denom_now)
-                last_val = row_val
-                if (pres_target is not None and row_val is not None and
-                        row_val[2] <= float(pres_target)):
-                    target_reached = True
+            # A Q_sel check can reduce the LR, so capture it afterwards.
+            lr_now = float(optimizer.param_groups[0]["lr"])
 
             history_row = {
                 "total": current["total"], "pde": current["pde"],
@@ -1245,6 +1890,33 @@ def train_pinn_hybrid_reduced_logw_multi(
                     "val_pde_rms": "" if row_val is None else row_val[0],
                     "val_terminal_rms": "" if row_val is None else row_val[1],
                     "val_pres": "" if row_val is None else row_val[2],
+                    "sel_pde_rms": "" if row_sel is None else row_sel[0],
+                    "sel_terminal_rms": "" if row_sel is None else row_sel[1],
+                    "sel_pres": "" if row_sel is None else row_sel[2],
+                    "scheduler_score": "" if row_sel is None else row_sel[2],
+                    "scheduler_check": int(row_sel is not None),
+                    "qsel_rollback_triggered": int(
+                        bool(rollback_event is not None
+                             and rollback_event["triggered"])),
+                    "qsel_rollback_rescued": int(
+                        bool(rollback_event is not None
+                             and rollback_event["rescued"])),
+                    "qsel_rollback_failed": int(
+                        bool(rollback_event is not None
+                             and rollback_event["failed"])),
+                    "qsel_rollback_observed_pres": (
+                        "" if rollback_event is None
+                        else rollback_event["observed"][2]),
+                    "qsel_rollback_restored_pres": (
+                        "" if rollback_event is None
+                        or rollback_event["restored"] is None
+                        else rollback_event["restored"][2]),
+                    "qsel_rollback_restored_epoch": (
+                        "" if rollback_event is None
+                        or rollback_event["restored_from_epoch"] is None
+                        else rollback_event["restored_from_epoch"]),
+                    "qsel_rollback_rescues_used":
+                        qsel_rollback_rescues_used,
                     "hjb_guard_mode": hjb_guard_mode,
                     "hjb_guard_tau_vy": tau_vy_now,
                     "hjb_guard_tau_denom": tau_denom_now,
@@ -1252,34 +1924,38 @@ def train_pinn_hybrid_reduced_logw_multi(
                     "hjb_guard_frac_denom": current["guard_frac_denom"],
                     "lr": lr_now, "best_loss": best_loss,
                     "elapsed_sec": time.time() - start_time,
-                    "stopped": 0,
-                    "stop_reason": "pres_target_reached" if target_reached else "",
+                    "stopped": int(rollback_terminal_failure),
+                    "stop_reason": (
+                        qsel_rollback_failure_reason
+                        if rollback_terminal_failure else
+                        ("pres_target_reached" if target_reached else "")),
                 })
 
             if print_every > 0 and total_optimizer_steps % print_every == 0:
                 ptxt = "" if row_val is None else f" | p_res={row_val[2]:.3e}"
+                stxt = "" if row_sel is None else f" | s_sel={row_sel[2]:.3e}"
                 print(f"[{total_optimizer_steps:6d}/{epochs}] total={current['total']:.3e} | "
                       f"pde={current['pde']:.3e} | term={current['terminal']:.3e} | "
                       f"eta={current['eta']:.3e} | lr={lr_now:.2e} | "
                       f"guard=({current['guard_frac_vy']:.2%},"
-                      f"{current['guard_frac_denom']:.2%}){ptxt}")
+                      f"{current['guard_frac_denom']:.2%}){ptxt}{stxt}")
 
             if t_int.grad is not None:
                 t_int.grad = None
             if y_int.grad is not None:
                 y_int.grad = None
-            if target_reached:
+            if target_reached or rollback_terminal_failure:
                 break
 
         # Always report p_res for the official end-of-block state when a
         # validation set exists, even when no target is active.
-        if val_set is not None:
+        if val_set is not None and not rollback_terminal_failure:
             last_val = _heldout(tau_vy_now, tau_denom_now)
             if (pres_target is not None and last_val is not None and
                     last_val[2] <= float(pres_target)):
                 target_reached = True
         diag_res: Dict[str, float] = {}
-        if (diag is not None and
+        if (not rollback_terminal_failure and diag is not None and
                 (diag_every <= 1 or outer_iter == 1
                  or outer_iter % diag_every == 0 or outer_iter == outer_iters)):
             diag_res = eval_diag_metrics(value_net, diag, diag_col)
@@ -1287,7 +1963,8 @@ def train_pinn_hybrid_reduced_logw_multi(
         stop_triggered = False
         stop_meta: Dict[str, object] = {
             "active": False, "is_bad": False, "bad_count": 0}
-        if (not target_reached and stopper is not None and
+        if (not target_reached and not rollback_terminal_failure
+                and stopper is not None and
                 math.isfinite(current["pde"])):
             stop_triggered, stop_meta = stopper.update(outer_iter, current["pde"])
 
@@ -1305,26 +1982,137 @@ def train_pinn_hybrid_reduced_logw_multi(
             "val_pde_rms": "" if last_val is None else last_val[0],
             "val_terminal_rms": "" if last_val is None else last_val[1],
             "val_pres": "" if last_val is None else last_val[2],
+            "sel_pde_rms": "" if last_sel is None else last_sel[0],
+            "sel_terminal_rms": "" if last_sel is None else last_sel[1],
+            "sel_pres": "" if last_sel is None else last_sel[2],
+            "scheduler_score": "" if last_sel is None else last_sel[2],
+            "sel_check_epoch": "" if last_sel is None else last_sel_epoch,
+            "scheduler_checks": scheduler_checks,
+            "qsel_rollback_triggers": qsel_rollback_triggers,
+            "qsel_rollback_rescues_used": qsel_rollback_rescues_used,
+            "qsel_rollback_scheduler_resets":
+                qsel_rollback_scheduler_resets,
+            "qsel_rollback_last_epoch": (
+                "" if qsel_rollback_last_epoch < 0
+                else qsel_rollback_last_epoch),
+            "qsel_rollback_last_observed_pres": (
+                "" if qsel_rollback_last_observed_pres is None
+                else qsel_rollback_last_observed_pres),
+            "qsel_rollback_baseline_epoch": (
+                "" if qsel_rollback_baseline_epoch < 0
+                else qsel_rollback_baseline_epoch),
+            "qsel_rollback_baseline_pres": (
+                "" if qsel_rollback_baseline_pres is None
+                else qsel_rollback_baseline_pres),
+            "qsel_rollback_last_admissible_epoch": (
+                "" if last_admissible_epoch < 0
+                else last_admissible_epoch),
+            "qsel_rollback_last_admissible_pres": (
+                "" if last_admissible_pres is None
+                else last_admissible_pres),
+            "qsel_rollback_last_restored_epoch": (
+                "" if qsel_rollback_last_restored_epoch < 0
+                else qsel_rollback_last_restored_epoch),
+            "qsel_rollback_last_restored_pres": (
+                "" if qsel_rollback_last_restored_pres is None
+                else qsel_rollback_last_restored_pres),
+            "qsel_rollback_failed": int(qsel_rollback_failed),
+            "qsel_rollback_failure_reason":
+                qsel_rollback_failure_reason,
+            "training_batch_resamples_outer": training_batch_resamples_outer,
+            "training_batches_sampled_outer": training_batches_sampled_outer,
+            "training_batch_resamples_total": training_batch_resamples_total,
+            "training_batches_sampled_total": training_batches_sampled_total,
             "hjb_guard_mode": hjb_guard_mode,
             "hjb_guard_tau_vy": tau_vy_now,
             "hjb_guard_tau_denom": tau_denom_now,
             "hjb_guard_frac_vy": current["guard_frac_vy"],
             "hjb_guard_frac_denom": current["guard_frac_denom"],
             "inner_epochs_used": epochs_used, "target_reached": int(target_reached),
+            # E1 consumes the same fixed tensor Q_ev grid used by the
+            # diagnostics below.  Record the scope explicitly so the paper
+            # aggregator never has to infer it from diag_points.
+            "control_metric_scope": "fixed_qev" if diag_res else "",
+            "control_metric_points": (
+                int(diag["t"].shape[0]) if diag_res and diag is not None else ""),
             **{key: diag_res.get(key, "") for key in diagnostic_fields},
             "lr": lr_now, "best_loss": best_loss,
             "bad_count": stop_meta.get("bad_count", ""),
             "stop_active": int(bool(stop_meta.get("active", False))),
             "stop_is_bad": int(bool(stop_meta.get("is_bad", False))),
-            "stopped": int(bool(stop_triggered)),
-            "stop_reason": ("pres_target_reached" if target_reached
-                            else str(stop_meta.get("reason", ""))),
+            "stopped": int(bool(stop_triggered or rollback_terminal_failure)),
+            "stop_reason": (
+                qsel_rollback_failure_reason
+                if rollback_terminal_failure else
+                ("pres_target_reached" if target_reached
+                 else str(stop_meta.get("reason", "")))),
             "elapsed_sec": time.time() - start_time,
         }
 
         if recorder is not None and not timing_mode:
             mxu.append_csv_rows(recorder.train_csv, pending_rows, train_fields)
             mxu.append_csv_rows(recorder.outer_csv, [outer_row], outer_fields)
+        if rollback_terminal_failure:
+            # Never create value_net_final/last for a rescue-exhausted run.
+            # A clearly non-official CPU snapshot is retained only for audit.
+            failed_admissible_path = None
+            if last_admissible_model_state is not None and not timing_mode:
+                failed_admissible_path = os.path.join(
+                    weight_dir, "value_net_failed_last_admissible.pt")
+                torch.save(
+                    last_admissible_model_state, failed_admissible_path)
+            stop_info = {
+                "run_failed": True,
+                "stopped_early": False,
+                "target_reached": False,
+                "achieved_pres": None,
+                "failure_reason": qsel_rollback_failure_reason,
+                "failed_admissible_weight_path": failed_admissible_path,
+                "q_res_role": "pres_target_and_official_residual",
+                "q_res_seed": int(val_seed),
+                "q_sel_role": (
+                    "lr_scheduler_and_qsel_rollback"
+                    if qsel_rollback_active else "lr_scheduler_only"),
+                "q_sel_seed": int(sel_seed),
+                "q_sel_active": bool(scheduler is not None),
+                "heldout_score_formula": HELDOUT_SCORE_FORMULA,
+                "scheduler_metric": (
+                    "fixed_q_sel_pres"
+                    if scheduler is not None else "none_fixed_lr"),
+                "scheduler_patience_unit": "q_sel_checks",
+                "scheduler_patience_checks": int(scheduler_patience),
+                "scheduler_check_every_optimizer_steps": int(val_every),
+                "scheduler_checks": int(scheduler_checks),
+                "scheduler_lr_reductions": int(
+                    scheduler_lr_reductions),
+                "resample_every_optimizer_steps": int(resample_every),
+                "training_batch_resamples_total": int(
+                    training_batch_resamples_total),
+                "training_batches_sampled_total": int(
+                    training_batches_sampled_total),
+                "sel_pde_rms_last": (
+                    None if last_sel is None else float(last_sel[0])),
+                "sel_terminal_rms_last": (
+                    None if last_sel is None else float(last_sel[1])),
+                "sel_pres_last": (
+                    None if last_sel is None else float(last_sel[2])),
+                "scheduler_score_last": (
+                    None if last_sel is None else float(last_sel[2])),
+                "sel_pres_best": (
+                    None if not math.isfinite(best_sel_pres)
+                    else float(best_sel_pres)),
+                "sel_check_epoch_last": (
+                    None if last_sel is None else int(last_sel_epoch)),
+                "outer_iter": int(outer_iter),
+                "epoch_at_stop": int(total_optimizer_steps),
+                "total_optimizer_steps": int(total_optimizer_steps),
+                "hjb_guard_mode": hjb_guard_mode,
+                "hjb_guard_version": HJB_GUARD_VERSION,
+                "hjb_guard_tau_vy_final": tau_vy_now,
+                "hjb_guard_tau_denom_final": tau_denom_now,
+                **_rollback_status(),
+            }
+            return loss_history, optimizer, stop_info
         if save_iterate_every > 0 and not timing_mode and outer_iter % save_iterate_every == 0:
             torch.save(value_net.state_dict(), os.path.join(
                 iterate_dir, f"value_net_iter{outer_iter:04d}.pt"))
@@ -1339,12 +2127,43 @@ def train_pinn_hybrid_reduced_logw_multi(
                 "stopped_early": bool(stop_triggered),
                 "target_reached": bool(target_reached),
                 "achieved_pres": None if last_val is None else float(last_val[2]),
+                "q_res_role": "pres_target_and_official_residual",
+                "q_res_seed": int(val_seed),
+                "q_sel_role": (
+                    "lr_scheduler_and_qsel_rollback"
+                    if qsel_rollback_active else "lr_scheduler_only"),
+                "q_sel_seed": int(sel_seed),
+                "q_sel_active": bool(scheduler is not None),
+                "heldout_score_formula": HELDOUT_SCORE_FORMULA,
+                "scheduler_metric": (
+                    "fixed_q_sel_pres" if scheduler is not None else "none_fixed_lr"),
+                "scheduler_patience_unit": "q_sel_checks",
+                "scheduler_patience_checks": int(scheduler_patience),
+                "scheduler_check_every_optimizer_steps": int(val_every),
+                "scheduler_checks": int(scheduler_checks),
+                "scheduler_lr_reductions": int(scheduler_lr_reductions),
+                "resample_every_optimizer_steps": int(resample_every),
+                "training_batch_resamples_total": int(
+                    training_batch_resamples_total),
+                "training_batches_sampled_total": int(
+                    training_batches_sampled_total),
+                "sel_pde_rms_last": None if last_sel is None else float(last_sel[0]),
+                "sel_terminal_rms_last": (
+                    None if last_sel is None else float(last_sel[1])),
+                "sel_pres_last": None if last_sel is None else float(last_sel[2]),
+                "scheduler_score_last": (
+                    None if last_sel is None else float(last_sel[2])),
+                "sel_pres_best": (
+                    None if not math.isfinite(best_sel_pres) else float(best_sel_pres)),
+                "sel_check_epoch_last": (
+                    None if last_sel is None else int(last_sel_epoch)),
                 "outer_iter": outer_iter, "epoch_at_stop": total_optimizer_steps,
                 "total_optimizer_steps": total_optimizer_steps,
                 "hjb_guard_mode": hjb_guard_mode,
                 "hjb_guard_version": HJB_GUARD_VERSION,
                 "hjb_guard_tau_vy_final": tau_vy_now,
                 "hjb_guard_tau_denom_final": tau_denom_now,
+                **_rollback_status(),
             }
             reason = "p_res target" if target_reached else "divergence stopper"
             print(f"[stop] direct PINN ended at outer={outer_iter}, steps={total_optimizer_steps} ({reason})")
@@ -1362,10 +2181,36 @@ def train_pinn_hybrid_reduced_logw_multi(
         "outer_iters_completed": completed_outers,
         "total_optimizer_steps": total_optimizer_steps,
         "achieved_pres": None if last_val is None else float(last_val[2]),
+        "q_res_role": "pres_target_and_official_residual",
+        "q_res_seed": int(val_seed),
+        "q_sel_role": (
+            "lr_scheduler_and_qsel_rollback"
+            if qsel_rollback_active else "lr_scheduler_only"),
+        "q_sel_seed": int(sel_seed),
+        "q_sel_active": bool(scheduler is not None),
+        "heldout_score_formula": HELDOUT_SCORE_FORMULA,
+        "scheduler_metric": (
+            "fixed_q_sel_pres" if scheduler is not None else "none_fixed_lr"),
+        "scheduler_patience_unit": "q_sel_checks",
+        "scheduler_patience_checks": int(scheduler_patience),
+        "scheduler_check_every_optimizer_steps": int(val_every),
+        "scheduler_checks": int(scheduler_checks),
+        "scheduler_lr_reductions": int(scheduler_lr_reductions),
+        "resample_every_optimizer_steps": int(resample_every),
+        "training_batch_resamples_total": int(training_batch_resamples_total),
+        "training_batches_sampled_total": int(training_batches_sampled_total),
+        "sel_pde_rms_last": None if last_sel is None else float(last_sel[0]),
+        "sel_terminal_rms_last": None if last_sel is None else float(last_sel[1]),
+        "sel_pres_last": None if last_sel is None else float(last_sel[2]),
+        "scheduler_score_last": None if last_sel is None else float(last_sel[2]),
+        "sel_pres_best": (
+            None if not math.isfinite(best_sel_pres) else float(best_sel_pres)),
+        "sel_check_epoch_last": None if last_sel is None else int(last_sel_epoch),
         "hjb_guard_mode": hjb_guard_mode,
         "hjb_guard_version": HJB_GUARD_VERSION,
         "hjb_guard_tau_vy_final": tau_vy_now,
         "hjb_guard_tau_denom_final": tau_denom_now,
+        **_rollback_status(),
     })
     return loss_history, optimizer, stop_info
 
@@ -1482,25 +2327,60 @@ def eval_pinn_on_grid_margin(
 
 def compute_metrics(
     V_pinn: np.ndarray, c_pinn: np.ndarray, pi_pinn: np.ndarray,
-    V_cf: np.ndarray, c_cf: np.ndarray, pi_cf: np.ndarray
+    V_cf: np.ndarray, c_cf: np.ndarray, pi_cf: np.ndarray,
+    *,
+    Vw_pinn: np.ndarray, Vww_pinn: np.ndarray,
+    Vw_cf: np.ndarray, Vww_cf: np.ndarray,
 ) -> Dict[str, float]:
-    mse_V = float(np.mean((V_pinn - V_cf) ** 2))
-    mse_c = float(np.mean((c_pinn - c_cf) ** 2))
-    mse_pi = float(np.mean((pi_pinn - pi_cf) ** 2))
+    """Common all-margin value/bundle/control metrics.
 
-    rel_l2_V = _relative_l2(V_pinn, V_cf)
-    rel_l2_c = _relative_l2(c_pinn, c_cf)
-    rel_l2_pi = _relative_l2(pi_pinn, pi_cf)
+    The bundle is the reduced wealth-coordinate pair ``(V_w,V_ww)``.  This
+    Merton problem has no additional factor coordinate and hence no ``V_wx``.
+    """
+    return mem.full_window_metrics(
+        V_pinn, c_pinn, pi_pinn, Vw_pinn, Vww_pinn,
+        V_cf, c_cf, pi_cf, Vw_cf, Vww_cf,
+    )
 
-    max_V_err = float(np.max(np.abs(V_pinn - V_cf)))
-    max_c_err = float(np.max(np.abs(c_pinn - c_cf)))
-    max_pi_err = float(np.max(np.abs(pi_pinn - pi_cf)))
 
-    return {
-        "MSE_V": mse_V, "MSE_c": mse_c, "MSE_pi": mse_pi,
-        "RelL2_V": rel_l2_V, "RelL2_c": rel_l2_c, "RelL2_pi": rel_l2_pi,
-        "MaxErr_V": max_V_err, "MaxErr_c": max_c_err, "MaxErr_pi": max_pi_err,
-    }
+def eval_model_bundle_on_points(
+    value_net: nn.Module,
+    t_np: np.ndarray,
+    w_np: np.ndarray,
+    chunk: int = 4096,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate ``V,V_w,V_ww,c,pi`` on arbitrary paired points."""
+    was_training = value_net.training
+    value_net.eval()
+    t_np = np.asarray(t_np, dtype=np.float32).reshape(-1, 1)
+    w_np = np.asarray(w_np, dtype=np.float32).reshape(-1, 1)
+    V_parts, Vw_parts, Vww_parts, c_parts, pi_parts = [], [], [], [], []
+    for start in range(0, len(t_np), int(chunk)):
+        t = torch.tensor(t_np[start:start + chunk], device=device)
+        y = torch.tensor(
+            np.log(w_np[start:start + chunk]), device=device, requires_grad=True)
+        V = value_net(t, y)
+        V_y = torch.autograd.grad(
+            V, y, torch.ones_like(V), create_graph=True, retain_graph=True)[0]
+        V_yy = torch.autograd.grad(
+            V_y, y, torch.ones_like(V_y), create_graph=False, retain_graph=True)[0]
+        W = torch.exp(y)
+        V_w = V_y / W
+        V_ww = (V_yy - V_y) / (W ** 2)
+        c = compute_c_from_foc_log(V_y, y)
+        pi = compute_pi_from_foc_log_multi(V_y, V_yy, Sigma_inv_mu)
+        V_parts.append(V.detach().cpu().numpy())
+        Vw_parts.append(V_w.detach().cpu().numpy())
+        Vww_parts.append(V_ww.detach().cpu().numpy())
+        c_parts.append(c.detach().cpu().numpy())
+        pi_parts.append(pi.detach().cpu().numpy())
+    if was_training:
+        value_net.train()
+    return (
+        np.concatenate(V_parts), np.concatenate(Vw_parts),
+        np.concatenate(Vww_parts), np.concatenate(c_parts),
+        np.concatenate(pi_parts),
+    )
 
 
 def eval_model_on_points(
@@ -1510,22 +2390,27 @@ def eval_model_on_points(
     chunk: int = 4096,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate V,c,pi on arbitrary paired (t,W) points."""
-    was_training = value_net.training
-    value_net.eval()
-    t_np = np.asarray(t_np, dtype=np.float32).reshape(-1, 1)
-    w_np = np.asarray(w_np, dtype=np.float32).reshape(-1, 1)
-    V_parts, c_parts, pi_parts = [], [], []
-    for start in range(0, len(t_np), int(chunk)):
-        t = torch.tensor(t_np[start:start + chunk], device=device, requires_grad=True)
-        y = torch.tensor(np.log(w_np[start:start + chunk]), device=device, requires_grad=True)
-        V, c, pi, _ = compute_policies_from_log_multi(
-            value_net, t, y, create_graph=False)
-        V_parts.append(V.detach().cpu().numpy())
-        c_parts.append(c.detach().cpu().numpy())
-        pi_parts.append(pi.detach().cpu().numpy())
-    if was_training:
-        value_net.train()
-    return np.concatenate(V_parts), np.concatenate(c_parts), np.concatenate(pi_parts)
+    V, _Vw, _Vww, c, pi = eval_model_bundle_on_points(
+        value_net, t_np, w_np, chunk=chunk)
+    return V, c, pi
+
+
+def eval_metrics_on_points(
+    value_net: nn.Module,
+    t_np: np.ndarray,
+    w_np: np.ndarray,
+) -> Dict[str, float]:
+    """Evaluate the common E9 metric schema on one fixed point set."""
+    t_eval = np.asarray(t_np, dtype=np.float64).reshape(-1, 1)
+    w_eval = np.asarray(w_np, dtype=np.float64).reshape(-1, 1)
+    V, Vw, Vww, c, pi = eval_model_bundle_on_points(value_net, t_eval, w_eval)
+    V_cf, Vw_cf, Vww_cf = closed_form_wealth_bundle(t_eval, w_eval)
+    c_cf = closed_form_c(t_eval, w_eval)
+    pi_cf = np.broadcast_to(pi_star_np.reshape(1, -1), pi.shape)
+    return compute_metrics(
+        V, c, pi, V_cf, c_cf, pi_cf,
+        Vw_pinn=Vw, Vww_pinn=Vww, Vw_cf=Vw_cf, Vww_cf=Vww_cf,
+    )
 
 
 def eval_fulldim_test_metrics(
@@ -1543,12 +2428,7 @@ def eval_fulldim_test_metrics(
         y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
         y_np = y_lo + u_y * (y_hi - y_lo)
         w_np = np.exp(y_np)
-        V_pred, c_pred, pi_pred = eval_model_on_points(value_net, t_np, w_np)
-        V_cf = closed_form_V(t_np, w_np)
-        c_cf = closed_form_c(t_np, w_np)
-        pi_cf = np.broadcast_to(pi_star_np.reshape(1, -1), pi_pred.shape)
-        output[float(margin)] = compute_metrics(
-            V_pred, c_pred, pi_pred, V_cf, c_cf, pi_cf)
+        output[float(margin)] = eval_metrics_on_points(value_net, t_np, w_np)
     return output
 
 
@@ -1662,6 +2542,12 @@ def plot_comparison_heatmaps(
 # 11) Main
 # =============================================================================
 def main():
+    # Timing runs must never execute final plotting: otherwise the measured
+    # evaluation peak can include Matplotlib/image allocations.  Persist the
+    # effective flag so aggregate_compute can audit this invariant directly.
+    ARGS.skip_figures_requested = bool(ARGS.skip_figures)
+    ARGS.skip_figures = bool(
+        ARGS.skip_figures or ARGS.skip_plots or ARGS.timing_mode)
     # Persist an explicit separation between the training HJB continuation,
     # the legacy eta auxiliary denominator, and evaluation-only FOC clamps.
     # This prevents downstream audits from mistaking a direct-PINN change for
@@ -1673,10 +2559,40 @@ def main():
     ARGS.hjb_guard_scope = "direct-nonlinear-hjb-only"
     ARGS.eta_aux_guard_mode = "legacy-abs"
     ARGS.evaluation_policy_guard_mode = "one-sided-hard-clamp"
+    # Config-facing held-out contract. Q_res and Q_sel deliberately reuse the
+    # requested set sizes, but never their samples or algorithmic roles.
+    ARGS.q_res_role = "pres_target_and_official_residual"
+    ARGS.q_res_seed = int(MARKET_SEED)
+    ARGS.q_res_points = int(ARGS.val_points)
+    ARGS.q_res_terminal_points = int(ARGS.val_terminal_points)
+    ARGS.qsel_rollback_active = bool(
+        not ARGS.eval_only
+        and ARGS.lr_schedule == "plateau"
+        and int(ARGS.qsel_rollback_max_rescues) > 0)
+    ARGS.q_sel_role = (
+        "lr_scheduler_and_qsel_rollback"
+        if ARGS.qsel_rollback_active else "lr_scheduler_only")
+    ARGS.q_sel_seed_offset = int(DIRECT_PINN_QSEL_SEED_OFFSET)
+    ARGS.q_sel_seed = int(MARKET_SEED) + int(DIRECT_PINN_QSEL_SEED_OFFSET)
+    ARGS.q_sel_active = bool(not ARGS.eval_only and ARGS.lr_schedule == "plateau")
+    ARGS.q_sel_points = int(ARGS.val_points)
+    ARGS.q_sel_terminal_points = int(ARGS.val_terminal_points)
+    ARGS.q_res_q_sel_independent_streams = True
+    ARGS.scheduler_metric = (
+        "fixed_q_sel_pres" if ARGS.lr_schedule == "plateau" else "none_fixed_lr")
+    ARGS.scheduler_score_formula = HELDOUT_SCORE_FORMULA
+    ARGS.scheduler_patience_unit = "q_sel_checks"
+    ARGS.scheduler_patience_checks = int(ARGS.scheduler_patience)
+    ARGS.scheduler_check_every_optimizer_steps = int(ARGS.val_every)
+    ARGS.resample_every_semantics = (
+        "inner_optimizer_steps; zero=fixed_within_outer; "
+        "refresh_before_step_K_plus_1"
+    )
+    ARGS.training_batch_refresh_at_outer_start = True
     out_dir = os.path.join(ARGS.output_root, ARGS.run_tag)
     weight_dir = ARGS.weight_root or os.path.join(out_dir, "weights")
     recorder = mxu.ExperimentRecorder(out_dir, weight_dir, ARGS)
-    skip_figures = bool(ARGS.skip_figures or ARGS.skip_plots)
+    skip_figures = bool(ARGS.skip_figures)
     loaded_weight_path = None
 
     if ARGS.eval_only:
@@ -1731,7 +2647,33 @@ def main():
 
         train_gpu_peak = None
         if not ARGS.eval_only:
-            recorder.write_status("running")
+            # Do this only after the shared-stop early return above. A run
+            # skipped by an existing stop flag must not archive otherwise
+            # valid official checkpoints from an earlier attempt.
+            recorder.rotate_training_checkpoints()
+            recorder.write_status(
+                "running",
+                q_res_role=ARGS.q_res_role, q_res_seed=ARGS.q_res_seed,
+                q_sel_role=ARGS.q_sel_role, q_sel_seed=ARGS.q_sel_seed,
+                q_sel_active=ARGS.q_sel_active,
+                heldout_score_formula=HELDOUT_SCORE_FORMULA,
+                scheduler_metric=ARGS.scheduler_metric,
+                scheduler_patience_unit=ARGS.scheduler_patience_unit,
+                scheduler_patience_checks=int(ARGS.scheduler_patience),
+                scheduler_check_every_optimizer_steps=int(ARGS.val_every),
+                scheduler_checks=0,
+                qsel_rollback_active=ARGS.qsel_rollback_active,
+                qsel_rollback_factor=float(ARGS.qsel_rollback_factor),
+                qsel_rollback_lr_factor=float(
+                    ARGS.qsel_rollback_lr_factor),
+                qsel_rollback_max_rescues=int(
+                    ARGS.qsel_rollback_max_rescues),
+                qsel_rollback_triggers=0,
+                qsel_rollback_rescues_used=0,
+                resample_every_optimizer_steps=int(ARGS.resample_every),
+                training_batch_resamples_total=0,
+                training_batches_sampled_total=0,
+            )
             loss_history, _opt, stop_info = train_pinn_hybrid_reduced_logw_multi(
                 value_net=value_net,
                 epochs=epochs,
@@ -1749,6 +2691,11 @@ def main():
                 scheduler_factor=float(ARGS.scheduler_factor),
                 scheduler_min_lr=float(ARGS.scheduler_min_lr),
                 lr_schedule=str(ARGS.lr_schedule),
+                qsel_rollback_factor=float(ARGS.qsel_rollback_factor),
+                qsel_rollback_lr_factor=float(
+                    ARGS.qsel_rollback_lr_factor),
+                qsel_rollback_max_rescues=int(
+                    ARGS.qsel_rollback_max_rescues),
                 hjb_guard_mode=str(ARGS.hjb_guard_mode),
                 hjb_vy_guard_eps=float(ARGS.hjb_vy_guard_eps),
                 hjb_denom_guard_eps=float(ARGS.hjb_denom_guard_eps),
@@ -1780,6 +2727,10 @@ def main():
                 torch.cuda.reset_peak_memory_stats(device)
             h = int(elapsed // 3600); m = int((elapsed % 3600) // 60); s = elapsed % 60
             print(f"\nElapsed time: {h:02d}:{m:02d}:{s:05.2f}")
+            if bool(stop_info.get("run_failed", False)):
+                raise RuntimeError(str(
+                    stop_info.get(
+                        "failure_reason", "qsel rollback failed")))
             if bool(stop_info.get("stopped_early", False)):
                 recorder.write_status(
                     "stopped_early", elapsed_sec=elapsed,
@@ -1848,7 +2799,11 @@ def main():
                     policy_kappa_max=kappa_max_bound,
                     policy_c_min=c_min_bound, policy_c_max=c_max_bound,
                     train_gpu_peak_mem_bytes=train_gpu_peak,
-                    timing_mode=bool(ARGS.timing_mode))
+                    timing_mode=bool(ARGS.timing_mode),
+                    **{key: stop_info.get(key) for key in (
+                        SCHEDULER_STATUS_FIELDS
+                        + QSEL_ROLLBACK_STATUS_FIELDS
+                        + RESAMPLING_STATUS_FIELDS)})
             return
 
         # Eval-only uses a temporary metrics file. A failed reevaluation never
@@ -1866,11 +2821,12 @@ def main():
             # Deterministic 2D-grid fallback (also useful for a cheap smoke).
             metrics_by_margin: Dict[float, Dict[str, float]] = {}
             for margin in margins:
-                tt, ww, V_pred, c_pred, pi_pred, _ = eval_pinn_on_grid_margin(
-                    value_net, Nt=Nt, Nw=Nw, margin=margin, chunk=4000)
-                V_cf, c_cf, pi_cf = closed_form_numpy(tt, ww)
-                metrics_by_margin[float(margin)] = compute_metrics(
-                    V_pred, c_pred, pi_pred, V_cf, c_cf, pi_cf)
+                y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
+                t_vals = np.linspace(t_min, t_max - 1e-3, Nt)
+                w_vals = np.exp(np.linspace(y_lo, y_hi, Nw))
+                tt, ww = np.meshgrid(t_vals, w_vals, indexing="ij")
+                metrics_by_margin[float(margin)] = eval_metrics_on_points(
+                    value_net, tt, ww)
 
         metric_rows = []
         for margin in margins:
@@ -1941,13 +2897,29 @@ def main():
                 hjb_guard_tau_vy_final=stop_info.get("hjb_guard_tau_vy_final"),
                 hjb_guard_tau_denom_final=stop_info.get("hjb_guard_tau_denom_final"),
                 train_gpu_peak_mem_bytes=train_gpu_peak,
-                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins)
+                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins,
+                **{key: stop_info.get(key) for key in (
+                    SCHEDULER_STATUS_FIELDS
+                    + QSEL_ROLLBACK_STATUS_FIELDS
+                    + RESAMPLING_STATUS_FIELDS)})
         print("\nDone.")
     except Exception as exc:
         if ARGS.eval_only:
             recorder.mark_failed_eval(reason=repr(exc))
         else:
-            recorder.mark_failed(reason=repr(exc))
+            failure_meta = {}
+            if isinstance(locals().get("stop_info"), dict):
+                failure_meta = {
+                    key: stop_info.get(key)
+                    for key in (
+                        SCHEDULER_STATUS_FIELDS
+                        + QSEL_ROLLBACK_STATUS_FIELDS
+                        + RESAMPLING_STATUS_FIELDS
+                        + ("total_optimizer_steps", "failure_reason",
+                           "failed_admissible_weight_path"))
+                    if key in stop_info
+                }
+            recorder.mark_failed(reason=repr(exc), **failure_meta)
         raise
 
 

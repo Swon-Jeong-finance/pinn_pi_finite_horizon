@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 
 # Merton (with-consumption) PINN / PI-PINN sweep driver.
 # Independent of the Liu tune script; mirrors its UX (BASE dicts, seed sweep,
@@ -15,6 +16,8 @@ set -euo pipefail
 #     bash tune_merton.sh out  # no finite action boxes in either method
 #   PIPINN_OVERRIDES="e3b_checkpoints=1" bash tune_merton.sh out  # exact-map trajectory
 #   AGGREGATE=0 bash tune_merton.sh ...        # skip the seed-aggregation step
+#   MERGE_CONFIG_GROUPS=1 bash tune_merton.sh ...
+#       # explicitly combine split config groups within each method x N x M cell
 #   FORCE_RERUN=1 bash tune_merton.sh ...      # ignore previous _SUCCESS
 #   EVAL_ONLY=1 bash tune_merton.sh ...        # re-evaluate from saved weights
 
@@ -25,12 +28,21 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 PINN_SCRIPT="${PINN_SCRIPT:-$SCRIPT_DIR/merton_nd_consumption_pinn.py}"
 PIPINN_SCRIPT="${PIPINN_SCRIPT:-$SCRIPT_DIR/merton_nd_consumption_pi_pinn.py}"
 mkdir -p "$OUT_ROOT"
+# Keep every persisted path unambiguous even when the launcher is invoked with
+# a relative output root.  This also makes later exact-map/welfare loaders
+# independent of the caller's working directory.
+OUT_ROOT="$(realpath -m "$OUT_ROOT")"
 LOG_DIR="$OUT_ROOT/logs"; mkdir -p "$LOG_DIR"
 
 FORCE_RERUN="${FORCE_RERUN:-0}"      # 1: rerun regardless of previous status
 EVAL_ONLY="${EVAL_ONLY:-0}"          # 1: skip training, re-evaluate from weights
 ALLOW_LEGACY_BEST_EVAL="${ALLOW_LEGACY_BEST_EVAL:-0}"  # eval-only diagnostic/legacy fallback
 AGGREGATE="${AGGREGATE:-1}"          # 1: run aggregate_seeds after the sweep
+MERGE_CONFIG_GROUPS="${MERGE_CONFIG_GROUPS:-0}"  # 1: opt-in recovery merge
+case "$MERGE_CONFIG_GROUPS" in
+  0|1) ;;
+  *) echo "[error] MERGE_CONFIG_GROUPS must be 0 or 1" >&2; exit 2 ;;
+esac
 
 # Paper sweep defaults: N={10,50}, methods={PINN,PI-PINN}, and ten fixed
 # training seeds {1,2,3,5,7,11,17,23,42,101}.
@@ -141,10 +153,20 @@ declare -A BASE_PINN=(
   [outer_iters]=20
   [eval_epochs]=2000
   [resample_every]=200
-  [scheduler_patience]=5000
+  # Direct-PINN plateau scheduling uses only fixed held-out Q_sel. Patience is
+  # counted in Q_sel checks (one check per val_every optimizer steps), not in
+  # stochastic training steps. With val_every=25, 25 checks correspond to
+  # 625 optimizer steps. Q_res uses a separately seeded fixed stream.
+  [scheduler_patience]=25
   [scheduler_factor]=0.5
   [scheduler_min_lr]=1e-8
   [lr_schedule]=plateau
+  # Emergency rollback uses only raw p_sel on fixed Q_sel. It restores the
+  # last admissible model+Adam snapshot, halves LR, resets the plateau state,
+  # and refreshes the coupled training batch. The third trigger fails the run.
+  [qsel_rollback_factor]=10.0
+  [qsel_rollback_lr_factor]=1.0
+  [qsel_rollback_max_rescues]=2
   # Direct nonlinear-HJB guard. Use PINN_OVERRIDES or an explicit run_pinn
   # override for comparisons with the historical abs/hard continuations.
   [hjb_guard_mode]=softplus
@@ -167,6 +189,7 @@ declare -A BASE_PINN=(
   [pres_target]=none
   [val_points]=50000
   [val_terminal_points]=10000
+  # Shared sizes for separate Q_res/Q_sel sets; this is also Q_sel check cadence.
   [val_every]=25
   [save_iterate_every]=0
   [diag_points]=8192
@@ -219,11 +242,13 @@ declare -A BASE_PIPINN=(
   [pi_init_method]=myopic
   # Bash/public name intentionally follows the Liu experiment vocabulary;
   # build_flags maps it to Python's Merton-specific --pi-init-scale.
-  [theta_init_scale]="${THETA_INIT_SCALE:-0.5}"
+  # User-approved baseline in tune_merton(10).sh uses the fractional-myopic
+  # initialization a=0.5. Override theta_init_scale=1.0 for exact myopic.
+  [theta_init_scale]=0.5
   [c_init_method]=proportional
   [w_terminal]=10.0
   [w_shape]=1.0
-  [w_eta]=3.0
+  [w_eta]=20.0
   [eta_clip]=10.0
   [eta_focus_w]=none
   [pres_target]=none
@@ -235,7 +260,7 @@ declare -A BASE_PIPINN=(
   [sel_terminal_points]=2000
   [sel_every]=50
   [sel_patience]=0
-  [pe_resample_every]="${PE_RESAMPLE_EVERY:-0}"
+  [pe_resample_every]=0
   [save_iterate_every]=0
   [diag_points]=8192
   [diag_every]=1
@@ -469,12 +494,15 @@ run_all_jobs() {
 #   run_pipinn n_assets=50 w_eta=1.0 sel_patience=3
 #   run_pinn   n_assets=10 seed=1            # single-seed (no SEEDS expansion)
 
-for n_assets in "${N_ASSET_VALUES[@]}"; do
-  run_pinn   "n_assets=$n_assets"
-  run_pinn   "n_assets=$n_assets" outer_iters=30
-  run_pipinn "n_assets=$n_assets"
-  run_pipinn "n_assets=$n_assets" outer_iters=30
-done
+run_pinn   n_assets=10
+# run_pipinn n_assets=10
+# run_pipinn n_assets=10 w_eta=15.0
+# run_pipinn n_assets=10 w_eta=10.0
+
+run_pinn   n_assets=50
+# run_pipinn n_assets=50
+# run_pipinn n_assets=50 w_eta=15.0
+# run_pipinn n_assets=50 w_eta=10.0
 
 
 
@@ -487,13 +515,18 @@ fi
 
 if [[ "$AGGREGATE" == "1" && "$EVAL_ONLY" != "1" ]]; then
   echo "[info] aggregating seeds -> $OUT_ROOT"
-  "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" \
-    --out-root "$OUT_ROOT" \
-    --expected-seeds "$SEEDS" \
-    --expected-n-assets "$(printf '%s\n' "${!ENQUEUED_N[@]}" | sort -n | paste -sd, -)" \
-    --expected-m-states "1" \
-    --expected-models "pinn,pipinn" \
+  aggregate_args=(
+    --out-root "$OUT_ROOT"
+    --expected-seeds "$SEEDS"
+    --expected-n-assets "$(printf '%s\n' "${!ENQUEUED_N[@]}" | sort -n | paste -sd, -)"
+    --expected-m-states "1"
+    --expected-models "pinn,pipinn"
     --strict-market-snapshots
+  )
+  if [[ "$MERGE_CONFIG_GROUPS" == "1" ]]; then
+    aggregate_args+=(--merge-config-groups)
+  fi
+  "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" "${aggregate_args[@]}"
 fi
 
 echo "[done] Merton sweep complete: $OUT_ROOT"

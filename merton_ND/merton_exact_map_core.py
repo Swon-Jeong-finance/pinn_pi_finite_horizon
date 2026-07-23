@@ -14,6 +14,7 @@ never updated from the finite-difference solution.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Mapping, Tuple
 
@@ -206,6 +207,77 @@ def analytic_optimal_policy(problem: MertonProblem) -> PolicyFn:
     return policy
 
 
+def constant_proportional_policy(
+    problem: MertonProblem,
+    portfolio: Array,
+    consumption_ratio: float,
+) -> PolicyFn:
+    """Return the frozen feedback ``pi=pi0, c=chi0*w``.
+
+    This deliberately simple nonoptimal policy is useful as an independent
+    manufactured-solution check.  Unlike the optimal-policy check, it tests
+    the frozen PDE's drift and source terms without reusing the Merton
+    first-order conditions.
+    """
+    pi0 = np.asarray(portfolio, dtype=np.float64).reshape(-1)
+    chi0 = float(consumption_ratio)
+    if pi0.shape != (problem.n_assets,):
+        raise ValueError("constant portfolio has an incompatible shape")
+    if not math.isfinite(chi0) or chi0 <= 0.0:
+        raise ValueError("consumption_ratio must be finite and positive")
+
+    def policy(_tau: float, y: Array) -> Tuple[Array, Array, Mapping[str, float]]:
+        wealth = np.exp(np.asarray(y, dtype=np.float64).reshape(-1))
+        consumption = chi0 * wealth
+        pi = np.broadcast_to(pi0.reshape(1, -1), (wealth.size, pi0.size)).copy()
+        return consumption, pi, {"points": float(wealth.size)}
+
+    return policy
+
+
+def constant_proportional_closed_form(
+    problem: MertonProblem,
+    tau: Array,
+    y: Array,
+    portfolio: Array,
+    consumption_ratio: float,
+) -> Tuple[Array, Array, Array]:
+    """Analytic value bundle for ``pi=pi0, c=chi0*w``.
+
+    Writing ``q=1-gamma`` and ``u=A(tau) exp(q y)/q``, the frozen PDE reduces
+    to ``A'=beta*A+chi0**q`` with ``A(0)=bequest``.  This oracle is independent
+    of the optimal-policy closed form and supports non-unit bequest weights.
+    """
+    pi0 = np.asarray(portfolio, dtype=np.float64).reshape(-1)
+    chi0 = float(consumption_ratio)
+    if pi0.shape != (problem.n_assets,):
+        raise ValueError("constant portfolio has an incompatible shape")
+    if not math.isfinite(chi0) or chi0 <= 0.0:
+        raise ValueError("consumption_ratio must be finite and positive")
+    tau_arr, y_arr = np.broadcast_arrays(
+        np.asarray(tau, dtype=np.float64), np.asarray(y, dtype=np.float64)
+    )
+    q = 1.0 - problem.gamma
+    variance = float(pi0 @ problem.sigma @ pi0)
+    beta = (
+        q * (problem.risk_free + float(pi0 @ problem.mu_excess) - chi0)
+        + 0.5 * q * (q - 1.0) * variance
+        - problem.discount
+    )
+    if abs(beta) < 1e-12:
+        amplitude = problem.bequest + np.power(chi0, q) * tau_arr
+    else:
+        amplitude = (
+            problem.bequest * np.exp(beta * tau_arr)
+            + np.power(chi0, q) * np.expm1(beta * tau_arr) / beta
+        )
+    exp_qy = np.exp(q * y_arr)
+    value = amplitude * exp_qy / q
+    value_y = amplitude * exp_qy
+    value_yy = q * amplitude * exp_qy
+    return value, value_y, value_yy
+
+
 def policy_coefficients(
     problem: MertonProblem,
     y: Array,
@@ -358,9 +430,13 @@ def solve_frozen_policy(
 
     ``boundary='robin'`` imposes the homogeneous CRRA scaling relation
     ``u_y=(1-gamma)u`` without injecting the exact value amplitude.
-    ``boundary='exact-dirichlet'`` is available as an audit closure.  The
-    reported exact-map ratio should be checked across FD domain sizes (and,
-    when practical, both closures).
+    ``boundary='exact-dirichlet'`` is a compatibility name for an
+    *optimal-reference Dirichlet* sensitivity closure: it injects the
+    closed-form optimal value at the lateral boundaries.  It is exact only
+    when the frozen policy is optimal and must not be used as an independent
+    boundary oracle for a nonoptimal neural policy.  The homogeneous Robin
+    closure is therefore the primary specification; the reported exact-map
+    ratio should also be checked across FD domain sizes.
     """
     if not 0.5 <= float(theta_method) <= 1.0:
         raise ValueError("theta_method must lie in [0.5, 1]")

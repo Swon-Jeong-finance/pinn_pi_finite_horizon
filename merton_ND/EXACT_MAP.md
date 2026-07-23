@@ -32,23 +32,43 @@ Accordingly, every output row records all three fields:
 The final checkpoint can still be mapped even though its resulting greedy
 policy is not used by another training outer loop.
 
-## Producing E3b training artifacts
+E4 also solves the configured initial policy
+`pi_0=pi_init_scale*pi_myopic`, `c_0=rho_discount*W` independently and compares
+it with `value_net_iter0001.pt`, producing `defect_iter=0`. Adjacent
+checkpoint pairs then produce `defect_iter=1,...,N-1`. Thus a complete
+1--N checkpoint schedule yields exactly N defect rows. Every row is attached
+to outer `n+1`'s official post-restore fixed-Q_res value.
 
-For Figure-2 runs, enable E3b checkpoints explicitly. The launcher applies
-global overrides to every matching run, while a value written on an individual
-`run_pipinn` line has higher precedence.
+Defect refinement is not inferred from the exact-map-ratio audit. The
+evaluator separately writes `exact_map_defect_refinement.csv`, recomputing
+each selected \(\delta_n\) over the FD grid/domain/boundary variants while
+holding the next neural bundle fixed. `delta_0` is always audited; adjacent
+defects follow `--verify-checkpoints` (paper default: `all`). The E4
+postprocessor requires passing evidence for `delta_0`, the first and last
+adjacent defects, and the defect attaining the run-wise maximum
+\(\widehat p_X\).
+
+## Producing exact-map and E4 training artifacts
+
+The empirical paper Figure 2 is now produced from relative L2 outer
+trajectories by `postprocess_contraction.py`; it does not use this FD ratio.
+The exact-map result is a separate numerical experiment.
+
+For the complete E4 maximum over every policy-evaluation error, save every
+PI-PINN outer iterate and keep the sparse E3b schedule off:
 
 ```bash
 SEEDS="1,2,3,5,7,11,17,23,42,101" \
 N_ASSETS_LIST="10,50" \
-PIPINN_OVERRIDES="e3b_checkpoints=true" \
+PIPINN_OVERRIDES="e3b_checkpoints=false save_iterate_every=1" \
 bash tune_merton.sh /path/to/merton_sweep 2
 ```
 
-The E3b schedule retains outer iterations 1--10, every tenth iteration, and
-the final iteration. A checkpoint is taken after policy evaluation and after
-the optional held-out model+optimizer restoration. The manifest records this
-timing and the paper-index offset.
+`e3b_checkpoints=true` remains available for the older sparse schedule
+(outers 1--10, every tenth, and final), but that schedule is insufficient for
+the all-iteration E4 maximum. A checkpoint is taken after policy evaluation
+and after optional held-out model+optimizer restoration. The manifest records
+this timing and the paper-index offset.
 
 The launcher stores run data and weights separately:
 
@@ -79,6 +99,13 @@ schedule and verifies that the official final, last, and final-iterate files
 represent the same tensor state; it does not assume independently serialized
 PyTorch files have identical bytes.
 
+Current launchers canonicalize the sweep root before recording paths. For
+legacy runs that stored an `OUT_ROOT`-relative `weight_dir`, the loader first
+resolves that path against the `cwd` recorded in `config.json`, then checks
+run-directory and invocation-directory compatibility fallbacks. Thus a
+relative path such as `outputs/sweep/weights/...` is not incorrectly appended
+to the already nested run directory.
+
 Legacy checkpoints without `policy_guard_mode` are not guessed. They require
 an audited `--policy-mode` override; this prevents an older sign-preserving
 guard from being silently evaluated as the current one-sided map.
@@ -106,15 +133,28 @@ python3 merton_exact_map_fd.py \
   --verify-checkpoints all
 ```
 
-Multiple runs discovered below a sweep root can be selected with
-`--out-root` and `--run-name-regex`. The default expected training seeds are
-`1,2,3,5,7,11,17,23,42,101`, matching `tune_merton.sh`.
+Using a smaller verification subset remains possible for exploratory
+exact-map ratios, but the E4 paper aggregation will fail if that subset omits
+one of its required defect-refinement iterations.
 
-Before a large run, execute the PyTorch-free manufactured check:
+Multiple runs discovered below a sweep root can be selected with
+`--out-root` and `--run-name-regex`. Seed completeness is not forced by
+default. Pass
+`--expected-seeds "1,2,3,5,7,11,17,23,42,101"` explicitly for the paper
+sweep; smaller pilots can use their own list or omit the option.
+
+Before a large run, execute the PyTorch-free manufactured checks:
 
 ```bash
 python3 merton_exact_map_fd.py --self-test
 ```
+
+The self-test includes both the closed-form optimal frozen policy and an
+independent nonoptimal constant-proportional policy
+`pi(t,w)=pi_0`, `c(t,w)=chi_0 w` with non-unit bequest. The second oracle
+reduces the PDE to a scalar homothetic ODE and therefore checks the frozen
+source/drift signs, Robin closure, and remaining-time orientation without
+reusing the optimal first-order conditions.
 
 ## Trainer map reproduced by the evaluator
 
@@ -193,7 +233,13 @@ The frozen PDE is solved forward in remaining time with a theta-method
 tridiagonal scheme. The compatibility option `--rannacher-steps` denotes
 initial full-step backward-Euler damping, not classical two-half-step
 Rannacher smoothing. The primary boundary is the homogeneous CRRA Robin
-condition `u_y=(1-gamma)u`; exact Dirichlet closure is an audit variant.
+condition `u_y=(1-gamma)u`. The compatibility label `exact-dirichlet` means
+an **optimal-reference Dirichlet sensitivity audit**: it injects the
+closed-form optimal value `V*` at the lateral boundary. It is exact for the
+optimal-policy manufactured check, but it is not an exact boundary oracle for
+a nonoptimal frozen neural policy and must not be used as the paper primary.
+This distinction is emitted in `exact_map_protocol.json` and in each
+refinement CSV row's `boundary_semantics` field.
 
 The primary evaluation window follows the trainer's calendar-time `[0,T)`
 convention: the terminal face `t=T` is excluded, while `t=0` is retained.
@@ -218,12 +264,29 @@ After all seed runs have successful exact-map outputs:
 python3 merton_exact_map_fd.py \
   --aggregate-only \
   --out-root /path/to/merton_sweep \
-  --expected-seeds "1,2,3,5,7,11,17,23,42,101"
+  --expected-seeds "1,2,3,5,7,11,17,23,42,101" \
+  --min-seeds 10
+```
+
+The separate E4 residual-transfer aggregation is:
+
+```bash
+python3 postprocess_regularity_transfer.py \
+  --out-root /path/to/merton_residual_sweep \
+  --n-assets 50 \
+  --expected-seeds "1,2,3,5,7,11,17,23,42,101" \
+  --min-seeds 10 \
+  --formats png,pdf \
+  --overwrite
 ```
 
 Aggregation checks the seed set, fixed market, checkpoint support, training
 group, and FD/evaluation protocol. Ratios are computed within each seed before
 the mean, sample standard deviation, and Student-t 95% interval are formed.
+The seed-set equality check is enabled only when `--expected-seeds` is
+nonempty; `--allow-incomplete` then controls whether a mismatch is tolerated.
+Independently, `--min-seeds` controls the minimum usable seed count per group
+and defaults to 2 for the seed-level uncertainty summary.
 The paper default `--floor-multiple 0` retains every finite checkpoint. A
 positive value enables an exploratory cutoff relative to a late neural
 input-error scale; that scale is explicitly not an FD discretization floor and
@@ -248,14 +311,21 @@ Outputs:
 <run>/exact_map_fd/
   exact_map_ratios.csv
   exact_map_refinement.csv
+  exact_map_defects.csv
+  evaluated_bundles/*.npz
   exact_map_config.json
   exact_map_status.json
   _SUCCESS_EXACT_MAP
 
 <sweep>/exact_map_paper/
-  figure2_exact_map_ratios.csv
-  figure2_exact_map_summary.csv
-  figure2_exact_map_floor_summary.csv
-  figure2_exact_map_worst_summary.csv
-  figure2_exact_map.{png,pdf,svg,eps}
+  exact_map_ratios_by_seed.csv
+  exact_map_ratio_summary.csv
+  exact_map_floor_summary.csv
+  exact_map_worst_summary.csv
+  exact_map_contraction.{png,pdf,svg,eps}
 ```
+
+For E4 residual-transfer evidence, run `postprocess_regularity_transfer.py`
+after exact-map evaluation. It refuses sparse checkpoint schedules, legacy
+pre-restore residual semantics, missing or hash-mismatched evaluated bundles,
+incomplete defect indices, and mixed FD protocols.

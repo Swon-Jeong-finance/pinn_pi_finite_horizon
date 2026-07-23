@@ -30,6 +30,8 @@ import numpy as np
 from merton_exact_map_core import (
     FDGrid,
     MertonProblem,
+    constant_proportional_closed_form,
+    constant_proportional_policy,
     crra_closed_form,
     evaluate_fd_bundle,
     solve_frozen_policy,
@@ -38,13 +40,25 @@ from merton_exact_map_core import (
 
 
 CHECKPOINT_RE = re.compile(r"value_net_iter(\d+)\.pt$")
+BOUNDARY_SEMANTICS = {
+    "robin": (
+        "primary homogeneous CRRA Robin closure u_y=(1-gamma)u; "
+        "does not inject the optimal value amplitude"
+    ),
+    "exact-dirichlet": (
+        "optimal-reference Dirichlet sensitivity audit; compatibility name "
+        "that injects closed-form V* and is not an exact boundary oracle for "
+        "a nonoptimal frozen policy"
+    ),
+}
 RATIO_FIELDS = [
     "problem", "group", "protocol_hash", "model_type", "n_assets", "seed", "market_seed",
     "horizon", "gamma", "discount", "bequest", "risk_free", "network_dtype",
     "checkpoint_outer_iter", "source_iter", "target_policy_iter", "checkpoint",
     "checkpoint_sha256", "checkpoint_state_sha256",
     "market_sha256", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min", "ev_y_max",
-    "fd_margin", "fd_y_min", "fd_y_max", "boundary", "drift_scheme",
+    "fd_margin", "fd_y_min", "fd_y_max", "boundary", "boundary_semantics",
+    "drift_scheme",
     "grid_factor", "ny", "nt", "dy", "dt", "is_primary", "is_verification",
     "e_input_value", "e_input_vw", "e_input_vww", "e_input_vy", "e_input_vyy",
     "e_input_deriv", "e_input_X", "e_map_value", "e_map_vw", "e_map_vww",
@@ -64,6 +78,46 @@ RATIO_FIELDS = [
     "max_linear_residual", "policy_hash", "grid_abs_change", "grid_rel_change",
     "domain_abs_change", "domain_rel_change", "boundary_abs_change",
     "rho_sensitivity_envelope", "refinement_status", "contraction_status",
+]
+
+# E4 evaluates the neural policy-evaluation error at iteration ``n`` by
+# comparing the *next* neural checkpoint with the FD value generated from the
+# current checkpoint's greedy policy.  Keeping this in a separate table avoids
+# conflating the exact-map contraction ratio with the approximation hypothesis
+# ``delta_n = v_tilde_n - v^{alpha_n}``.
+DEFECT_FIELDS = [
+    "problem", "group", "protocol_hash", "model_type", "n_assets", "seed",
+    "market_seed", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min",
+    "ev_y_max", "defect_iter", "defect_kind",
+    "checkpoint_outer_iter", "source_iter",
+    "target_policy_iter", "next_checkpoint_outer_iter", "next_neural_iter",
+    "checkpoint_state_sha256", "next_checkpoint_state_sha256",
+    "frozen_policy_sha256",
+    "fd_margin", "boundary", "grid_factor", "ny", "nt", "is_verification",
+    "delta_value_sup", "delta_vw_sup", "delta_vww_sup", "delta_vy_sup",
+    "delta_vyy_sup", "delta_bundle_sup", "delta_X",
+    "defect_grid_abs_change", "defect_grid_rel_change",
+    "defect_domain_abs_change", "defect_domain_rel_change",
+    "defect_boundary_abs_change", "defect_sensitivity_envelope",
+    "p_res_post_restore", "p_res_source", "residual_semantics",
+    "evaluated_bundle_path", "evaluated_bundle_sha256",
+    "refinement_status", "map_variant", "local_map_unmodified_on_xfd",
+    "whole_space_map_claim",
+]
+
+DEFECT_REFINEMENT_FIELDS = [
+    "problem", "group", "protocol_hash", "model_type", "n_assets", "seed",
+    "market_seed", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min",
+    "ev_y_max", "defect_iter", "defect_kind", "target_policy_iter",
+    "next_checkpoint_outer_iter", "frozen_policy_sha256",
+    "fd_margin", "boundary", "grid_factor", "ny", "nt", "is_primary",
+    "is_verification", "delta_value_sup", "delta_vw_sup", "delta_vww_sup",
+    "delta_vy_sup", "delta_vyy_sup", "delta_bundle_sup", "delta_X",
+    "defect_grid_abs_change", "defect_grid_rel_change",
+    "defect_domain_abs_change", "defect_domain_rel_change",
+    "defect_boundary_abs_change", "defect_sensitivity_envelope",
+    "refinement_status", "map_variant", "local_map_unmodified_on_xfd",
+    "whole_space_map_claim",
 ]
 
 ACTIVATION_FIELDS = [
@@ -115,6 +169,18 @@ def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def atomic_npz(path: Path, **arrays: np.ndarray) -> None:
+    """Atomically persist an evaluated numerical bundle without pickle."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as handle:
+        np.savez_compressed(
+            handle,
+            **{name: np.asarray(value) for name, value in arrays.items()},
+        )
+    os.replace(tmp, path)
+
+
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -123,6 +189,40 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[st
         writer.writeheader()
         writer.writerows(rows)
     os.replace(tmp, path)
+
+
+def load_outer_residuals(run_dir: Path) -> Tuple[Dict[int, float], str]:
+    """Load the official per-outer residual attached to neural checkpoints.
+
+    New trainers record ``val_pres_post_restore`` for the official restored
+    model.  A legacy ``val_pres`` fallback is retained only so an old exact-map
+    run can still be diagnosed; E4 paper aggregation rejects that legacy
+    semantics instead of silently mixing pre- and post-restore states.
+    """
+    path = run_dir / "outer_history.csv"
+    if not path.is_file():
+        return {}, "missing"
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or ())
+        if "val_pres_post_restore" in fields:
+            field = "val_pres_post_restore"
+            semantics = "official_post_restore"
+        elif "val_pres" in fields:
+            field = "val_pres"
+            semantics = "legacy_val_pres"
+        else:
+            return {}, "missing"
+        values: Dict[int, float] = {}
+        for row in reader:
+            try:
+                outer = int(float(str(row.get("outer_iter", ""))))
+                value = float(str(row.get(field, "")))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0.0:
+                values[outer] = value
+    return values, semantics
 
 
 def parse_float_list(text: str) -> List[float]:
@@ -283,11 +383,55 @@ class RunSpec:
     checkpoint_manifest_hash: str
 
 
-def _resolve_path(value: Any, run_dir: Path) -> Optional[Path]:
+def _configured_path_candidates(
+    value: Any,
+    run_dir: Path,
+    cfg: Optional[Mapping[str, Any]] = None,
+) -> List[Path]:
+    """Resolve recorded paths without assuming they were run-dir relative.
+
+    Older launchers recorded ``weight_dir`` relative to the shell working
+    directory while ``config.json`` lives several levels below it.  Joining
+    that path to ``run_dir`` duplicates the output prefix.  The recorder also
+    stores its launch ``cwd``, so prefer that provenance, then retain the
+    historical run-directory interpretation and the invocation directory as
+    compatibility fallbacks.
+    """
     if value in (None, ""):
-        return None
-    path = Path(str(value)).expanduser()
-    return path.resolve() if path.is_absolute() else (run_dir / path).resolve()
+        return []
+    raw = Path(str(value)).expanduser()
+    if raw.is_absolute():
+        return [raw.resolve()]
+
+    roots: List[Path] = []
+    if cfg is not None:
+        recorded_cwd = _pick(
+            cfg,
+            ("cwd", "working_directory", "launch_cwd"),
+            default=None,
+        )
+        if recorded_cwd not in (None, ""):
+            roots.append(Path(str(recorded_cwd)).expanduser().resolve())
+    roots.extend((run_dir.resolve(), Path.cwd().resolve()))
+
+    candidates: List[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidate = (root / raw).resolve()
+        key = str(candidate)
+        if key not in seen:
+            candidates.append(candidate)
+            seen.add(key)
+    return candidates
+
+
+def _resolve_path(
+    value: Any,
+    run_dir: Path,
+    cfg: Optional[Mapping[str, Any]] = None,
+) -> Optional[Path]:
+    candidates = _configured_path_candidates(value, run_dir, cfg)
+    return candidates[0] if candidates else None
 
 
 def discover_checkpoints(weight_dir: Path, explicit: Sequence[Path] = ()) -> List[Tuple[int, Path]]:
@@ -355,7 +499,14 @@ def load_run_spec(
     metadata_provenance: Dict[str, str] = {}
 
     market_path_value = _pick(cfg, ("market_params_path", "market_path"), default=None)
-    market_path = _resolve_path(market_path_value, run_dir) or (run_dir / "market_params.npz")
+    market_candidates = _configured_path_candidates(
+        market_path_value, run_dir, cfg
+    )
+    market_candidates.append((run_dir / "market_params.npz").resolve())
+    market_path = next(
+        (path for path in market_candidates if path.is_file()),
+        market_candidates[0],
+    )
     if not market_path.is_file():
         raise FileNotFoundError(
             f"structured exact-map run requires a frozen market snapshot: {market_path}"
@@ -659,13 +810,15 @@ def load_run_spec(
     if weight_dir_override is not None:
         weight_dir = weight_dir_override.expanduser().resolve()
     else:
-        configured = _resolve_path(
-            _pick(cfg, ("weight_dir", "weight_root", "weights_dir"), default=None), run_dir
+        configured_candidates = _configured_path_candidates(
+            _pick(cfg, ("weight_dir", "weight_root", "weights_dir"), default=None),
+            run_dir,
+            cfg,
         )
-        candidates = [configured, run_dir / "weights", run_dir]
+        candidates = configured_candidates + [run_dir / "weights", run_dir]
         weight_dir = next(
             (path.resolve() for path in candidates if path is not None and (path / "iterates").is_dir()),
-            (configured or run_dir).resolve(),
+            (configured_candidates[0] if configured_candidates else run_dir).resolve(),
         )
     # Validate the completed run against its full on-disk schedule even when
     # the caller selects a smaller exploratory checkpoint subset.  Otherwise
@@ -847,9 +1000,14 @@ def load_run_spec(
                 f"iterate schedule ends at {actual_outers[-1]}, but completed run declares final outer {expected_final}"
             )
         final_checkpoint = weight_dir / "value_net_final.pt"
-        status_final_path = _resolve_path(status_payload.get("final_weight_path"), run_dir)
-        if not final_checkpoint.is_file() and status_final_path is not None:
-            final_checkpoint = status_final_path
+        status_final_candidates = _configured_path_candidates(
+            status_payload.get("final_weight_path"), run_dir, cfg
+        )
+        if not final_checkpoint.is_file():
+            final_checkpoint = next(
+                (path for path in status_final_candidates if path.is_file()),
+                status_final_candidates[0] if status_final_candidates else final_checkpoint,
+            )
         if not final_checkpoint.is_file():
             raise FileNotFoundError(f"completed run is missing official final checkpoint: {final_checkpoint}")
         declared_final_hash = str(status_payload.get("final_checkpoint_sha256", ""))
@@ -1570,6 +1728,157 @@ def _map_variant(fd_diag: Mapping[str, float], ev_diag: Mapping[str, float]) -> 
     return "locally_unmodified_on_sampled_xfd", 1
 
 
+def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
+    """Reconstruct the trainer's deterministic outer-zero policy exactly.
+
+    Random initialization is intentionally rejected: the historical trainer
+    sampled it independently at each call, so it is not a reproducible
+    state-feedback function on the FD grid.  Paper runs use the deterministic
+    myopic/proportional contract.
+    """
+    pi_method = str(run.training_protocol.get("pi_init_method", "myopic"))
+    c_method = str(run.training_protocol.get("c_init_method", "proportional"))
+    pi_scale = float(run.training_protocol.get("pi_init_scale", 1.0))
+    if pi_method not in {"myopic", "zero"}:
+        raise ValueError(
+            "E4 delta_0 requires deterministic pi_init_method=myopic or zero; "
+            f"got {pi_method!r}"
+        )
+    if c_method not in {"proportional", "zero"}:
+        raise ValueError(
+            "E4 delta_0 requires deterministic c_init_method=proportional or zero; "
+            f"got {c_method!r}"
+        )
+    if not math.isfinite(pi_scale) or pi_scale <= 0.0:
+        raise ValueError("pi_init_scale must be positive and finite")
+
+    storage_dtype = (
+        np.float32 if str(run.network.dtype).lower() == "float32" else np.float64
+    )
+    if pi_method == "myopic":
+        pi_star_storage = np.asarray(
+            run.problem.sigma_inv_mu / run.problem.gamma,
+            dtype=storage_dtype,
+        )
+        portfolio_template = np.asarray(
+            storage_dtype(pi_scale) * pi_star_storage, dtype=storage_dtype
+        )
+    else:
+        portfolio_template = np.zeros(run.problem.n_assets, dtype=storage_dtype)
+    policy_hash = stable_hash({
+        "kind": "trainer-initial-policy",
+        "pi_init_method": pi_method,
+        "pi_init_scale": pi_scale,
+        "c_init_method": c_method,
+        "discount": run.problem.discount,
+        "portfolio_template": portfolio_template.tolist(),
+        "policy_bounds": asdict(run.policy),
+    })
+
+    def policy(
+        _tau: float,
+        y: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, Mapping[str, float]]:
+        y_array = np.asarray(y, dtype=storage_dtype).reshape(-1)
+        wealth = np.exp(y_array)
+        n = int(y_array.size)
+        portfolio_raw = np.broadcast_to(
+            portfolio_template.reshape(1, -1),
+            (n, run.problem.n_assets),
+        ).copy()
+        portfolio = portfolio_raw.copy()
+        if run.policy.portfolio_min is not None:
+            portfolio = np.maximum(portfolio, float(run.policy.portfolio_min))
+        if run.policy.portfolio_max is not None:
+            portfolio = np.minimum(portfolio, float(run.policy.portfolio_max))
+        portfolio_component_clipped = portfolio != portfolio_raw
+
+        if c_method == "proportional":
+            consumption_raw = storage_dtype(run.problem.discount) * wealth
+        else:
+            floor = (
+                1e-8
+                if run.policy.consumption_min is None
+                else float(run.policy.consumption_min)
+            )
+            consumption_raw = np.full(n, floor, dtype=storage_dtype)
+        kappa_raw = consumption_raw / wealth
+        kappa = kappa_raw.copy()
+        if run.policy.kappa_min is not None:
+            kappa = np.maximum(kappa, float(run.policy.kappa_min))
+        if run.policy.kappa_max is not None:
+            kappa = np.minimum(kappa, float(run.policy.kappa_max))
+        consumption_level_raw = kappa * wealth
+        consumption = consumption_level_raw.copy()
+        if run.policy.consumption_min is not None:
+            consumption = np.maximum(
+                consumption, float(run.policy.consumption_min)
+            )
+        if run.policy.consumption_max is not None:
+            consumption = np.minimum(
+                consumption, float(run.policy.consumption_max)
+            )
+
+        kappa_clipped = kappa != kappa_raw
+        consumption_clipped = consumption != consumption_level_raw
+        portfolio_any_clipped = np.any(portfolio_component_clipped, axis=1)
+        return consumption, portfolio, {
+            "points": float(n),
+            "vw_guard_count": 0.0,
+            "numerator_guard_count": 0.0,
+            "denominator_guard_count": 0.0,
+            "positive_curvature_count": 0.0,
+            "kappa_clip_count": float(np.count_nonzero(kappa_clipped)),
+            "consumption_clip_count": float(
+                np.count_nonzero(consumption_clipped)
+            ),
+            "portfolio_any_clip_count": float(
+                np.count_nonzero(portfolio_any_clipped)
+            ),
+            # FDDiagnostics divides this by the number of points, yielding
+            # the fraction of clipped asset components.
+            "portfolio_component_clip_count": float(
+                np.count_nonzero(portfolio_component_clipped)
+            ) / float(run.problem.n_assets),
+        }
+
+    return policy, policy_hash
+
+
+def policy_diagnostics_on_tensor_grid(
+    policy: Any,
+    problem: MertonProblem,
+    tau: np.ndarray,
+    y: np.ndarray,
+) -> Dict[str, float]:
+    sums: Dict[str, float] = {}
+    points = 0.0
+    min_variance = float("inf")
+    max_variance = 0.0
+    for tau_value in np.asarray(tau, dtype=np.float64).reshape(-1):
+        _c, portfolio, diagnostics = policy(float(tau_value), y)
+        row_points = float(diagnostics.get("points", 0.0))
+        points += row_points
+        for key, value in diagnostics.items():
+            if key != "points":
+                sums[key] = sums.get(key, 0.0) + float(value)
+        variance = np.einsum(
+            "bi,ij,bj->b", portfolio, problem.sigma, portfolio, optimize=True
+        )
+        min_variance = min(min_variance, float(np.min(variance)))
+        max_variance = max(max_variance, float(np.max(variance)))
+    denominator = points if points > 0.0 else 1.0
+    result = {
+        f"policy_{key}": value / denominator for key, value in sums.items()
+    }
+    result.update({
+        "policy_points": points,
+        "min_diffusion_variance": min_variance,
+        "max_diffusion_variance": max_variance,
+    })
+    return result
+
+
 def select_verification_iterations(checkpoints: Sequence[Tuple[int, Path]], spec: str) -> set[int]:
     outers = [outer for outer, _path in checkpoints]
     text = str(spec).strip().lower()
@@ -1723,6 +2032,183 @@ def assess_refinement(
             row.setdefault("contraction_status", "variant")
 
 
+def assess_defect_refinement(
+    rows: List[Dict[str, Any]],
+    *,
+    grid_factors: Sequence[int],
+    fd_margins: Sequence[float],
+    boundaries: Sequence[str],
+    abs_tolerance: float,
+    rel_tolerance: float,
+) -> None:
+    """Attach an independent FD sensitivity audit to each primary E4 defect.
+
+    The next neural bundle is fixed while the frozen-policy FD value is
+    recomputed over the same grid/domain/boundary variants used by the exact
+    map audit.  Hence every reported change is a change in ``delta_X`` itself,
+    rather than a proxy copied from the contraction-ratio refinement table.
+    """
+    by_defect: Dict[int, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_defect.setdefault(int(row["defect_iter"]), []).append(row)
+    finest = max(grid_factors)
+    largest_domain_margin = min(fd_margins)
+    primary_boundary = boundaries[0]
+    coarse_factors = sorted({value for value in grid_factors if value < finest})
+    smaller_domain_margins = sorted(
+        {value for value in fd_margins if value > largest_domain_margin}
+    )
+    audit_boundaries = [
+        value for value in boundaries if value != primary_boundary
+    ]
+
+    for defect_rows in by_defect.values():
+        lookup = {_variant_key(row): row for row in defect_rows}
+        primary = lookup[(finest, largest_domain_margin, primary_boundary)]
+        delta = float(primary["delta_X"])
+        if not math.isfinite(delta):
+            primary.update({
+                "defect_grid_abs_change": float("nan"),
+                "defect_grid_rel_change": float("nan"),
+                "defect_domain_abs_change": float("nan"),
+                "defect_domain_rel_change": float("nan"),
+                "defect_boundary_abs_change": float("nan"),
+                "defect_sensitivity_envelope": float("nan"),
+                "refinement_status": "undefined_defect",
+            })
+        else:
+            comparisons: Dict[str, List[Optional[Dict[str, Any]]]] = {
+                "grid": [
+                    lookup.get(
+                        (factor, largest_domain_margin, primary_boundary)
+                    )
+                    for factor in coarse_factors
+                ],
+                "domain": [
+                    lookup.get((finest, margin, primary_boundary))
+                    for margin in smaller_domain_margins
+                ],
+                "boundary": [
+                    lookup.get((finest, largest_domain_margin, boundary))
+                    for boundary in audit_boundaries
+                ],
+            }
+            checked = True
+            passed = True
+            axis_deltas: List[float] = []
+            changes: Dict[str, float] = {}
+            tolerance = abs_tolerance + rel_tolerance * abs(delta)
+            for name, axis_rows in comparisons.items():
+                if not axis_rows or any(
+                    comparison is None
+                    or not math.isfinite(float(comparison["delta_X"]))
+                    for comparison in axis_rows
+                ):
+                    checked = False
+                    changes[name] = float("nan")
+                    continue
+                axis_changes = [
+                    abs(delta - float(comparison["delta_X"]))
+                    for comparison in axis_rows
+                    if comparison is not None
+                ]
+                change = max(axis_changes)
+                changes[name] = change
+                axis_deltas.append(change)
+                passed = passed and all(
+                    value <= tolerance for value in axis_changes
+                )
+
+            grid_change = changes.get("grid", float("nan"))
+            domain_change = changes.get("domain", float("nan"))
+            boundary_change = changes.get("boundary", float("nan"))
+            primary.update({
+                "defect_grid_abs_change": grid_change,
+                "defect_grid_rel_change": (
+                    grid_change / max(abs(delta), np.finfo(float).tiny)
+                ),
+                "defect_domain_abs_change": domain_change,
+                "defect_domain_rel_change": (
+                    domain_change / max(abs(delta), np.finfo(float).tiny)
+                ),
+                "defect_boundary_abs_change": boundary_change,
+                # A sensitivity envelope, not a rigorous FD error bound.
+                "defect_sensitivity_envelope": (
+                    delta + sum(axis_deltas) if checked else float("nan")
+                ),
+            })
+            if not bool(int(primary["is_verification"])):
+                primary["refinement_status"] = "not_checked"
+            elif largest_domain_margin >= 0.0:
+                primary["refinement_status"] = (
+                    "fd_domain_not_enlarged_beyond_training"
+                )
+            elif not checked:
+                primary["refinement_status"] = "incomplete"
+            else:
+                primary["refinement_status"] = "pass" if passed else "fail"
+
+        for row in defect_rows:
+            if row is primary:
+                continue
+            row.setdefault("defect_grid_abs_change", "")
+            row.setdefault("defect_grid_rel_change", "")
+            row.setdefault("defect_domain_abs_change", "")
+            row.setdefault("defect_domain_rel_change", "")
+            row.setdefault("defect_boundary_abs_change", "")
+            row.setdefault("defect_sensitivity_envelope", "")
+            row.setdefault("refinement_status", "variant")
+
+
+def required_defect_refinement_iterations(
+    defect_rows: Sequence[Mapping[str, Any]],
+) -> List[int]:
+    """Return the minimum E4 evidence set: delta_0, first/last adjacent, worst."""
+    if not defect_rows:
+        return []
+    by_iter: Dict[int, float] = {}
+    for row in defect_rows:
+        defect_iter = int(row["defect_iter"])
+        delta = float(row["delta_X"])
+        if not math.isfinite(delta) or delta < 0.0:
+            raise ValueError(
+                f"invalid delta_X={delta!r} for defect_iter={defect_iter}"
+            )
+        if defect_iter in by_iter:
+            raise ValueError(f"duplicate primary defect_iter={defect_iter}")
+        by_iter[defect_iter] = delta
+    adjacent = sorted(value for value in by_iter if value > 0)
+    required = {0} if 0 in by_iter else set()
+    if adjacent:
+        required.update((adjacent[0], adjacent[-1]))
+    worst = max(by_iter, key=lambda value: (by_iter[value], -value))
+    required.add(worst)
+    return sorted(required)
+
+
+def summarize_defect_refinement(
+    defect_rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize whether the minimum E4 FD evidence set is actually verified."""
+    required = required_defect_refinement_iterations(defect_rows)
+    by_iter = {
+        int(row["defect_iter"]): str(row.get("refinement_status", ""))
+        for row in defect_rows
+    }
+    statuses = {value: by_iter.get(value, "missing") for value in required}
+    if required and all(value == "pass" for value in statuses.values()):
+        evidence_status = "pass"
+    elif any(value == "fail" for value in statuses.values()):
+        evidence_status = "fail"
+    else:
+        evidence_status = "incomplete"
+    return {
+        "required_iterations": required,
+        "required_statuses": statuses,
+        "evidence_status": evidence_status,
+    }
+
+
 def evaluate_run(
     run: RunSpec,
     output: Path,
@@ -1764,8 +2250,20 @@ def evaluate_run(
         raise ValueError("boundaries must contain robin and/or exact-dirichlet")
     if len(set(boundaries)) != len(boundaries):
         raise ValueError("boundaries must be unique")
+    if boundaries[0] != "robin":
+        print(
+            "[warning] the first boundary is the reported primary, but the "
+            "paper protocol requires robin; exact-dirichlet injects optimal "
+            "V* and is only a sensitivity audit",
+            file=sys.stderr,
+        )
 
-    verification_outers = select_verification_iterations(run.checkpoints, verify_checkpoints)
+    verification_outers = select_verification_iterations(
+        run.checkpoints, verify_checkpoints
+    )
+    eval_y_min, eval_y_max = run.eval_y_bounds
+    eval_tau_min = run.problem.horizon / int(base_nt)
+    eval_tau_max = run.problem.horizon
     implementation_hashes = {
         "driver": sha256_file(Path(__file__).resolve()),
         "core": sha256_file(Path(__file__).with_name("merton_exact_map_core.py").resolve()),
@@ -1777,10 +2275,21 @@ def evaluate_run(
         "base_nt": base_nt,
         "eval_ny": eval_ny,
         "evaluation_calendar_time_domain": "[0,T)",
+        "primary_evaluation_window": {
+            "eval_margin": run.eval_margin,
+            "ev_tau_min": eval_tau_min,
+            "ev_tau_max": eval_tau_max,
+            "ev_y_min": eval_y_min,
+            "ev_y_max": eval_y_max,
+        },
         "grid_factors": list(grid_factors),
         "fd_margins": list(fd_margins),
         "boundaries": list(boundaries),
         "verify_checkpoints": verify_checkpoints,
+        "defect_refinement_selector": (
+            "delta0_plus_verify_checkpoints; paper evidence requires "
+            "delta0+first_adjacent+last_adjacent+worst"
+        ),
         "drift_scheme": drift_scheme,
         "peclet_limit": peclet_limit,
         "theta_method": theta_method,
@@ -1794,7 +2303,6 @@ def evaluate_run(
     finest = max(grid_factors)
     largest_domain_margin = min(fd_margins)
     primary_boundary = boundaries[0]
-    eval_y_min, eval_y_max = run.eval_y_bounds
     eval_y = np.linspace(eval_y_min, eval_y_max, int(eval_ny))
     # Q_ev follows the trainer's [0,T) calendar-time convention.  In
     # remaining time this is (0,T], so exclude tau=0 (the terminal face) and
@@ -1805,6 +2313,237 @@ def evaluate_run(
     closed_form = crra_closed_form(run.problem, tt_eval, yy_eval)
     training_y_width = run.problem.y_max - run.problem.y_min
     rows: List[Dict[str, Any]] = []
+    defect_rows: List[Dict[str, Any]] = []
+    defect_refinement_rows: List[Dict[str, Any]] = []
+    residual_by_outer, residual_semantics = load_outer_residuals(run.run_dir)
+    checkpoint_by_outer = dict(run.checkpoints)
+    input_bundle_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    # E4 starts at n=0: checkpoint outer 1 is v_tilde_0, while alpha_0 is the
+    # configured analytic initialization (not G of a neural checkpoint).
+    # Delta_0 is always recomputed over the complete FD variant family so its
+    # refinement status is based on the defect itself, not copied from an
+    # unrelated contraction-ratio check.
+    if 1 in checkpoint_by_outer:
+        first_checkpoint = checkpoint_by_outer[1]
+        first_evaluator = TorchCheckpointEvaluator(first_checkpoint, run, device)
+        first_bundle = first_evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
+        input_bundle_cache[1] = first_bundle
+        initial_policy, initial_policy_contract_hash = build_initial_policy(run)
+        initial_ev_diag = policy_diagnostics_on_tensor_grid(
+            initial_policy, run.problem, tau_eval, eval_y
+        )
+        initial_primary: Optional[Dict[str, Any]] = None
+        for factor, fd_margin, boundary in [
+            (factor, margin, boundary)
+            for factor in sorted(grid_factors)
+            for margin in sorted(fd_margins)
+            for boundary in boundaries
+        ]:
+            initial_fd_y_min, initial_fd_y_max = shrink_bounds(
+                run.problem.y_min, run.problem.y_max, fd_margin
+            )
+            initial_base_intervals = max(
+                6,
+                int(round(
+                    (initial_fd_y_max - initial_fd_y_min)
+                    / training_y_width
+                    * (int(base_ny) - 1)
+                )),
+            )
+            initial_ny = initial_base_intervals * int(factor) + 1
+            initial_nt = int(base_nt) * int(factor)
+            initial_grid = FDGrid(
+                initial_fd_y_min,
+                initial_fd_y_max,
+                ny=initial_ny,
+                nt=initial_nt,
+            )
+            initial_fd_y = np.linspace(
+                initial_fd_y_min,
+                initial_fd_y_max,
+                initial_ny,
+                dtype=np.float64,
+            )
+            initial_fd_dt = run.problem.horizon / initial_nt
+            initial_fd_tau_mid = (
+                np.arange(initial_nt, dtype=np.float64) + 0.5
+            ) * initial_fd_dt
+            initial_fd_c: List[np.ndarray] = []
+            initial_fd_pi: List[np.ndarray] = []
+            for tau_value in initial_fd_tau_mid:
+                consumption_row, portfolio_row, _diag = initial_policy(
+                    float(tau_value), initial_fd_y
+                )
+                initial_fd_c.append(np.asarray(consumption_row))
+                initial_fd_pi.append(np.asarray(portfolio_row))
+            initial_policy_hash = stable_hash({
+                "contract_hash": initial_policy_contract_hash,
+                "sampled_array_hash": canonical_array_hash({
+                    "tau_mid": initial_fd_tau_mid,
+                    "y": initial_fd_y,
+                    "consumption": np.stack(initial_fd_c, axis=0),
+                    "portfolio": np.stack(initial_fd_pi, axis=0),
+                }),
+            })
+            initial_solution = solve_frozen_policy(
+                run.problem,
+                initial_policy,
+                initial_grid,
+                theta_method=theta_method,
+                rannacher_steps=rannacher_steps,
+                drift_scheme=drift_scheme,
+                peclet_limit=peclet_limit,
+                boundary=boundary,
+            )
+            initial_map_bundle = evaluate_fd_bundle(
+                initial_solution, tau_eval, eval_y
+            )
+            initial_delta = x_norm_components(
+                *first_bundle, initial_map_bundle, yy_eval
+            )
+            initial_fd_diag = initial_solution.diagnostics.as_dict()
+            initial_variant, initial_unmodified = _map_variant(
+                initial_fd_diag, initial_ev_diag
+            )
+            is_primary_initial = (
+                factor,
+                fd_margin,
+                boundary,
+            ) == (finest, largest_domain_margin, primary_boundary)
+            initial_refinement_row: Dict[str, Any] = {
+                "problem": "merton",
+                "group": run.group,
+                "protocol_hash": protocol_hash,
+                "model_type": "pipinn",
+                "n_assets": run.problem.n_assets,
+                "seed": run.seed,
+                "market_seed": run.market_seed,
+                "eval_margin": run.eval_margin,
+                "ev_tau_min": float(tau_eval[0]),
+                "ev_tau_max": float(tau_eval[-1]),
+                "ev_y_min": float(eval_y[0]),
+                "ev_y_max": float(eval_y[-1]),
+                "defect_iter": 0,
+                "defect_kind": "initial_policy_evaluation",
+                "target_policy_iter": 0,
+                "next_checkpoint_outer_iter": 1,
+                "frozen_policy_sha256": initial_policy_hash,
+                "fd_margin": fd_margin,
+                "boundary": boundary,
+                "grid_factor": factor,
+                "ny": initial_ny,
+                "nt": initial_nt,
+                "is_primary": int(is_primary_initial),
+                "is_verification": 1,
+                "delta_value_sup": initial_delta["value_sup"],
+                "delta_vw_sup": initial_delta["vw_sup"],
+                "delta_vww_sup": initial_delta["vww_sup"],
+                "delta_vy_sup": initial_delta["vy_sup"],
+                "delta_vyy_sup": initial_delta["vyy_sup"],
+                "delta_bundle_sup": initial_delta["derivative_sup"],
+                "delta_X": initial_delta["x_norm"],
+                "map_variant": initial_variant,
+                "local_map_unmodified_on_xfd": initial_unmodified,
+                "whole_space_map_claim": "not_verified_by_finite_domain",
+            }
+            defect_refinement_rows.append(initial_refinement_row)
+            if is_primary_initial:
+                initial_primary = {
+                    "map_bundle": initial_map_bundle,
+                    "delta": initial_delta,
+                    "variant": initial_variant,
+                    "unmodified": initial_unmodified,
+                    "policy_hash": initial_policy_hash,
+                    "ny": initial_ny,
+                    "nt": initial_nt,
+                }
+        if initial_primary is None:
+            raise AssertionError("missing primary delta_0 FD variant")
+
+        initial_c_rows: List[np.ndarray] = []
+        initial_pi_rows: List[np.ndarray] = []
+        for tau_value in tau_eval:
+            consumption_row, portfolio_row, _diag = initial_policy(
+                float(tau_value), eval_y
+            )
+            initial_c_rows.append(np.asarray(consumption_row))
+            initial_pi_rows.append(np.asarray(portfolio_row))
+        initial_bundle_path = (
+            output / "evaluated_bundles" / "initial_policy_to_outer_0001.npz"
+        )
+        atomic_npz(
+            initial_bundle_path,
+            tau=tau_eval,
+            y=eval_y,
+            initial_consumption=np.stack(initial_c_rows, axis=0),
+            initial_portfolio=np.stack(initial_pi_rows, axis=0),
+            fd_map_value=initial_primary["map_bundle"][0],
+            fd_map_vw=initial_primary["map_bundle"][1],
+            fd_map_vww=initial_primary["map_bundle"][2],
+            next_neural_value=first_bundle[0],
+            next_neural_vw=first_bundle[1],
+            next_neural_vww=first_bundle[2],
+            optimal_value=closed_form[0],
+            optimal_vw=closed_form[1],
+            optimal_vww=closed_form[2],
+        )
+        defect_rows.append({
+            "problem": "merton",
+            "group": run.group,
+            "protocol_hash": protocol_hash,
+            "model_type": "pipinn",
+            "n_assets": run.problem.n_assets,
+            "seed": run.seed,
+            "market_seed": run.market_seed,
+            "eval_margin": run.eval_margin,
+            "ev_tau_min": float(tau_eval[0]),
+            "ev_tau_max": float(tau_eval[-1]),
+            "ev_y_min": float(eval_y[0]),
+            "ev_y_max": float(eval_y[-1]),
+            "defect_iter": 0,
+            "defect_kind": "initial_policy_evaluation",
+            "checkpoint_outer_iter": 0,
+            "source_iter": -1,
+            "target_policy_iter": 0,
+            "next_checkpoint_outer_iter": 1,
+            "next_neural_iter": 0,
+            "checkpoint_state_sha256": "",
+            "next_checkpoint_state_sha256": canonical_checkpoint_state_hash(
+                first_checkpoint
+            ),
+            "frozen_policy_sha256": initial_primary["policy_hash"],
+            "fd_margin": largest_domain_margin,
+            "boundary": primary_boundary,
+            "grid_factor": finest,
+            "ny": initial_primary["ny"],
+            "nt": initial_primary["nt"],
+            "is_verification": 1,
+            "delta_value_sup": initial_primary["delta"]["value_sup"],
+            "delta_vw_sup": initial_primary["delta"]["vw_sup"],
+            "delta_vww_sup": initial_primary["delta"]["vww_sup"],
+            "delta_vy_sup": initial_primary["delta"]["vy_sup"],
+            "delta_vyy_sup": initial_primary["delta"]["vyy_sup"],
+            "delta_bundle_sup": initial_primary["delta"]["derivative_sup"],
+            "delta_X": initial_primary["delta"]["x_norm"],
+            "defect_grid_abs_change": "",
+            "defect_grid_rel_change": "",
+            "defect_domain_abs_change": "",
+            "defect_domain_rel_change": "",
+            "defect_boundary_abs_change": "",
+            "defect_sensitivity_envelope": "",
+            "p_res_post_restore": residual_by_outer.get(1, ""),
+            "p_res_source": "",
+            "residual_semantics": residual_semantics,
+            "evaluated_bundle_path": str(
+                initial_bundle_path.relative_to(output)
+            ),
+            "evaluated_bundle_sha256": sha256_file(initial_bundle_path),
+            "refinement_status": "pending_defect_refinement",
+            "map_variant": initial_primary["variant"],
+            "local_map_unmodified_on_xfd": initial_primary["unmodified"],
+            "whole_space_map_claim": "not_verified_by_finite_domain",
+        })
 
     for checkpoint_index, (outer, checkpoint) in enumerate(run.checkpoints, start=1):
         source_iter = int(outer) - 1
@@ -1816,12 +2555,28 @@ def evaluate_run(
         evaluator = TorchCheckpointEvaluator(checkpoint, run, device)
         checkpoint_hash = sha256_file(checkpoint)
         checkpoint_state_hash = canonical_checkpoint_state_hash(checkpoint)
-        input_bundle = evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
+        input_bundle = input_bundle_cache.pop(int(outer), None)
+        if input_bundle is None:
+            input_bundle = evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
         input_metric = x_norm_components(*input_bundle, closed_form, yy_eval)
         ev_policy_diag = evaluator.policy_diagnostics_on_grid(tau_eval, eval_y)
         is_verification = outer in verification_outers
         cached_policy_key: Optional[Tuple[int, float]] = None
         cached_policy: Optional[Tuple[Any, str]] = None
+        next_outer = int(outer) + 1
+        next_checkpoint = checkpoint_by_outer.get(next_outer)
+        next_bundle: Optional[
+            Tuple[np.ndarray, np.ndarray, np.ndarray]
+        ] = None
+        if next_checkpoint is not None:
+            if next_outer not in input_bundle_cache:
+                next_evaluator = TorchCheckpointEvaluator(
+                    next_checkpoint, run, device
+                )
+                input_bundle_cache[next_outer] = (
+                    next_evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
+                )
+            next_bundle = input_bundle_cache[next_outer]
 
         primary_variant = (finest, largest_domain_margin, primary_boundary)
         if is_verification:
@@ -1910,6 +2665,7 @@ def evaluate_run(
                 "fd_y_min": fd_y_min,
                 "fd_y_max": fd_y_max,
                 "boundary": boundary,
+                "boundary_semantics": BOUNDARY_SEMANTICS[boundary],
                 "drift_scheme": drift_scheme,
                 "grid_factor": factor,
                 "ny": ny,
@@ -1967,6 +2723,138 @@ def evaluate_run(
             }
             rows.append(row)
 
+            # E4: the source checkpoint produces alpha_K and the FD map
+            # v^{alpha_K}; checkpoint K+1 is the neural approximation
+            # v_tilde_K of that same frozen-policy equation.  For verified
+            # checkpoints, delta_K is evaluated for every FD variant so its
+            # own refinement status has numerical evidence. Unselected
+            # checkpoints retain a clearly labelled primary-only row.
+            if next_checkpoint is not None and next_bundle is not None:
+                delta_metric = x_norm_components(
+                    *next_bundle, map_bundle, yy_eval
+                )
+                defect_refinement_rows.append({
+                    "problem": "merton",
+                    "group": run.group,
+                    "protocol_hash": protocol_hash,
+                    "model_type": "pipinn",
+                    "n_assets": run.problem.n_assets,
+                    "seed": run.seed,
+                    "market_seed": run.market_seed,
+                    "eval_margin": run.eval_margin,
+                    "ev_tau_min": float(tau_eval[0]),
+                    "ev_tau_max": float(tau_eval[-1]),
+                    "ev_y_min": float(eval_y[0]),
+                    "ev_y_max": float(eval_y[-1]),
+                    "defect_iter": int(outer),
+                    "defect_kind": "adjacent_policy_evaluation",
+                    "target_policy_iter": target_policy_iter,
+                    "next_checkpoint_outer_iter": next_outer,
+                    "frozen_policy_sha256": policy_hash,
+                    "fd_margin": fd_margin,
+                    "boundary": boundary,
+                    "grid_factor": factor,
+                    "ny": ny,
+                    "nt": nt,
+                    "is_primary": int(row["is_primary"]),
+                    "is_verification": int(is_verification),
+                    "delta_value_sup": delta_metric["value_sup"],
+                    "delta_vw_sup": delta_metric["vw_sup"],
+                    "delta_vww_sup": delta_metric["vww_sup"],
+                    "delta_vy_sup": delta_metric["vy_sup"],
+                    "delta_vyy_sup": delta_metric["vyy_sup"],
+                    "delta_bundle_sup": delta_metric["derivative_sup"],
+                    "delta_X": delta_metric["x_norm"],
+                    "map_variant": map_variant,
+                    "local_map_unmodified_on_xfd": unmodified,
+                    "whole_space_map_claim": (
+                        "not_verified_by_finite_domain"
+                    ),
+                })
+
+                if int(row["is_primary"]) == 1:
+                    bundle_path = (
+                        output / "evaluated_bundles"
+                        / f"outer_{int(outer):04d}_to_{next_outer:04d}.npz"
+                    )
+                    atomic_npz(
+                        bundle_path,
+                        tau=tau_eval,
+                        y=eval_y,
+                        input_value=input_bundle[0],
+                        input_vw=input_bundle[1],
+                        input_vww=input_bundle[2],
+                        fd_map_value=map_bundle[0],
+                        fd_map_vw=map_bundle[1],
+                        fd_map_vww=map_bundle[2],
+                        next_neural_value=next_bundle[0],
+                        next_neural_vw=next_bundle[1],
+                        next_neural_vww=next_bundle[2],
+                        optimal_value=closed_form[0],
+                        optimal_vw=closed_form[1],
+                        optimal_vww=closed_form[2],
+                    )
+                    defect_rows.append({
+                        "problem": "merton",
+                        "group": run.group,
+                        "protocol_hash": protocol_hash,
+                        "model_type": "pipinn",
+                        "n_assets": run.problem.n_assets,
+                        "seed": run.seed,
+                        "market_seed": run.market_seed,
+                        "eval_margin": run.eval_margin,
+                        "ev_tau_min": float(tau_eval[0]),
+                        "ev_tau_max": float(tau_eval[-1]),
+                        "ev_y_min": float(eval_y[0]),
+                        "ev_y_max": float(eval_y[-1]),
+                        "defect_iter": int(outer),
+                        "defect_kind": "adjacent_policy_evaluation",
+                        "checkpoint_outer_iter": int(outer),
+                        "source_iter": source_iter,
+                        "target_policy_iter": target_policy_iter,
+                        "next_checkpoint_outer_iter": next_outer,
+                        "next_neural_iter": next_outer - 1,
+                        "checkpoint_state_sha256": checkpoint_state_hash,
+                        "next_checkpoint_state_sha256": (
+                            canonical_checkpoint_state_hash(next_checkpoint)
+                        ),
+                        "frozen_policy_sha256": policy_hash,
+                        "fd_margin": fd_margin,
+                        "boundary": boundary,
+                        "grid_factor": factor,
+                        "ny": ny,
+                        "nt": nt,
+                        "is_verification": int(is_verification),
+                        "delta_value_sup": delta_metric["value_sup"],
+                        "delta_vw_sup": delta_metric["vw_sup"],
+                        "delta_vww_sup": delta_metric["vww_sup"],
+                        "delta_vy_sup": delta_metric["vy_sup"],
+                        "delta_vyy_sup": delta_metric["vyy_sup"],
+                        "delta_bundle_sup": delta_metric["derivative_sup"],
+                        "delta_X": delta_metric["x_norm"],
+                        "defect_grid_abs_change": "",
+                        "defect_grid_rel_change": "",
+                        "defect_domain_abs_change": "",
+                        "defect_domain_rel_change": "",
+                        "defect_boundary_abs_change": "",
+                        "defect_sensitivity_envelope": "",
+                        "p_res_post_restore": residual_by_outer.get(
+                            next_outer, ""
+                        ),
+                        "p_res_source": residual_by_outer.get(int(outer), ""),
+                        "residual_semantics": residual_semantics,
+                        "evaluated_bundle_path": str(
+                            bundle_path.relative_to(output)
+                        ),
+                        "evaluated_bundle_sha256": sha256_file(bundle_path),
+                        "refinement_status": "pending_defect_refinement",
+                        "map_variant": map_variant,
+                        "local_map_unmodified_on_xfd": unmodified,
+                        "whole_space_map_claim": (
+                            "not_verified_by_finite_domain"
+                        ),
+                    })
+
     assess_refinement(
         rows,
         grid_factors=grid_factors,
@@ -1975,11 +2863,76 @@ def evaluate_run(
         abs_tolerance=refinement_abs_tolerance,
         rel_tolerance=refinement_rel_tolerance,
     )
+    assess_defect_refinement(
+        defect_refinement_rows,
+        grid_factors=grid_factors,
+        fd_margins=fd_margins,
+        boundaries=boundaries,
+        abs_tolerance=refinement_abs_tolerance,
+        rel_tolerance=refinement_rel_tolerance,
+    )
+    primary_defect_refinement = [
+        row for row in defect_refinement_rows if int(row["is_primary"]) == 1
+    ]
+    if len(primary_defect_refinement) != len(defect_rows):
+        raise AssertionError(
+            "expected exactly one primary FD-refinement row per E4 defect"
+        )
+    refinement_by_defect = {
+        int(row["defect_iter"]): row for row in primary_defect_refinement
+    }
+    evidence_fields = (
+        "defect_grid_abs_change",
+        "defect_grid_rel_change",
+        "defect_domain_abs_change",
+        "defect_domain_rel_change",
+        "defect_boundary_abs_change",
+        "defect_sensitivity_envelope",
+        "refinement_status",
+        "is_verification",
+    )
+    for defect in defect_rows:
+        evidence = refinement_by_defect[int(defect["defect_iter"])]
+        for field in evidence_fields:
+            defect[field] = evidence[field]
+
     primary_rows = [row for row in rows if int(row["is_primary"]) == 1]
     if len(primary_rows) != len(run.checkpoints):
         raise AssertionError("expected exactly one primary exact-map row per checkpoint")
+    expected_defect_iterations = (
+        ([0] if 1 in checkpoint_by_outer else [])
+        + [
+            int(outer)
+            for outer, _path in run.checkpoints
+            if int(outer) + 1 in checkpoint_by_outer
+        ]
+    )
+    observed_defect_iterations = sorted(
+        int(row["defect_iter"]) for row in defect_rows
+    )
+    if observed_defect_iterations != sorted(expected_defect_iterations):
+        raise AssertionError(
+            "E4 defect iteration coverage mismatch: "
+            f"found {observed_defect_iterations}, "
+            f"expected {sorted(expected_defect_iterations)}"
+        )
+    for defect in defect_rows:
+        defect_iter = int(defect["defect_iter"])
+        if not (
+            int(defect["target_policy_iter"]) == defect_iter
+            and int(defect["next_neural_iter"]) == defect_iter
+            and int(defect["next_checkpoint_outer_iter"]) == defect_iter + 1
+        ):
+            raise AssertionError(f"mis-indexed E4 defect row: {defect}")
+    defect_refinement_summary = summarize_defect_refinement(defect_rows)
     write_csv(output / "exact_map_refinement.csv", rows, RATIO_FIELDS)
     write_csv(output / "exact_map_ratios.csv", primary_rows, RATIO_FIELDS)
+    write_csv(output / "exact_map_defects.csv", defect_rows, DEFECT_FIELDS)
+    write_csv(
+        output / "exact_map_defect_refinement.csv",
+        defect_refinement_rows,
+        DEFECT_REFINEMENT_FIELDS,
+    )
     protocol = {
         "run_dir": str(run.run_dir),
         "config_path": str(run.config_path),
@@ -2010,6 +2963,13 @@ def evaluate_run(
             "grid_factors": list(grid_factors),
             "fd_margins": list(fd_margins),
             "boundaries": list(boundaries),
+            "boundary_semantics": {
+                name: BOUNDARY_SEMANTICS[name] for name in boundaries
+            },
+            "primary_boundary_requirement": (
+                "Use robin as the paper primary. exact-dirichlet is only an "
+                "optimal-reference sensitivity audit."
+            ),
             "verify_checkpoints": verify_checkpoints,
             "drift_scheme": drift_scheme,
             "peclet_limit": peclet_limit,
@@ -2020,8 +2980,44 @@ def evaluate_run(
             "evaluation_terminal_face_included": False,
             "evaluation_tau_min": float(tau_eval[0]),
             "evaluation_tau_max": float(tau_eval[-1]),
+            "evaluation_y_min": float(eval_y[0]),
+            "evaluation_y_max": float(eval_y[-1]),
         },
         "norm": "sup|V-V*| + sup sqrt((V_w-V*_w)^2 + (V_ww-V*_ww)^2)",
+        "e4_defect": {
+            "definition": (
+                "delta_0=||v_tilde_0-v^{alpha_0}||_Xev from the configured "
+                "initial policy; for n>=1, delta_n=||v_tilde_n-"
+                "E(G(v_tilde_(n-1)))||_Xev from adjacent checkpoints, all on "
+                "the primary FD/evaluation grid"
+            ),
+            "residual_semantics": residual_semantics,
+            "n_defect_iterations": len(defect_rows),
+            "defect_iterations": observed_defect_iterations,
+            "defect_coverage": (
+                "complete_for_saved_schedule"
+                if observed_defect_iterations
+                == sorted(expected_defect_iterations) else "incomplete"
+            ),
+            "refinement_selector": (
+                "delta0_plus_source_outer_in_verify_checkpoints"
+            ),
+            "refinement_required_iterations": (
+                defect_refinement_summary["required_iterations"]
+            ),
+            "refinement_required_statuses": (
+                defect_refinement_summary["required_statuses"]
+            ),
+            "refinement_evidence_status": (
+                defect_refinement_summary["evidence_status"]
+            ),
+            "refinement_table": "exact_map_defect_refinement.csv",
+            "evaluated_bundle_storage": (
+                "evaluated_bundles/*.npz; tau/y plus initial controls or neural "
+                "input, FD-map, next-neural, and optimal (value,V_w,V_ww) "
+                "arrays; SHA-256 in exact_map_defects.csv"
+            ),
+        },
         "protocol_hash": protocol_hash,
         "implementation_hashes": implementation_hashes,
         "refinement_abs_tolerance": refinement_abs_tolerance,
@@ -2060,6 +3056,32 @@ def evaluate_run(
         "n_checkpoints": len(run.checkpoints),
         "n_primary_rows": len(primary_rows),
         "n_refinement_rows": len(rows),
+        "n_defect_rows": len(defect_rows),
+        "n_expected_defect_iterations": len(expected_defect_iterations),
+        "defect_iterations": observed_defect_iterations,
+        "max_delta_X": (
+            max(float(row["delta_X"]) for row in defect_rows)
+            if defect_rows else None
+        ),
+        "defect_refinement_required_iterations": (
+            defect_refinement_summary["required_iterations"]
+        ),
+        "defect_refinement_required_statuses": (
+            defect_refinement_summary["required_statuses"]
+        ),
+        "defect_refinement_evidence_status": (
+            defect_refinement_summary["evidence_status"]
+        ),
+        "n_defect_refinement_rows": len(defect_refinement_rows),
+        "n_defect_refinement_pass": sum(
+            str(row.get("refinement_status", "")) == "pass"
+            for row in primary_defect_refinement
+        ),
+        "n_evaluated_bundle_files": len(defect_rows),
+        "defect_residual_semantics": residual_semantics,
+        "n_modified_defect_policies": sum(
+            not int(row["local_map_unmodified_on_xfd"]) for row in defect_rows
+        ),
         "n_refinement_pass": sum(row.get("refinement_status") == "pass" for row in primary_rows),
         "n_sampled_modified_map": sum(
             not int(row["local_map_unmodified_on_xfd"]) for row in primary_rows
@@ -2114,9 +3136,13 @@ def aggregate_exact_map(
     make_plot: bool,
     plot_format: str,
     dpi: int,
+    min_seeds: int = 2,
     ellipticity_tolerance: float = 0.0,
     allow_degenerate_diffusion: bool = False,
 ) -> None:
+    if isinstance(min_seeds, bool) or int(min_seeds) != min_seeds or int(min_seeds) < 1:
+        raise ValueError("min_seeds must be a positive integer")
+    min_seeds = int(min_seeds)
     if not math.isfinite(float(floor_multiple)) or float(floor_multiple) < 0.0:
         raise ValueError("floor_multiple must be finite and nonnegative")
     if (
@@ -2161,8 +3187,11 @@ def aggregate_exact_map(
         if expected and set(seeds) != expected and not allow_incomplete:
             raise ValueError(f"group={group}: exact-map seeds={seeds}, expected={sorted(expected)}")
         selected = sorted(set(seeds) & expected) if expected else seeds
-        if len(selected) < 2:
-            raise ValueError(f"group={group}: at least two seeds are required for aggregation")
+        if len(selected) < min_seeds:
+            raise ValueError(
+                f"group={group}: found {len(selected)} selected seed(s), "
+                f"but min_seeds={min_seeds}"
+            )
         markets = {str(row["market_sha256"]) for row in group_rows if int(row["seed"]) in selected}
         if len(markets) != 1:
             raise ValueError(f"group={group}: exact-map runs use different market snapshots")
@@ -2611,19 +3640,22 @@ def aggregate_exact_map(
         "all_regular_locally_unmodified_map",
         "map_status", "map_variants", "contraction_statuses", *activation_max_fields,
     ]
-    write_csv(output / "figure2_exact_map_ratios.csv", per_seed_rows, per_seed_fields)
-    write_csv(output / "figure2_exact_map_summary.csv", summary_rows, summary_fields)
-    write_csv(output / "figure2_exact_map_floor_summary.csv", floor_summary_rows, [
+    # Exact PI-map evidence is a separate FD experiment, not the empirical
+    # relative-L2 Figure 2.  Keep the artifact names unambiguous.
+    write_csv(output / "exact_map_ratios_by_seed.csv", per_seed_rows, per_seed_fields)
+    write_csv(output / "exact_map_ratio_summary.csv", summary_rows, summary_fields)
+    write_csv(output / "exact_map_floor_summary.csv", floor_summary_rows, [
         "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma", "eval_margin",
         "network_dtype", "market_seed", "whole_space_map_claim", "source_iter",
         "target_policy_iter", "n_finite_seeds",
         "n_requested_seeds", "rho_exact_mean", "rho_exact_std", "floor_dominated",
         "map_status", "map_variants", "contraction_statuses", *activation_max_fields,
     ])
-    write_csv(output / "figure2_exact_map_worst_summary.csv", worst_rows, worst_fields)
+    write_csv(output / "exact_map_worst_summary.csv", worst_rows, worst_fields)
     atomic_json(output / "exact_map_aggregate_config.json", {
         "result_dirs": [str(path.resolve()) for path in result_dirs],
         "expected_seeds": list(expected_seeds),
+        "min_seeds": min_seeds,
         "floor_multiple": floor_multiple,
         "allow_incomplete": allow_incomplete,
         "allow_unverified": allow_unverified,
@@ -2678,7 +3710,7 @@ def aggregate_exact_map(
         ax.set_ylabel(r"$\widehat{\rho}^{\mathrm{exact}}_n$")
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False)
-        fig.savefig(output / f"figure2_exact_map.{plot_format}", dpi=dpi, bbox_inches="tight")
+        fig.savefig(output / f"exact_map_contraction.{plot_format}", dpi=dpi, bbox_inches="tight")
         plt.close(fig)
 
 
@@ -2736,23 +3768,83 @@ def run_self_test() -> int:
     tau = np.linspace(0.0, 1.0, 41)[1:]
     y = np.linspace(np.log(0.1), np.log(2.0), 61)
     tt, yy = np.meshgrid(tau, y, indexing="ij")
-    reference = crra_closed_form(problem, tt, yy)
-    errors = []
-    for ny in (81, 161):
-        solution = solve_frozen_policy(
-            problem,
-            analytic_optimal_policy(problem),
-            FDGrid(problem.y_min, problem.y_max, ny=ny, nt=ny - 1),
-            boundary="robin",
+    def refinement_errors(
+        test_problem: MertonProblem,
+        policy: Any,
+        reference: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    ) -> List[float]:
+        errors: List[float] = []
+        for ny in (81, 161):
+            solution = solve_frozen_policy(
+                test_problem,
+                policy,
+                FDGrid(test_problem.y_min, test_problem.y_max, ny=ny, nt=ny - 1),
+                boundary="robin",
+            )
+            metric = x_norm_components(
+                *evaluate_fd_bundle(solution, tau, y), reference, yy
+            )
+            errors.append(float(metric["x_norm"]))
+        return errors
+
+    optimal_errors = refinement_errors(
+        problem,
+        analytic_optimal_policy(problem),
+        crra_closed_form(problem, tt, yy),
+    )
+    optimal_ratio = optimal_errors[1] / optimal_errors[0]
+    print(
+        "[self-test:optimal] "
+        f"X-error coarse={optimal_errors[0]:.6e}, "
+        f"fine={optimal_errors[1]:.6e}, ratio={optimal_ratio:.4f}"
+    )
+    if not (optimal_errors[1] < optimal_errors[0] and optimal_ratio < 0.4):
+        raise RuntimeError("optimal-policy FD check did not show refinement convergence")
+
+    # Independent manufactured solution: neither the frozen portfolio nor
+    # consumption ratio satisfies the Merton first-order conditions, and the
+    # terminal bequest coefficient is deliberately non-unit.  This catches
+    # source/drift signs and remaining-time orientation that an optimal-only
+    # check could accidentally share with the reference formula.
+    nonoptimal_problem = MertonProblem(
+        horizon=problem.horizon,
+        y_min=problem.y_min,
+        y_max=problem.y_max,
+        gamma=problem.gamma,
+        discount=problem.discount,
+        bequest=2.25,
+        risk_free=problem.risk_free,
+        mu_excess=problem.mu_excess,
+        sigma=problem.sigma,
+    )
+    portfolio = np.asarray([0.35])
+    consumption_ratio = 0.12
+    nonoptimal_errors = refinement_errors(
+        nonoptimal_problem,
+        constant_proportional_policy(
+            nonoptimal_problem, portfolio, consumption_ratio
+        ),
+        constant_proportional_closed_form(
+            nonoptimal_problem,
+            tt,
+            yy,
+            portfolio,
+            consumption_ratio,
+        ),
+    )
+    nonoptimal_ratio = nonoptimal_errors[1] / nonoptimal_errors[0]
+    print(
+        "[self-test:nonoptimal-proportional] "
+        f"X-error coarse={nonoptimal_errors[0]:.6e}, "
+        f"fine={nonoptimal_errors[1]:.6e}, ratio={nonoptimal_ratio:.4f}"
+    )
+    if not (
+        nonoptimal_errors[1] < nonoptimal_errors[0]
+        and nonoptimal_ratio < 0.4
+    ):
+        raise RuntimeError(
+            "nonoptimal proportional-policy FD check did not show refinement convergence"
         )
-        metric = x_norm_components(
-            *evaluate_fd_bundle(solution, tau, y), reference, yy
-        )
-        errors.append(float(metric["x_norm"]))
-    ratio = errors[1] / errors[0]
-    print(f"[self-test] X-error coarse={errors[0]:.6e}, fine={errors[1]:.6e}, ratio={ratio:.4f}")
-    if not (errors[1] < errors[0] and ratio < 0.4):
-        raise RuntimeError("FD self-test did not show the expected refinement convergence")
     return 0
 
 
@@ -2770,7 +3862,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--aggregate-output", default="", help="Default <out-root>/exact_map_paper.")
     parser.add_argument("--aggregate-only", action="store_true")
     parser.add_argument("--result-dir", action="append", default=[], help="Existing exact_map_fd directory for --aggregate-only.")
-    parser.add_argument("--self-test", action="store_true", help="Run a PyTorch-free analytic FD refinement test and exit.")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help=(
+            "Run PyTorch-free optimal and nonoptimal proportional-policy "
+            "analytic FD refinement tests and exit."
+        ),
+    )
 
     parser.add_argument("--device", default="cpu")
     parser.add_argument(
@@ -2806,12 +3905,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--boundaries",
         default="robin,exact-dirichlet",
-        help="Primary first; the paper default audits Robin against exact Dirichlet closure.",
+        help=(
+            "Primary first. Use Robin as the paper primary; exact-dirichlet is "
+            "a compatibility name for an optimal-reference Dirichlet "
+            "sensitivity audit, not an exact neural-policy boundary oracle."
+        ),
     )
     parser.add_argument(
         "--verify-checkpoints",
         default="all",
-        help="Extra h/domain/boundary variants: all, none, first/middle/last, or explicit outer indices.",
+        help=(
+            "Extra h/domain/boundary variants for exact ratios and adjacent "
+            "E4 defects: all, none, first/middle/last, or explicit outer "
+            "indices. delta_0 is always verified; paper E4 aggregation "
+            "requires delta_0 plus first/last/worst adjacent evidence."
+        ),
     )
     parser.add_argument("--drift-scheme", choices=("central", "adaptive", "monotone"), default="adaptive")
     parser.add_argument("--peclet-limit", type=float, default=1.0)
@@ -2831,8 +3939,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--expected-seeds",
-        default="1,2,3,5,7,11,17,23,42,101",
-        help="Paper training-seed set; must match tune_merton.sh unless explicitly overridden.",
+        default="",
+        help=(
+            "Optional expected training-seed set. The empty default accepts the "
+            "seeds discovered in the selected runs; pass the paper seed list "
+            "explicitly when strict completeness validation is required."
+        ),
+    )
+    parser.add_argument(
+        "--min-seeds",
+        type=int,
+        default=2,
+        help=(
+            "Minimum discovered/selected seed count required per exact-map "
+            "aggregation group (default: 2). This is independent of the "
+            "optional exact-set check from --expected-seeds."
+        ),
     )
     parser.add_argument(
         "--floor-multiple", type=float, default=0.0,
@@ -2912,6 +4034,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             make_plot=not args.no_plot,
             plot_format=args.format,
             dpi=args.dpi,
+            min_seeds=args.min_seeds,
             ellipticity_tolerance=args.ellipticity_tolerance,
             allow_degenerate_diffusion=args.allow_degenerate_diffusion,
         )
@@ -3001,6 +4124,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             make_plot=not args.no_plot,
             plot_format=args.format,
             dpi=args.dpi,
+            min_seeds=args.min_seeds,
             ellipticity_tolerance=args.ellipticity_tolerance,
             allow_degenerate_diffusion=args.allow_degenerate_diffusion,
         )
