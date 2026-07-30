@@ -1,10 +1,5 @@
 # Liu 실험 실행·집계 Runbook
 
-> 현재 Liu 코드 기준 실행 기록
->
-> 최종 점검일: 2026-07-30
->
-> 기준 작업 디렉터리: `~/PINN/Liu/AAAI`
 
 이 문서는 Liu/Kim--Omberg 실험을 처음부터 다시 실행하거나, 이미 끝난
 학습 결과에서 표와 그림을 재생성할 때 사용할 수 있는 실행 순서와 명령어를
@@ -68,11 +63,6 @@ timing sweep          --> E8 computation summary
 
 ## 1. 공통 준비
 
-작업 디렉터리로 이동한다.
-
-```bash
-cd ~/PINN/Liu/AAAI
-```
 
 이 문서의 대표 seed 집합은 다음과 같다.
 
