@@ -6,7 +6,6 @@ Supplementary Figure 1까지 재현하기 위한 실행 순서를 정리한 runb
 
 작성 기준:
 
-- 코드 디렉터리: `/home/sw/PINN/merton_multi/AAAI`
 - Main 결과: `outputs/main_10seed_20260723`
 - E6 결과: `outputs/pres_5seed_pilot`
 - Main seeds: `1,2,3,5,7,11,17,23,42,101`
@@ -18,13 +17,6 @@ Supplementary Figure 1까지 재현하기 위한 실행 순서를 정리한 runb
 - Main evaluation margin: 첫 값 `0.10`
 - E6/FD one-sided evaluation window:
   `eval_margin=0.1`, `eval_w_min=0.5`
-
-명령어는 모두 다음 디렉터리에서 실행하는 것을 전제로 한다.
-
-```bash
-cd /home/sw/PINN/merton_multi/AAAI
-export PYTHONUNBUFFERED=1
-```
 
 ---
 
