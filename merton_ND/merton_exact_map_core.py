@@ -112,6 +112,10 @@ class FDDiagnostics:
     upwind_points: int = 0
     coefficient_points: int = 0
     max_linear_residual: float = 0.0
+    boundary_elimination_size: int = 0
+    boundary_elimination_rank: int = 0
+    boundary_elimination_cond_inf: float = float("nan")
+    min_linear_system_lu_pivot_ratio: float = float("inf")
     policy_sums: Dict[str, float] = field(default_factory=dict)
     policy_points: float = 0.0
 
@@ -139,6 +143,14 @@ class FDDiagnostics:
                 else 0.0
             ),
             "max_linear_residual": float(self.max_linear_residual),
+            "boundary_elimination_size": int(self.boundary_elimination_size),
+            "boundary_elimination_rank": int(self.boundary_elimination_rank),
+            "boundary_elimination_cond_inf": float(
+                self.boundary_elimination_cond_inf
+            ),
+            "min_linear_system_lu_pivot_ratio": float(
+                self.min_linear_system_lu_pivot_ratio
+            ),
             "policy_points": float(self.policy_points),
         }
         denom = self.policy_points if self.policy_points > 0.0 else 1.0
@@ -351,33 +363,140 @@ def _tridiagonal_matvec(lower: Array, diag: Array, upper: Array, x: Array) -> Ar
     return out
 
 
-def solve_tridiagonal(lower: Array, diag: Array, upper: Array, rhs: Array) -> Array:
-    """Thomas solve with finite-pivot checks."""
+def _solve_tridiagonal_with_diagnostics(
+    lower: Array,
+    diag: Array,
+    upper: Array,
+    rhs: Array,
+) -> Tuple[Array, float]:
+    """Thomas solve and return the minimum-to-maximum LU pivot ratio."""
     a = np.asarray(lower, dtype=np.float64).copy()
     b = np.asarray(diag, dtype=np.float64).copy()
     c = np.asarray(upper, dtype=np.float64).copy()
     d = np.asarray(rhs, dtype=np.float64).copy()
     n = b.size
+    if n == 0:
+        raise ValueError("tridiagonal system must be nonempty")
     if any(arr.size != n for arr in (a, c, d)):
         raise ValueError("tridiagonal arrays must have equal lengths")
-    tiny = 100.0 * np.finfo(np.float64).tiny
+    if not all(np.all(np.isfinite(arr)) for arr in (a, b, c, d)):
+        raise FloatingPointError("tridiagonal system contains non-finite entries")
+    coefficient_scale = max(
+        float(np.max(np.abs(a))),
+        float(np.max(np.abs(b))),
+        float(np.max(np.abs(c))),
+        np.finfo(np.float64).tiny,
+    )
+    pivot_floor = 100.0 * np.finfo(np.float64).eps * coefficient_scale
+    pivots = np.empty(n, dtype=np.float64)
     for i in range(1, n):
-        if not np.isfinite(b[i - 1]) or abs(b[i - 1]) <= tiny:
-            raise np.linalg.LinAlgError(f"invalid tridiagonal pivot at {i - 1}")
+        pivots[i - 1] = abs(b[i - 1])
+        if (
+            not np.isfinite(pivots[i - 1])
+            or pivots[i - 1] <= pivot_floor
+        ):
+            raise np.linalg.LinAlgError(
+                f"invalid tridiagonal pivot at {i - 1}: "
+                f"|pivot|={pivots[i - 1]:.3e}, "
+                f"relative_floor={pivot_floor:.3e}"
+            )
         factor = a[i] / b[i - 1]
         b[i] -= factor * c[i - 1]
         d[i] -= factor * d[i - 1]
-    if not np.isfinite(b[-1]) or abs(b[-1]) <= tiny:
-        raise np.linalg.LinAlgError(f"invalid tridiagonal pivot at {n - 1}")
+    pivots[-1] = abs(b[-1])
+    if not np.isfinite(pivots[-1]) or pivots[-1] <= pivot_floor:
+        raise np.linalg.LinAlgError(
+            f"invalid tridiagonal pivot at {n - 1}: "
+            f"|pivot|={pivots[-1]:.3e}, relative_floor={pivot_floor:.3e}"
+        )
     x = np.empty(n, dtype=np.float64)
     x[-1] = d[-1] / b[-1]
     for i in range(n - 2, -1, -1):
-        if not np.isfinite(b[i]) or abs(b[i]) <= tiny:
-            raise np.linalg.LinAlgError(f"invalid tridiagonal pivot at {i}")
         x[i] = (d[i] - c[i] * x[i + 1]) / b[i]
     if not np.all(np.isfinite(x)):
         raise FloatingPointError("non-finite tridiagonal solution")
-    return x
+    pivot_ratio = float(np.min(pivots) / np.max(pivots))
+    return x, pivot_ratio
+
+
+def solve_tridiagonal(lower: Array, diag: Array, upper: Array, rhs: Array) -> Array:
+    """Thomas solve with finite, scale-aware pivot checks."""
+    solution, _pivot_ratio = _solve_tridiagonal_with_diagnostics(
+        lower, diag, upper, rhs
+    )
+    return solution
+
+
+def _boundary_elimination_diagnostics(
+    dy: float,
+    exponent: float,
+    boundary: str,
+) -> Dict[str, float]:
+    """Return the size, rank, and infinity condition of the boundary block."""
+    normalized = str(boundary).replace("_", "-").lower()
+    if normalized == "robin":
+        left_den = 3.0 + 2.0 * float(dy) * float(exponent)
+        right_den = 3.0 - 2.0 * float(dy) * float(exponent)
+        block = np.diag(np.asarray([left_den, right_den], dtype=np.float64))
+        if not np.all(np.isfinite(block)):
+            raise FloatingPointError(
+                "Robin boundary elimination contains non-finite entries"
+            )
+        size = int(block.shape[0])
+        rank = int(np.linalg.matrix_rank(block))
+        condition = (
+            float(np.linalg.cond(block, p=np.inf))
+            if rank == size
+            else float("inf")
+        )
+    elif normalized == "exact-dirichlet":
+        # Known boundary values correspond to an identity boundary block.
+        size = 2
+        rank = 2
+        condition = 1.0
+    else:
+        raise ValueError(f"unsupported boundary closure {boundary!r}")
+    return {
+        "size": int(size),
+        "rank": int(rank),
+        "condition_inf": float(condition),
+    }
+
+
+def _validated_robin_denominators(
+    dy: float,
+    exponent: float,
+    boundary_condition_limit: float,
+) -> Tuple[float, float]:
+    """Validate the Robin block before returning divisors used by elimination."""
+    if (
+        not np.isfinite(boundary_condition_limit)
+        or float(boundary_condition_limit) < 1.0
+    ):
+        raise ValueError(
+            "boundary_condition_limit must be finite and at least one"
+        )
+    diagnostics = _boundary_elimination_diagnostics(dy, exponent, "robin")
+    if int(diagnostics["rank"]) != int(diagnostics["size"]):
+        raise np.linalg.LinAlgError(
+            "Robin boundary elimination is rank deficient: "
+            f"rank={int(diagnostics['rank'])}, "
+            f"size={int(diagnostics['size'])}"
+        )
+    condition = float(diagnostics["condition_inf"])
+    if (
+        not np.isfinite(condition)
+        or condition > float(boundary_condition_limit)
+    ):
+        raise np.linalg.LinAlgError(
+            "Robin boundary elimination is ill-conditioned: "
+            f"cond_inf={condition:.3e}, "
+            f"limit={float(boundary_condition_limit):.3e}"
+        )
+    return (
+        3.0 + 2.0 * float(dy) * float(exponent),
+        3.0 - 2.0 * float(dy) * float(exponent),
+    )
 
 
 def _robin_eliminated_operator(
@@ -386,15 +505,17 @@ def _robin_eliminated_operator(
     upper: Array,
     dy: float,
     exponent: float,
+    boundary_condition_limit: float = 1.0e12,
 ) -> Tuple[Array, Array, Array]:
     """Eliminate second-order homogeneous Robin boundaries from L."""
     lo = np.asarray(lower, dtype=np.float64).copy()
     di = np.asarray(diag, dtype=np.float64).copy()
     up = np.asarray(upper, dtype=np.float64).copy()
-    left_den = 3.0 + 2.0 * dy * exponent
-    right_den = 3.0 - 2.0 * dy * exponent
-    if abs(left_den) < 1e-10 or abs(right_den) < 1e-10:
-        raise ValueError("Robin boundary elimination is singular on this grid")
+    if not (lo.size == di.size == up.size) or di.size == 0:
+        raise ValueError("Robin operator arrays must have equal nonzero lengths")
+    left_den, right_den = _validated_robin_denominators(
+        dy, exponent, boundary_condition_limit
+    )
     di[0] += lo[0] * (4.0 / left_den)
     up[0] += lo[0] * (-1.0 / left_den)
     lo[0] = 0.0
@@ -404,9 +525,18 @@ def _robin_eliminated_operator(
     return lo, di, up
 
 
-def _apply_robin_boundaries(value: Array, dy: float, exponent: float) -> None:
-    left_den = 3.0 + 2.0 * dy * exponent
-    right_den = 3.0 - 2.0 * dy * exponent
+def _apply_robin_boundaries(
+    value: Array,
+    dy: float,
+    exponent: float,
+    boundary_condition_limit: float = 1.0e12,
+) -> None:
+    value_arr = np.asarray(value)
+    if value_arr.ndim != 1 or value_arr.size < 3:
+        raise ValueError("Robin boundary application requires at least three nodes")
+    left_den, right_den = _validated_robin_denominators(
+        dy, exponent, boundary_condition_limit
+    )
     value[0] = (4.0 * value[1] - value[2]) / left_den
     value[-1] = (4.0 * value[-2] - value[-3]) / right_den
 
@@ -418,9 +548,12 @@ def solve_frozen_policy(
     *,
     theta_method: float = 0.5,
     rannacher_steps: int = 2,
-    drift_scheme: str = "adaptive",
+    drift_scheme: str = "central",
     peclet_limit: float = 1.0,
     boundary: str = "robin",
+    ellipticity_tolerance: float = 0.0,
+    linear_residual_tolerance: float = 1.0e-8,
+    boundary_condition_limit: float = 1.0e12,
 ) -> FDSolution:
     """Solve one frozen-policy equation on a uniform log-wealth grid.
 
@@ -437,6 +570,13 @@ def solve_frozen_policy(
     boundary oracle for a nonoptimal neural policy.  The homogeneous Robin
     closure is therefore the primary specification; the reported exact-map
     ratio should also be checked across FD domain sizes.
+
+    No ellipticity repair is performed: the sampled scalar variance
+    ``pi.T@Sigma@pi`` must be strictly larger than
+    ``ellipticity_tolerance``.  Every time-step solve is also rejected when
+    its normalized infinity residual exceeds ``linear_residual_tolerance``.
+    Robin elimination is validated for rank and infinity-norm conditioning
+    before either boundary denominator is used.
     """
     if not 0.5 <= float(theta_method) <= 1.0:
         raise ValueError("theta_method must lie in [0.5, 1]")
@@ -445,6 +585,25 @@ def solve_frozen_policy(
     boundary = str(boundary).replace("_", "-").lower()
     if boundary not in {"robin", "exact-dirichlet"}:
         raise ValueError("boundary must be robin or exact-dirichlet")
+    if (
+        not np.isfinite(ellipticity_tolerance)
+        or float(ellipticity_tolerance) < 0.0
+    ):
+        raise ValueError("ellipticity_tolerance must be finite and nonnegative")
+    if (
+        not np.isfinite(linear_residual_tolerance)
+        or float(linear_residual_tolerance) <= 0.0
+    ):
+        raise ValueError(
+            "linear_residual_tolerance must be finite and positive"
+        )
+    if (
+        not np.isfinite(boundary_condition_limit)
+        or float(boundary_condition_limit) < 1.0
+    ):
+        raise ValueError(
+            "boundary_condition_limit must be finite and at least one"
+        )
 
     tau_grid = np.linspace(0.0, problem.horizon, grid.nt + 1, dtype=np.float64)
     y_grid = np.linspace(grid.y_min, grid.y_max, grid.ny, dtype=np.float64)
@@ -452,10 +611,40 @@ def solve_frozen_policy(
     dy = float(y_grid[1] - y_grid[0])
     values = np.empty((grid.nt + 1, grid.ny), dtype=np.float64)
     values[0] = crra_terminal(problem, y_grid)
-    diagnostics = FDDiagnostics()
+    boundary_diag = _boundary_elimination_diagnostics(
+        dy, 1.0 - problem.gamma, boundary
+    )
+    if int(boundary_diag["rank"]) != int(boundary_diag["size"]):
+        raise np.linalg.LinAlgError(
+            f"{boundary} boundary elimination is rank deficient: "
+            f"rank={int(boundary_diag['rank'])}, "
+            f"size={int(boundary_diag['size'])}"
+        )
+    if (
+        not np.isfinite(boundary_diag["condition_inf"])
+        or float(boundary_diag["condition_inf"])
+        > float(boundary_condition_limit)
+    ):
+        raise np.linalg.LinAlgError(
+            f"{boundary} boundary elimination is ill-conditioned: "
+            f"cond_inf={float(boundary_diag['condition_inf']):.3e}, "
+            f"limit={float(boundary_condition_limit):.3e}"
+        )
+    diagnostics = FDDiagnostics(
+        boundary_elimination_size=int(boundary_diag["size"]),
+        boundary_elimination_rank=int(boundary_diag["rank"]),
+        boundary_elimination_cond_inf=float(
+            boundary_diag["condition_inf"]
+        ),
+    )
 
     if boundary == "robin":
-        _apply_robin_boundaries(values[0], dy, 1.0 - problem.gamma)
+        _apply_robin_boundaries(
+            values[0],
+            dy,
+            1.0 - problem.gamma,
+            boundary_condition_limit,
+        )
 
     for step in range(grid.nt):
         tau_old = float(tau_grid[step])
@@ -477,6 +666,13 @@ def solve_frozen_policy(
         diagnostics.max_diffusion_variance = max(
             diagnostics.max_diffusion_variance, float(variance.max())
         )
+        min_variance = float(np.min(variance))
+        if min_variance <= float(ellipticity_tolerance):
+            raise ValueError(
+                f"sampled log-wealth diffusion variance {min_variance:.3e} "
+                f"does not exceed tolerance "
+                f"{float(ellipticity_tolerance):.3e}"
+            )
 
         lower_all, diag_all, upper_all, peclet_all, upwind_all = stencil_coefficients(
             diffusion, drift, problem.discount, dy, drift_scheme, peclet_limit
@@ -493,9 +689,19 @@ def solve_frozen_policy(
         theta = 1.0 if step < int(rannacher_steps) else float(theta_method)
 
         if boundary == "robin":
-            _apply_robin_boundaries(old, dy, 1.0 - problem.gamma)
+            _apply_robin_boundaries(
+                old,
+                dy,
+                1.0 - problem.gamma,
+                boundary_condition_limit,
+            )
             lower_eff, diag_eff, upper_eff = _robin_eliminated_operator(
-                lower_l, diag_l, upper_l, dy, 1.0 - problem.gamma
+                lower_l,
+                diag_l,
+                upper_l,
+                dy,
+                1.0 - problem.gamma,
+                boundary_condition_limit,
             )
             old_int = old[1:-1]
             l_old = _tridiagonal_matvec(lower_eff, diag_eff, upper_eff, old_int)
@@ -503,10 +709,17 @@ def solve_frozen_policy(
             mat_lower = -dt * theta * lower_eff
             mat_diag = 1.0 - dt * theta * diag_eff
             mat_upper = -dt * theta * upper_eff
-            new_int = solve_tridiagonal(mat_lower, mat_diag, mat_upper, rhs)
+            new_int, pivot_ratio = _solve_tridiagonal_with_diagnostics(
+                mat_lower, mat_diag, mat_upper, rhs
+            )
             new = np.empty(grid.ny, dtype=np.float64)
             new[1:-1] = new_int
-            _apply_robin_boundaries(new, dy, 1.0 - problem.gamma)
+            _apply_robin_boundaries(
+                new,
+                dy,
+                1.0 - problem.gamma,
+                boundary_condition_limit,
+            )
         else:
             old_int = old[1:-1]
             l_old = (
@@ -524,18 +737,36 @@ def solve_frozen_policy(
             mat_upper = -dt * theta * upper_l
             mat_lower[0] = 0.0
             mat_upper[-1] = 0.0
-            new_int = solve_tridiagonal(mat_lower, mat_diag, mat_upper, rhs)
+            new_int, pivot_ratio = _solve_tridiagonal_with_diagnostics(
+                mat_lower, mat_diag, mat_upper, rhs
+            )
             new = np.empty(grid.ny, dtype=np.float64)
             new[0] = left_new
             new[-1] = right_new
             new[1:-1] = new_int
 
+        diagnostics.min_linear_system_lu_pivot_ratio = min(
+            diagnostics.min_linear_system_lu_pivot_ratio,
+            float(pivot_ratio),
+        )
         residual = _tridiagonal_matvec(mat_lower, mat_diag, mat_upper, new_int) - rhs
         scale = max(1.0, float(np.max(np.abs(rhs))))
+        normalized_residual = float(np.max(np.abs(residual))) / scale
         diagnostics.max_linear_residual = max(
             diagnostics.max_linear_residual,
-            float(np.max(np.abs(residual))) / scale,
+            normalized_residual,
         )
+        if (
+            not np.isfinite(normalized_residual)
+            or normalized_residual > float(linear_residual_tolerance)
+        ):
+            raise FloatingPointError(
+                f"FD linear residual gate failed for boundary={boundary}, "
+                f"step={step + 1}/{grid.nt}, tau={tau_new:.6g}, "
+                f"grid=({grid.ny},{grid.nt}): "
+                f"normalized_residual={normalized_residual:.3e} exceeds "
+                f"tolerance={float(linear_residual_tolerance):.3e}"
+            )
         if not np.all(np.isfinite(new)):
             raise FloatingPointError(f"non-finite FD value at tau step {step + 1}")
         values[step + 1] = new

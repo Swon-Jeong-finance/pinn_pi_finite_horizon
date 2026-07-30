@@ -13,6 +13,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import socket
 import time
@@ -173,6 +174,81 @@ def shrink_bounds(lo, hi, margin: float):
     """
     half_removed = 0.5 * margin * (hi - lo)
     return lo + half_removed, hi - half_removed
+
+
+def resolve_eval_window(
+    y_min: float,
+    y_max: float,
+    margin: float,
+    eval_w_min: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Resolve the Merton evaluation window with an optional lower-W override.
+
+    The ordinary ``eval_margin`` first contracts both sides of the saved
+    log-wealth interval.  When ``eval_w_min`` is supplied, it replaces only
+    that symmetric window's lower wealth endpoint; the upper endpoint remains
+    the one selected by ``eval_margin``.  This is the same convention used by
+    ``merton_exact_map_fd.py --eval-w-mins``.
+    """
+    y_min = float(y_min)
+    y_max = float(y_max)
+    margin = float(margin)
+    if not (
+        math.isfinite(y_min)
+        and math.isfinite(y_max)
+        and y_min < y_max
+    ):
+        raise ValueError("saved log-wealth bounds must be finite and ordered")
+    if not math.isfinite(margin) or not 0.0 <= margin < 1.0:
+        raise ValueError(
+            "eval margin (half-width fraction) must be finite and in [0, 1)"
+        )
+
+    symmetric_y_min, symmetric_y_max = shrink_bounds(y_min, y_max, margin)
+    symmetric_w_min = float(math.exp(symmetric_y_min))
+    symmetric_w_max = float(math.exp(symmetric_y_max))
+    requested: Optional[float] = None
+    effective_w_min = symmetric_w_min
+    mode = "symmetric-margin"
+
+    if eval_w_min is not None:
+        candidate = float(eval_w_min)
+        if not math.isfinite(candidate) or candidate <= 0.0:
+            raise ValueError(
+                "evaluation w_min must be finite and strictly positive"
+            )
+        training_w_min = float(math.exp(y_min))
+        tolerance = (
+            32.0
+            * np.finfo(np.float64).eps
+            * max(1.0, abs(training_w_min))
+        )
+        if candidate < training_w_min - tolerance:
+            raise ValueError(
+                "evaluation w_min must remain inside the saved nominal "
+                f"training interval: got {candidate:.17g}, but training "
+                f"w_min is {training_w_min:.17g}"
+            )
+        if candidate >= symmetric_w_max:
+            raise ValueError(
+                "evaluation w_min must lie strictly below the symmetric "
+                f"eval-margin upper bound {symmetric_w_max:.17g}"
+            )
+        requested = candidate
+        effective_w_min = max(candidate, training_w_min)
+        mode = "lower-wealth-override"
+
+    effective_y_min = float(math.log(effective_w_min))
+    return {
+        "eval_margin": margin,
+        "eval_window_mode": mode,
+        "eval_w_min_requested": requested,
+        "eval_w_min_symmetric": symmetric_w_min,
+        "ev_y_min": effective_y_min,
+        "ev_y_max": float(symmetric_y_max),
+        "ev_w_min": effective_w_min,
+        "ev_w_max": symmetric_w_max,
+    }
 
 
 def pres_from_mse(pde_mse: float, terminal_mse: float) -> float:

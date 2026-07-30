@@ -21,6 +21,7 @@ import math
 import os
 import re
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -35,11 +36,23 @@ from merton_exact_map_core import (
     crra_closed_form,
     evaluate_fd_bundle,
     solve_frozen_policy,
+    log_to_wealth_derivatives,
     x_norm_components,
 )
 
 
 CHECKPOINT_RE = re.compile(r"value_net_iter(\d+)\.pt$")
+POLICY_EXTENSIONS = ("boundary-projection", "neural-extrapolation")
+SUPPORTED_PLOT_FORMATS = ("png", "pdf", "svg", "eps")
+E6_WARMUP_BUNDLE_SCHEMA_VERSION = 1
+E6_WARMUP_BUNDLE_KIND = "merton-pipinn-e6-common-warmup-v1"
+E6_WARM_START_PROTOCOL = "merton-e6-common-warm-start-v1"
+EXACT_PROTOCOL_COMPATIBILITY_VERSION = (
+    "merton-exact-map-fd-seed-neutral-v1"
+)
+REFINEMENT_SEMANTICS_VERSION = (
+    "merton-fd-grid-domain-gate-boundary-sensitivity-v2"
+)
 BOUNDARY_SEMANTICS = {
     "robin": (
         "primary homogeneous CRRA Robin closure u_y=(1-gamma)u; "
@@ -52,14 +65,21 @@ BOUNDARY_SEMANTICS = {
     ),
 }
 RATIO_FIELDS = [
-    "problem", "group", "protocol_hash", "model_type", "n_assets", "seed", "market_seed",
+    "problem", "group", "protocol_hash", "model_type", "e6_role",
+    "n_assets", "seed", "market_seed",
     "horizon", "gamma", "discount", "bequest", "risk_free", "network_dtype",
     "checkpoint_outer_iter", "source_iter", "target_policy_iter", "checkpoint",
     "checkpoint_sha256", "checkpoint_state_sha256",
-    "market_sha256", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min", "ev_y_max",
+    "market_sha256", "eval_margin", "eval_window_mode",
+    "eval_w_min_requested", "eval_w_min_symmetric",
+    "ev_tau_min", "ev_tau_max", "ev_y_min", "ev_y_max",
+    "ev_w_min", "ev_w_max",
     "fd_margin", "fd_y_min", "fd_y_max", "boundary", "boundary_semantics",
+    "boundary_role", "is_boundary_representative",
     "drift_scheme",
     "grid_factor", "ny", "nt", "dy", "dt", "is_primary", "is_verification",
+    "analysis_mode", "policy_extension", "map_definition",
+    "outside_collocation_count_fd", "outside_collocation_fraction_fd",
     "e_input_value", "e_input_vw", "e_input_vww", "e_input_vy", "e_input_vyy",
     "e_input_deriv", "e_input_X", "e_map_value", "e_map_vw", "e_map_vww",
     "e_map_vy", "e_map_vyy", "e_map_deriv", "e_map_X",
@@ -75,9 +95,15 @@ RATIO_FIELDS = [
     "min_diffusion", "max_diffusion", "min_diffusion_variance",
     "max_diffusion_variance", "min_diffusion_variance_ev",
     "max_diffusion_variance_ev", "max_peclet", "upwind_fraction",
-    "max_linear_residual", "policy_hash", "grid_abs_change", "grid_rel_change",
+    "max_linear_residual", "linear_residual_tolerance",
+    "boundary_elimination_size", "boundary_elimination_rank",
+    "boundary_elimination_cond_inf", "min_linear_system_lu_pivot_ratio",
+    "policy_hash", "grid_abs_change", "grid_rel_change",
     "domain_abs_change", "domain_rel_change", "boundary_abs_change",
-    "rho_sensitivity_envelope", "refinement_status", "contraction_status",
+    "boundary_rel_change", "boundary_sensitivity_status",
+    "rho_grid_domain_sensitivity_envelope", "rho_sensitivity_envelope",
+    "grid_domain_refinement_status", "refinement_semantics_version",
+    "refinement_status", "contraction_status",
 ]
 
 # E4 evaluates the neural policy-evaluation error at iteration ``n`` by
@@ -86,36 +112,55 @@ RATIO_FIELDS = [
 # conflating the exact-map contraction ratio with the approximation hypothesis
 # ``delta_n = v_tilde_n - v^{alpha_n}``.
 DEFECT_FIELDS = [
-    "problem", "group", "protocol_hash", "model_type", "n_assets", "seed",
-    "market_seed", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min",
-    "ev_y_max", "defect_iter", "defect_kind",
+    "problem", "group", "protocol_hash", "model_type", "e6_role",
+    "n_assets", "seed",
+    "market_seed", "eval_margin", "eval_window_mode",
+    "eval_w_min_requested", "eval_w_min_symmetric",
+    "ev_tau_min", "ev_tau_max", "ev_y_min",
+    "ev_y_max", "ev_w_min", "ev_w_max", "defect_iter", "defect_kind",
     "checkpoint_outer_iter", "source_iter",
     "target_policy_iter", "next_checkpoint_outer_iter", "next_neural_iter",
     "checkpoint_state_sha256", "next_checkpoint_state_sha256",
     "frozen_policy_sha256",
-    "fd_margin", "boundary", "grid_factor", "ny", "nt", "is_verification",
+    "fd_margin", "boundary", "boundary_role",
+    "grid_factor", "ny", "nt", "is_verification",
+    "analysis_mode", "policy_extension", "map_definition",
+    "outside_collocation_count_fd", "outside_collocation_fraction_fd",
     "delta_value_sup", "delta_vw_sup", "delta_vww_sup", "delta_vy_sup",
     "delta_vyy_sup", "delta_bundle_sup", "delta_X",
     "defect_grid_abs_change", "defect_grid_rel_change",
     "defect_domain_abs_change", "defect_domain_rel_change",
-    "defect_boundary_abs_change", "defect_sensitivity_envelope",
+    "defect_boundary_abs_change", "defect_boundary_rel_change",
+    "boundary_sensitivity_status",
+    "defect_grid_domain_sensitivity_envelope", "defect_sensitivity_envelope",
     "p_res_post_restore", "p_res_source", "residual_semantics",
     "evaluated_bundle_path", "evaluated_bundle_sha256",
+    "grid_domain_refinement_status", "refinement_semantics_version",
     "refinement_status", "map_variant", "local_map_unmodified_on_xfd",
     "whole_space_map_claim",
 ]
 
 DEFECT_REFINEMENT_FIELDS = [
-    "problem", "group", "protocol_hash", "model_type", "n_assets", "seed",
-    "market_seed", "eval_margin", "ev_tau_min", "ev_tau_max", "ev_y_min",
-    "ev_y_max", "defect_iter", "defect_kind", "target_policy_iter",
+    "problem", "group", "protocol_hash", "model_type", "e6_role",
+    "n_assets", "seed",
+    "market_seed", "eval_margin", "eval_window_mode",
+    "eval_w_min_requested", "eval_w_min_symmetric",
+    "ev_tau_min", "ev_tau_max", "ev_y_min",
+    "ev_y_max", "ev_w_min", "ev_w_max", "defect_iter", "defect_kind",
+    "target_policy_iter",
     "next_checkpoint_outer_iter", "frozen_policy_sha256",
-    "fd_margin", "boundary", "grid_factor", "ny", "nt", "is_primary",
-    "is_verification", "delta_value_sup", "delta_vw_sup", "delta_vww_sup",
+    "fd_margin", "boundary", "boundary_role", "is_boundary_representative",
+    "grid_factor", "ny", "nt", "is_primary",
+    "is_verification", "analysis_mode", "policy_extension", "map_definition",
+    "outside_collocation_count_fd", "outside_collocation_fraction_fd",
+    "delta_value_sup", "delta_vw_sup", "delta_vww_sup",
     "delta_vy_sup", "delta_vyy_sup", "delta_bundle_sup", "delta_X",
     "defect_grid_abs_change", "defect_grid_rel_change",
     "defect_domain_abs_change", "defect_domain_rel_change",
-    "defect_boundary_abs_change", "defect_sensitivity_envelope",
+    "defect_boundary_abs_change", "defect_boundary_rel_change",
+    "boundary_sensitivity_status",
+    "defect_grid_domain_sensitivity_envelope", "defect_sensitivity_envelope",
+    "grid_domain_refinement_status", "refinement_semantics_version",
     "refinement_status", "map_variant", "local_map_unmodified_on_xfd",
     "whole_space_map_claim",
 ]
@@ -161,6 +206,182 @@ def stable_hash(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _checkpoint_indexing_contract(
+    value: Any,
+) -> Dict[str, Any]:
+    """Return only the seed-neutral checkpoint-indexing semantics.
+
+    ``exact_map_config.json`` also records per-checkpoint lookup maps for
+    auditability.  Those maps are derived from the saved schedule rather than
+    from the numerical FD protocol, so the compatibility fingerprint keeps
+    only the indexing contract used by the exact-map solver.
+    """
+    payload = value if isinstance(value, Mapping) else {}
+    keys = (
+        "checkpoint_outer_index_base",
+        "source_iter_offset_from_checkpoint_outer",
+        "target_policy_iter_offset_from_checkpoint_outer",
+        "algorithm_outer_index_offset",
+        "warmup_excluded_from_outer_history",
+        "source",
+    )
+    return {
+        key: payload.get(key)
+        for key in keys
+        if key in payload
+    }
+
+
+def exact_protocol_compatibility_payload(
+    exact_cfg: Mapping[str, Any],
+    *,
+    training_group: str,
+) -> Dict[str, Any]:
+    """Build a seed-neutral FD/evaluation protocol payload.
+
+    The warm-start bundle and model-state hashes remain in
+    ``warm_start_predecessor`` and are still checked when a run is loaded.
+    They identify a seed-specific input artifact, however, not a numerical FD
+    protocol.  Consequently they must not split otherwise identical
+    cross-seed exact-map aggregations.
+
+    New outputs store the producer payload directly.  For outputs created
+    before this contract existed, the same payload is reconstructed from
+    ``exact_map_config.json`` so aggregation does not require rerunning the FD
+    solves.
+    """
+    stored = exact_cfg.get("protocol_compatibility_payload")
+    if isinstance(stored, Mapping):
+        payload = dict(stored)
+        payload["training_group"] = str(training_group)
+        # Refuse to propagate the two legacy seed-specific fields even if a
+        # hand-edited config inserted them into the stored payload.
+        payload.pop("warm_start_bundle_file_hash", None)
+        payload.pop("warm_start_model_state_hash", None)
+        payload["compatibility_version"] = (
+            EXACT_PROTOCOL_COMPATIBILITY_VERSION
+        )
+        return payload
+
+    grid_value = exact_cfg.get("grid")
+    grid = grid_value if isinstance(grid_value, Mapping) else {}
+    bounds_value = exact_cfg.get("evaluation_bounds")
+    bounds = bounds_value if isinstance(bounds_value, Mapping) else {}
+    problem_value = exact_cfg.get("problem")
+    problem = problem_value if isinstance(problem_value, Mapping) else {}
+    implementation_value = exact_cfg.get("implementation_hashes")
+    implementation_hashes = (
+        dict(implementation_value)
+        if isinstance(implementation_value, Mapping)
+        else implementation_value
+    )
+    analysis_mode = str(exact_cfg.get("analysis_mode", ""))
+    skip_e4 = analysis_mode in {
+        "exact_map_only_pilot",
+        "sparse_exact_map_only_pilot",
+    }
+    eval_w_min = bounds.get(
+        "w_min", grid.get("evaluation_w_min")
+    )
+    eval_w_max = bounds.get(
+        "w_max", grid.get("evaluation_w_max")
+    )
+    eval_y_min = bounds.get(
+        "y_min", grid.get("evaluation_y_min")
+    )
+    eval_y_max = bounds.get(
+        "y_max", grid.get("evaluation_y_max")
+    )
+    eval_tau_max = grid.get(
+        "evaluation_tau_max", problem.get("horizon")
+    )
+    return {
+        "compatibility_version": EXACT_PROTOCOL_COMPATIBILITY_VERSION,
+        "training_group": str(training_group),
+        "base_ny": grid.get("base_ny"),
+        "base_nt": grid.get("base_nt"),
+        "eval_ny": grid.get("eval_ny"),
+        "evaluation_calendar_time_domain": grid.get(
+            "evaluation_time_calendar_domain", "[0,T)"
+        ),
+        "primary_evaluation_window": {
+            "eval_margin": exact_cfg.get("eval_margin"),
+            "eval_window_mode": exact_cfg.get(
+                "eval_window_mode", "symmetric-margin"
+            ),
+            "eval_w_min_requested": exact_cfg.get(
+                "eval_w_min_requested"
+            ),
+            "eval_w_min_symmetric": exact_cfg.get(
+                "eval_w_min_symmetric", eval_w_min
+            ),
+            "ev_tau_min": grid.get("evaluation_tau_min"),
+            "ev_tau_max": eval_tau_max,
+            "ev_y_min": eval_y_min,
+            "ev_y_max": eval_y_max,
+            "ev_w_min": eval_w_min,
+            "ev_w_max": eval_w_max,
+        },
+        "grid_factors": list(grid.get("grid_factors", [])),
+        "fd_margins": list(grid.get("fd_margins", [])),
+        "boundaries": list(grid.get("boundaries", [])),
+        "verify_checkpoints": grid.get("verify_checkpoints"),
+        "analysis_mode": analysis_mode,
+        "skip_e4": skip_e4,
+        "e6_role": exact_cfg.get("e6_role", "standard"),
+        "checkpoint_indexing": _checkpoint_indexing_contract(
+            exact_cfg.get("checkpoint_indexing")
+        ),
+        "initial_defect_mode": exact_cfg.get("initial_defect_mode"),
+        "policy_extension": exact_cfg.get("policy_extension"),
+        "defect_refinement_selector": (
+            "first_defect_plus_verify_checkpoints; paper evidence requires "
+            "first+last+worst defects"
+        ),
+        "drift_scheme": grid.get("drift_scheme"),
+        "peclet_limit": grid.get("peclet_limit"),
+        "theta_method": grid.get("theta_method"),
+        "rannacher_steps": grid.get(
+            "initial_full_dt_backward_euler_steps"
+        ),
+        "denominator_tolerance": exact_cfg.get(
+            "denominator_tolerance"
+        ),
+        "linear_residual_tolerance": exact_cfg.get(
+            "linear_residual_tolerance",
+            grid.get("linear_residual_tolerance"),
+        ),
+        "boundary_condition_limit": exact_cfg.get(
+            "boundary_condition_limit",
+            grid.get("boundary_condition_limit"),
+        ),
+        "solver_ellipticity_tolerance": exact_cfg.get(
+            "solver_ellipticity_tolerance",
+            grid.get("solver_ellipticity_tolerance"),
+        ),
+        "refinement_abs_tolerance": exact_cfg.get(
+            "refinement_abs_tolerance"
+        ),
+        "refinement_rel_tolerance": exact_cfg.get(
+            "refinement_rel_tolerance"
+        ),
+        "implementation_hashes": implementation_hashes,
+        "checkpoint_selection": exact_cfg.get("checkpoint_selection"),
+    }
+
+
+def exact_protocol_compatibility_hash(
+    exact_cfg: Mapping[str, Any],
+    *,
+    training_group: str,
+) -> str:
+    return stable_hash(
+        exact_protocol_compatibility_payload(
+            exact_cfg, training_group=training_group
+        )
+    )[:16]
+
+
 def atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -184,11 +405,131 @@ def atomic_npz(path: Path, **arrays: np.ndarray) -> None:
 def write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+    required = set(fields)
+    for index, row in enumerate(rows):
+        missing = sorted(required - set(row))
+        if missing:
+            raise KeyError(
+                f"{path.name} row {index} is missing schema fields: {missing}"
+            )
     with tmp.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="ignore")
+        # Silently dropping an unexpected metric key previously made it
+        # possible to publish blank component columns.  Artifact schemas are
+        # contracts: a producer-side spelling error must fail immediately.
+        writer = csv.DictWriter(handle, fieldnames=list(fields), extrasaction="raise")
         writer.writeheader()
         writer.writerows(rows)
     os.replace(tmp, path)
+
+
+METRIC_COMPONENT_MAP = {
+    "value_sup": "value",
+    "vw_sup": "vw",
+    "vww_sup": "vww",
+    "vy_sup": "vy",
+    "vyy_sup": "vyy",
+    "derivative_sup": "deriv",
+    "x_norm": "X",
+}
+
+
+def metric_to_columns(prefix: str, metric: Mapping[str, Any]) -> Dict[str, float]:
+    """Map a complete X-norm diagnostic to an explicit CSV component schema."""
+    missing = [key for key in METRIC_COMPONENT_MAP if key not in metric]
+    if missing:
+        raise KeyError(
+            f"{prefix} metric is missing required components: {', '.join(missing)}"
+        )
+    out: Dict[str, float] = {}
+    for source, suffix in METRIC_COMPONENT_MAP.items():
+        value = float(metric[source])
+        if not math.isfinite(value):
+            raise ValueError(f"{prefix}_{suffix} must be finite, got {value!r}")
+        out[f"{prefix}_{suffix}"] = value
+    return out
+
+
+def bundle_storage_arrays(
+    prefix: str,
+    bundle: Tuple[np.ndarray, np.ndarray, np.ndarray],
+    y: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Return unambiguous log- and wealth-coordinate bundle arrays for NPZ."""
+    value, value_y, value_yy = (
+        np.asarray(bundle[0]),
+        np.asarray(bundle[1]),
+        np.asarray(bundle[2]),
+    )
+    value_w, value_ww = log_to_wealth_derivatives(value_y, value_yy, y)
+    return {
+        f"{prefix}_value": value,
+        f"{prefix}_vy": value_y,
+        f"{prefix}_vyy": value_yy,
+        f"{prefix}_vw": value_w,
+        f"{prefix}_vww": value_ww,
+    }
+
+
+def _quarantine_previous_outputs(output: Path) -> None:
+    """Move old canonical artifacts aside before a new attempt.
+
+    A failed rerun must never leave a stale CSV/NPZ under its canonical name.
+    Moving, rather than deleting, preserves prior evidence for manual audit.
+    """
+    names = (
+        "exact_map_refinement.csv",
+        "exact_map_ratios.csv",
+        "exact_map_defects.csv",
+        "exact_map_defect_refinement.csv",
+        "exact_map_config.json",
+        "exact_map_status.json",
+        "evaluated_bundles",
+        "_SUCCESS_EXACT_MAP",
+        "_FAILED_EXACT_MAP",
+        "_STALE_EXACT_MAP",
+        "_INCOMPLETE_EXACT_MAP",
+    )
+    existing = [output / name for name in names if (output / name).exists()]
+    if not existing:
+        return
+    stale = output / "stale_outputs" / str(time.time_ns())
+    stale.mkdir(parents=True, exist_ok=False)
+    for path in existing:
+        os.replace(path, stale / path.name)
+
+
+def _policy_extension_y(
+    problem: MertonProblem,
+    y: np.ndarray,
+    mode: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    normalized = str(mode).strip().lower().replace("_", "-")
+    if normalized not in POLICY_EXTENSIONS:
+        raise ValueError(
+            f"unsupported policy extension {mode!r}; choose from {POLICY_EXTENSIONS}"
+        )
+    actual = np.asarray(y, dtype=np.float64)
+    outside = (actual < problem.y_min) | (actual > problem.y_max)
+    if normalized == "boundary-projection":
+        evaluated = np.clip(actual, problem.y_min, problem.y_max)
+    else:
+        evaluated = actual
+    return evaluated, outside
+
+
+def _map_definition(policy_extension: str) -> Tuple[str, str]:
+    normalized = str(policy_extension).strip().lower().replace("_", "-")
+    if normalized == "boundary-projection":
+        return (
+            "finite_domain_boundary_projected_policy_extension",
+            "not_a_whole_space_map",
+        )
+    if normalized == "neural-extrapolation":
+        return (
+            "finite_domain_raw_neural_extrapolation",
+            "not_verified_by_finite_domain",
+        )
+    raise ValueError(f"unsupported policy extension {policy_extension!r}")
 
 
 def load_outer_residuals(run_dir: Path) -> Tuple[Dict[int, float], str]:
@@ -230,6 +571,47 @@ def parse_float_list(text: str) -> List[float]:
     if not values:
         raise ValueError("expected a nonempty numeric list")
     return values
+
+
+def parse_plot_formats(text: str) -> List[str]:
+    formats = [
+        item.lower().lstrip(".")
+        for item in re.split(r"[\s,]+", str(text).strip())
+        if item
+    ]
+    if not formats:
+        raise ValueError("--formats must contain at least one format")
+    if len(set(formats)) != len(formats):
+        raise ValueError(f"duplicate formats in --formats={text!r}")
+    invalid = sorted(set(formats) - set(SUPPORTED_PLOT_FORMATS))
+    if invalid:
+        raise ValueError(
+            f"unsupported figure formats {invalid}; choose from "
+            f"{list(SUPPORTED_PLOT_FORMATS)}"
+        )
+    return formats
+
+
+def resolve_plot_formats(formats: str, legacy_format: str) -> List[str]:
+    """Resolve the multi-format CLI while preserving the old --format flag."""
+    if str(formats).strip() and str(legacy_format).strip():
+        raise ValueError("--formats and legacy --format cannot be used together")
+    if str(formats).strip():
+        return parse_plot_formats(formats)
+    if str(legacy_format).strip():
+        return parse_plot_formats(legacy_format)
+    return ["png"]
+
+
+def eval_w_min_output_name(value: float) -> str:
+    """Return a stable, human-readable directory name for a wealth cutoff."""
+    text = repr(float(value)).lower()
+    slug = (
+        text.replace("+", "p")
+        .replace("-", "m")
+        .replace(".", "p")
+    )
+    return f"eval_w_min_{slug}"
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -370,7 +752,11 @@ class RunSpec:
     market_seed: int
     model_type: str
     eval_margin: float
+    eval_window_mode: str
+    eval_w_min_requested: Optional[float]
+    eval_w_min_symmetric: float
     eval_y_bounds: Tuple[float, float]
+    eval_w_bounds: Tuple[float, float]
     market_hash: str
     group: str
     checkpoint_selection: str
@@ -381,6 +767,15 @@ class RunSpec:
     final_checkpoint_state_hash: str
     checkpoint_manifest_path: Optional[Path]
     checkpoint_manifest_hash: str
+    e6_role: str
+    checkpoint_source_iters: Dict[int, int]
+    checkpoint_target_policy_iters: Dict[int, int]
+    checkpoint_indexing_provenance: Dict[str, Any]
+    initial_defect_mode: str
+    warm_start_bundle_path: Optional[Path]
+    warm_start_bundle_file_hash: str
+    warm_start_model_state_hash: str
+    warm_start_provenance: Dict[str, Any]
 
 
 def _configured_path_candidates(
@@ -465,6 +860,7 @@ def load_run_spec(
     policy_mode_override: str = "",
     time_coordinate_override: str = "",
     eval_margin_override: Optional[float] = None,
+    eval_w_min_override: Optional[float] = None,
     network_dtype: str = "training",
 ) -> RunSpec:
     run_dir = run_dir.expanduser().resolve()
@@ -790,10 +1186,10 @@ def load_run_spec(
             provenance=metadata_provenance, label="activation")),
         dtype=resolved_dtype,
     )
-    margin = (
-        float(eval_margin_override)
+    margin = first_margin(
+        eval_margin_override
         if eval_margin_override is not None
-        else first_margin(_pick(cfg, ("eval_margin",), default="0.10"))
+        else _pick(cfg, ("eval_margin",), default="0.10")
     )
     margin_coordinate = str(
         _pick(cfg, ("eval_margin_coordinate",), default="y")
@@ -805,7 +1201,47 @@ def load_run_spec(
     # Merton is trained and diagnosed in y=log(w); the primary Q_ev margin
     # therefore shrinks only the log-wealth axis. The time axis is not margin-
     # contracted; evaluate_run applies the trainer's [0,T) endpoint convention.
-    eval_y_bounds = shrink_bounds(problem.y_min, problem.y_max, margin)
+    symmetric_eval_y_bounds = shrink_bounds(
+        problem.y_min, problem.y_max, margin
+    )
+    symmetric_eval_w_bounds = tuple(
+        float(math.exp(value)) for value in symmetric_eval_y_bounds
+    )
+    if eval_w_min_override is None:
+        eval_window_mode = "symmetric-margin"
+        eval_w_min_requested = None
+        eval_w_bounds = symmetric_eval_w_bounds
+    else:
+        candidate = float(eval_w_min_override)
+        if not math.isfinite(candidate) or candidate <= 0.0:
+            raise ValueError(
+                "evaluation w_min must be finite and strictly positive"
+            )
+        symmetric_lower, symmetric_upper = symmetric_eval_w_bounds
+        training_lower = float(math.exp(problem.y_min))
+        lower_tolerance = 32.0 * np.finfo(np.float64).eps * max(
+            1.0, abs(training_lower)
+        )
+        if candidate < training_lower - lower_tolerance:
+            raise ValueError(
+                "evaluation w_min must remain inside the saved nominal "
+                f"training interval: got {candidate:.17g}, but training "
+                f"w_min is {training_lower:.17g}"
+            )
+        if candidate >= symmetric_upper:
+            raise ValueError(
+                "evaluation w_min must lie strictly below the symmetric "
+                f"eval-margin upper bound {symmetric_upper:.17g}"
+            )
+        # Preserve the raw request for provenance but clamp a roundoff-only
+        # undershoot to the exact saved training endpoint.
+        eval_window_mode = "lower-wealth-override"
+        eval_w_min_requested = candidate
+        eval_w_bounds = (max(candidate, training_lower), symmetric_upper)
+    eval_y_bounds = (
+        float(math.log(eval_w_bounds[0])),
+        symmetric_eval_y_bounds[1],
+    )
 
     if weight_dir_override is not None:
         weight_dir = weight_dir_override.expanduser().resolve()
@@ -841,6 +1277,40 @@ def load_run_spec(
         )
     expected_final = status_final or config_final
     actual_outers = [outer for outer, _path in available_checkpoints]
+    recorded_e6_roles: Dict[str, str] = {}
+    for source, value in (
+        ("config", _pick(cfg, ("e6_role",), default=None)),
+        ("status", status_payload.get("e6_role")),
+    ):
+        if value not in (None, ""):
+            recorded_e6_roles[source] = str(value).strip().lower()
+    if len(set(recorded_e6_roles.values())) > 1:
+        raise ValueError(
+            "inconsistent e6_role metadata: "
+            + ", ".join(
+                f"{source}={value!r}"
+                for source, value in sorted(recorded_e6_roles.items())
+            )
+        )
+    e6_role = next(iter(recorded_e6_roles.values()), "standard")
+    if e6_role not in {"standard", "warmup", "target_branch"}:
+        raise ValueError(
+            f"unsupported e6_role={e6_role!r}; expected standard, warmup, "
+            "or target_branch"
+        )
+    checkpoint_source_iters: Dict[int, int] = {
+        outer: outer - 1 for outer in actual_outers
+    }
+    checkpoint_target_policy_iters: Dict[int, int] = {
+        outer: outer for outer in actual_outers
+    }
+    checkpoint_indexing_provenance: Dict[str, Any] = {
+        "checkpoint_outer_index_base": 1,
+        "source_iter_offset_from_checkpoint_outer": -1,
+        "target_policy_iter_offset_from_checkpoint_outer": 0,
+        "source": "legacy-standard-default",
+    }
+    warm_start_provenance: Dict[str, Any] = {}
     checkpoint_manifest_path = weight_dir / "checkpoint_manifest.json"
     checkpoint_manifest_hash = ""
     manifest_payload: Dict[str, Any] = {}
@@ -861,6 +1331,103 @@ def load_run_spec(
         }:
             raise ValueError(
                 f"checkpoint manifest is not complete: status={manifest_status!r}"
+            )
+        manifest_e6_role_value = manifest_payload.get("e6_role")
+        if manifest_e6_role_value not in (None, ""):
+            manifest_e6_role = str(manifest_e6_role_value).strip().lower()
+            recorded_e6_roles["manifest"] = manifest_e6_role
+            if len(set(recorded_e6_roles.values())) > 1:
+                raise ValueError(
+                    "inconsistent e6_role metadata: "
+                    + ", ".join(
+                        f"{source}={value!r}"
+                        for source, value in sorted(recorded_e6_roles.items())
+                    )
+                )
+            e6_role = manifest_e6_role
+        if e6_role not in {"standard", "warmup", "target_branch"}:
+            raise ValueError(
+                f"unsupported manifest e6_role={e6_role!r}"
+            )
+        is_target_branch = e6_role == "target_branch"
+        expected_algorithm_offset = 1 if is_target_branch else 0
+        if int(
+            manifest_payload.get(
+                "algorithm_outer_index_offset", expected_algorithm_offset
+            )
+        ) != expected_algorithm_offset:
+            raise ValueError(
+                "manifest algorithm_outer_index_offset does not match "
+                f"e6_role={e6_role!r}"
+            )
+        warmup_excluded = bool(
+            manifest_payload.get(
+                "warmup_excluded_from_outer_history", is_target_branch
+            )
+        )
+        if warmup_excluded != is_target_branch:
+            raise ValueError(
+                "manifest warmup_excluded_from_outer_history does not match "
+                f"e6_role={e6_role!r}"
+            )
+        raw_indexing = manifest_payload.get("indexing")
+        if raw_indexing is None:
+            if is_target_branch:
+                raise ValueError(
+                    "E6 target_branch checkpoint manifest is missing indexing "
+                    "provenance"
+                )
+            raw_indexing = {}
+        if not isinstance(raw_indexing, Mapping):
+            raise ValueError("manifest indexing must be an object")
+        expected_source_offset = 0 if is_target_branch else -1
+        expected_target_offset = 1 if is_target_branch else 0
+        source_offset = int(
+            raw_indexing.get(
+                "source_iter_offset_from_checkpoint_outer",
+                expected_source_offset,
+            )
+        )
+        target_offset = int(
+            raw_indexing.get(
+                "target_policy_iter_offset_from_checkpoint_outer",
+                expected_target_offset,
+            )
+        )
+        if source_offset != expected_source_offset:
+            raise ValueError(
+                "manifest source_iter_offset_from_checkpoint_outer="
+                f"{source_offset} does not match e6_role={e6_role!r}"
+            )
+        if target_offset != expected_target_offset:
+            raise ValueError(
+                "manifest target_policy_iter_offset_from_checkpoint_outer="
+                f"{target_offset} does not match e6_role={e6_role!r}"
+            )
+        checkpoint_indexing_provenance = dict(raw_indexing)
+        checkpoint_indexing_provenance.update({
+            "checkpoint_outer_index_base": int(
+                raw_indexing.get("checkpoint_outer_index_base", 1)
+            ),
+            "source_iter_offset_from_checkpoint_outer": source_offset,
+            "target_policy_iter_offset_from_checkpoint_outer": target_offset,
+            "algorithm_outer_index_offset": expected_algorithm_offset,
+            "warmup_excluded_from_outer_history": warmup_excluded,
+            "source": "checkpoint_manifest",
+        })
+        if checkpoint_indexing_provenance["checkpoint_outer_index_base"] != 1:
+            raise ValueError(
+                "manifest checkpoint_outer_index_base must equal one"
+            )
+        raw_warm_start_provenance = manifest_payload.get(
+            "warmup_provenance", {}
+        )
+        if not isinstance(raw_warm_start_provenance, Mapping):
+            raise ValueError("manifest warmup_provenance must be an object")
+        warm_start_provenance = dict(raw_warm_start_provenance)
+        if is_target_branch and not warm_start_provenance:
+            raise ValueError(
+                "E6 target_branch manifest is missing warm-up provenance"
             )
         declared_manifest_hash = str(
             status_payload.get("checkpoint_manifest_sha256", "")
@@ -936,14 +1503,28 @@ def load_run_spec(
                 raise ValueError(
                     f"invalid/duplicate checkpoint_outer_iter={outer} in manifest"
                 )
-            if int(entry.get("source_iter", outer - 1)) != outer - 1:
+            expected_source_iter = outer + source_offset
+            expected_target_policy_iter = outer + target_offset
+            if int(
+                entry.get("source_iter", expected_source_iter)
+            ) != expected_source_iter:
                 raise ValueError(
-                    f"manifest outer={outer} must use paper source_iter={outer - 1}"
+                    f"manifest outer={outer} must use paper "
+                    f"source_iter={expected_source_iter}"
                 )
-            if int(entry.get("target_policy_iter", outer)) != outer:
+            if int(
+                entry.get(
+                    "target_policy_iter", expected_target_policy_iter
+                )
+            ) != expected_target_policy_iter:
                 raise ValueError(
-                    f"manifest outer={outer} must use target_policy_iter={outer}"
+                    f"manifest outer={outer} must use "
+                    f"target_policy_iter={expected_target_policy_iter}"
                 )
+            checkpoint_source_iters[outer] = expected_source_iter
+            checkpoint_target_policy_iters[outer] = (
+                expected_target_policy_iter
+            )
             manifest_entries[outer] = entry
         if sorted(manifest_entries) != actual_outers:
             raise ValueError(
@@ -990,6 +1571,11 @@ def load_run_spec(
     elif status_payload.get("checkpoint_manifest_sha256"):
         raise FileNotFoundError(
             "status.json declares checkpoint_manifest_sha256 but checkpoint_manifest.json is missing"
+        )
+    elif e6_role == "target_branch":
+        raise FileNotFoundError(
+            "E6 target_branch exact-map evaluation requires "
+            "weights/checkpoint_manifest.json with explicit indexing provenance"
         )
 
     final_checkpoint: Optional[Path] = None
@@ -1164,6 +1750,172 @@ def load_run_spec(
     model_type = str(_pick(cfg, ("model_type",), default="pipinn")).lower()
     if model_type not in {"pipinn", "pi-pinn", "pinn-pi"}:
         raise ValueError(f"exact PI-map input must be a PI-PINN run, got model_type={model_type}")
+    initial_defect_mode = (
+        "warm-start-value"
+        if e6_role == "target_branch"
+        else "analytic-initial-policy"
+    )
+    warm_start_bundle_path: Optional[Path] = None
+    warm_start_bundle_file_hash = ""
+    warm_start_model_state_hash = ""
+    if e6_role == "target_branch":
+        # The target run does not copy v~_0 into its own iterate directory.
+        # Merge redundant recorder fields only as fallbacks; the manifest
+        # remains the primary indexing/provenance authority.
+        warm_keys = {
+            key
+            for payload in (cfg, status_payload, warm_start_provenance)
+            for key in payload
+            if str(key).startswith("e6_warm")
+            or key in {
+                "first_target_policy_source",
+                "e6_target_phase_start_algorithm_iter",
+            }
+        }
+        merged_warm_provenance: Dict[str, Any] = {}
+        for payload in (cfg, status_payload, warm_start_provenance):
+            for key in warm_keys:
+                value = payload.get(key)
+                if value not in (None, ""):
+                    merged_warm_provenance[key] = value
+        warm_start_provenance = merged_warm_provenance
+
+        first_policy_source = str(
+            warm_start_provenance.get(
+                "first_target_policy_source", ""
+            )
+        )
+        if first_policy_source != "warm_start_value_net":
+            raise ValueError(
+                "E6 target_branch warm-up provenance must declare "
+                "first_target_policy_source='warm_start_value_net'"
+            )
+        warmup_outer_count = int(
+            warm_start_provenance.get("e6_warmup_outer_count", 0) or 0
+        )
+        if warmup_outer_count != 1:
+            raise ValueError(
+                "E6 target_branch exact-map indexing currently requires "
+                "exactly one common warm-up outer"
+            )
+        target_start = int(
+            warm_start_provenance.get(
+                "e6_target_phase_start_algorithm_iter", 0
+            )
+            or 0
+        )
+        if target_start != 2:
+            raise ValueError(
+                "E6 target_branch must start its target phase at algorithm "
+                "outer iteration 2"
+            )
+
+        path_values: List[Any] = []
+        for key in (
+            "e6_warmup_bundle_path",
+            "e6_warm_start_source",
+            "e6_warm_start",
+        ):
+            for payload in (
+                warm_start_provenance,
+                status_payload,
+                cfg,
+            ):
+                value = payload.get(key)
+                if value not in (None, "") and value not in path_values:
+                    path_values.append(value)
+        warm_candidates: List[Path] = []
+        seen_warm_candidates: set[str] = set()
+        for value in path_values:
+            for candidate in _configured_path_candidates(
+                value, run_dir, cfg
+            ):
+                key = str(candidate)
+                if key not in seen_warm_candidates:
+                    warm_candidates.append(candidate)
+                    seen_warm_candidates.add(key)
+        # A moved output tree invalidates recorded absolute paths.  The E6
+        # launcher uses this deterministic sweep-relative location.
+        if len(run_dir.parents) >= 2:
+            sweep_root = run_dir.parent.parent
+            fallback = (
+                sweep_root
+                / "e6_warm_starts"
+                / f"n_assets{problem.n_assets}"
+                / f"seed{seed}"
+                / "e6_warm_start.pt"
+            ).resolve()
+            if str(fallback) not in seen_warm_candidates:
+                warm_candidates.append(fallback)
+        warm_start_bundle_path = next(
+            (path for path in warm_candidates if path.is_file()),
+            None,
+        )
+        if warm_start_bundle_path is None:
+            attempted = ", ".join(str(path) for path in warm_candidates)
+            raise FileNotFoundError(
+                "E6 target_branch warm-start bundle is missing; tried "
+                f"{attempted or '<no recorded path>'}"
+            )
+
+        declared_bundle_hashes = {
+            str(value)
+            for key in (
+                "e6_warmup_bundle_file_sha256",
+                "e6_warm_start_bundle_sha256",
+                "e6_warm_start_loaded_bundle_sha256",
+            )
+            for value in [warm_start_provenance.get(key)]
+            if value not in (None, "")
+        }
+        if not declared_bundle_hashes:
+            raise ValueError(
+                "E6 target_branch warm-up provenance is missing the bundle "
+                "file hash"
+            )
+        if len(declared_bundle_hashes) != 1:
+            raise ValueError(
+                "E6 target_branch warm-up bundle hashes disagree"
+            )
+        warm_start_bundle_file_hash = sha256_file(
+            warm_start_bundle_path
+        )
+        if warm_start_bundle_file_hash not in declared_bundle_hashes:
+            raise ValueError(
+                "E6 target_branch warm-start bundle hash mismatch"
+            )
+
+        declared_state_hashes = {
+            str(value)
+            for key in (
+                "e6_warmup_model_state_sha256",
+                "e6_warm_start_model_sha256",
+            )
+            for value in [warm_start_provenance.get(key)]
+            if value not in (None, "")
+        }
+        if not declared_state_hashes:
+            raise ValueError(
+                "E6 target_branch warm-up provenance is missing the model "
+                "state hash"
+            )
+        if len(declared_state_hashes) != 1:
+            raise ValueError(
+                "E6 target_branch warm-up model-state hashes disagree"
+            )
+        warm_start_model_state_hash = (
+            _load_and_validate_e6_warmup_bundle(
+                warm_start_bundle_path,
+                expected_seed=seed,
+                expected_market_seed=market_seed,
+                expected_n_assets=problem.n_assets,
+            )
+        )
+        if warm_start_model_state_hash not in declared_state_hashes:
+            raise ValueError(
+                "E6 target_branch warm-start model-state hash mismatch"
+            )
+
     market_hash = canonical_array_hash({
         "mu_excess": mu,
         "Sigma": sigma,
@@ -1217,6 +1969,10 @@ def load_run_spec(
     # configs omitted their argparse spelling.
     training_protocol["utility_cap"] = utility_cap
     training_protocol["policy"] = asdict(policy)
+    training_protocol["e6_role"] = e6_role
+    training_protocol["checkpoint_indexing"] = dict(
+        checkpoint_indexing_provenance
+    )
 
     group_payload = {
         "problem": "merton",
@@ -1233,6 +1989,13 @@ def load_run_spec(
         "network": asdict(network),
         "training": training_protocol,
     }
+    if eval_w_min_override is not None:
+        group_payload["evaluation_window_override"] = {
+            "eval_w_min_requested": eval_w_min_requested,
+            "eval_w_min_symmetric": symmetric_eval_w_bounds[0],
+            "eval_y_bounds": list(eval_y_bounds),
+            "eval_w_bounds": list(eval_w_bounds),
+        }
     return RunSpec(
         run_dir=run_dir,
         config_path=config_path,
@@ -1248,7 +2011,11 @@ def load_run_spec(
         market_seed=market_seed,
         model_type="pipinn",
         eval_margin=margin,
+        eval_window_mode=eval_window_mode,
+        eval_w_min_requested=eval_w_min_requested,
+        eval_w_min_symmetric=symmetric_eval_w_bounds[0],
         eval_y_bounds=eval_y_bounds,
+        eval_w_bounds=eval_w_bounds,
         market_hash=market_hash,
         group=stable_hash(group_payload)[:12],
         checkpoint_selection=checkpoint_selection,
@@ -1261,16 +2028,51 @@ def load_run_spec(
             checkpoint_manifest_path if checkpoint_manifest_path.is_file() else None
         ),
         checkpoint_manifest_hash=checkpoint_manifest_hash,
+        e6_role=e6_role,
+        checkpoint_source_iters=checkpoint_source_iters,
+        checkpoint_target_policy_iters=checkpoint_target_policy_iters,
+        checkpoint_indexing_provenance=checkpoint_indexing_provenance,
+        initial_defect_mode=initial_defect_mode,
+        warm_start_bundle_path=warm_start_bundle_path,
+        warm_start_bundle_file_hash=warm_start_bundle_file_hash,
+        warm_start_model_state_hash=warm_start_model_state_hash,
+        warm_start_provenance=warm_start_provenance,
     )
 
 
-def _state_dict_from_checkpoint(torch: Any, path: Path) -> Mapping[str, Any]:
-    try:
-        payload = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:  # PyTorch < 2.0
-        payload = torch.load(path, map_location="cpu")
+def _state_dict_from_checkpoint(
+    torch: Any,
+    path: Path,
+    *,
+    allow_e6_warmup_bundle: bool = False,
+) -> Mapping[str, Any]:
+    if allow_e6_warmup_bundle:
+        # The trusted trainer-produced E6 bundle contains NumPy/CUDA RNG
+        # provenance in addition to tensors.  PyTorch's restricted
+        # ``weights_only`` unpickler cannot deserialize that metadata, so use
+        # the full loader only after load_run_spec has verified the recorded
+        # bundle file hash.
+        try:
+            payload = torch.load(
+                path, map_location="cpu", weights_only=False
+            )
+        except TypeError:  # PyTorch < 2.0
+            payload = torch.load(path, map_location="cpu")
+    else:
+        try:
+            payload = torch.load(
+                path, map_location="cpu", weights_only=True
+            )
+        except TypeError:  # PyTorch < 2.0
+            payload = torch.load(path, map_location="cpu")
     if isinstance(payload, Mapping):
-        for key in ("state_dict", "model_state_dict", "value_net_state_dict", "model"):
+        for key in (
+            "state_dict",
+            "model_state_dict",
+            "value_net_state_dict",
+            "model_state",
+            "model",
+        ):
             nested = payload.get(key)
             if isinstance(nested, Mapping):
                 payload = nested
@@ -1285,6 +2087,149 @@ def _state_dict_from_checkpoint(torch: Any, path: Path) -> Mapping[str, Any]:
                 name = name[len(prefix):]
         cleaned[name] = value
     return cleaned
+
+
+def _load_e6_warmup_bundle_payload(path: Path) -> Any:
+    """Load a hash-verified trainer E6 bundle, including non-tensor metadata.
+
+    This helper is used only after ``load_run_spec`` has matched the complete
+    file SHA-256 against the trainer provenance. Ordinary model checkpoints
+    continue to use PyTorch's restricted ``weights_only=True`` path.
+    """
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - production evaluator requires Torch
+        raise RuntimeError(
+            "PyTorch is required to inspect E6 warm-start bundle provenance"
+        ) from exc
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:  # PyTorch < 2.0
+        return torch.load(path, map_location="cpu")
+
+
+def _validate_e6_warmup_bundle_payload(
+    payload: Any,
+    *,
+    expected_seed: int,
+    expected_market_seed: int,
+    expected_n_assets: int,
+) -> str:
+    """Validate the trainer's common-warm-start artifact contract.
+
+    Returns the canonical hash of the bundled value-network state only after
+    both metadata and the bundle's internal state hash have been verified.
+    Optimizer/RNG state is intentionally neither loaded into live objects nor
+    used by the FD evaluator.
+    """
+    if not isinstance(payload, Mapping):
+        raise TypeError("E6 warm-start bundle must be a mapping")
+
+    def required_int(name: str) -> int:
+        value = payload.get(name)
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"E6 warm-start bundle has invalid {name}={value!r}"
+            ) from exc
+
+    if required_int("schema_version") != E6_WARMUP_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported E6 warm-start bundle schema_version="
+            f"{payload.get('schema_version')!r}"
+        )
+    if payload.get("kind") != E6_WARMUP_BUNDLE_KIND:
+        raise ValueError(
+            "unexpected E6 warm-start bundle kind="
+            f"{payload.get('kind')!r}"
+        )
+    if payload.get("warm_start_protocol") != E6_WARM_START_PROTOCOL:
+        raise ValueError(
+            "unexpected E6 warm-start protocol="
+            f"{payload.get('warm_start_protocol')!r}"
+        )
+    for name, expected in (
+        ("seed", int(expected_seed)),
+        ("market_seed", int(expected_market_seed)),
+        ("n_assets", int(expected_n_assets)),
+    ):
+        actual = required_int(name)
+        if actual != expected:
+            raise ValueError(
+                f"E6 warm-start bundle {name}={actual} does not match "
+                f"target run {name}={expected}"
+            )
+    if required_int("outer_count") != 1:
+        raise ValueError(
+            "E6 warm-start bundle must end after exactly one outer solve"
+        )
+
+    try:
+        warmup_target = float(payload.get("warmup_pres_target"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "E6 warm-start bundle has invalid warmup_pres_target"
+        ) from exc
+    if (
+        not math.isfinite(warmup_target)
+        or not math.isclose(
+            warmup_target, 1.0, rel_tol=0.0, abs_tol=1.0e-12
+        )
+    ):
+        raise ValueError(
+            "E6 warm-start bundle must use warmup_pres_target=1.0, got "
+            f"{warmup_target!r}"
+        )
+    try:
+        achieved = float(payload.get("warmup_achieved_pres"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            "E6 warm-start bundle has invalid warmup_achieved_pres"
+        ) from exc
+    if (
+        not math.isfinite(achieved)
+        or achieved <= 0.0
+        or achieved > warmup_target * (1.0 + 1.0e-9)
+    ):
+        raise ValueError(
+            "E6 warm-start bundle is not admissible: "
+            f"warmup_achieved_pres={achieved!r} must lie in (0,1]"
+        )
+
+    model_state = payload.get("model_state")
+    if not isinstance(model_state, Mapping) or not model_state:
+        raise ValueError("E6 warm-start bundle is missing model_state mapping")
+    if not any(hasattr(value, "detach") for value in model_state.values()):
+        raise ValueError(
+            "E6 warm-start bundle model_state has no tensor values"
+        )
+    internal_state_hash = str(payload.get("model_state_sha256", ""))
+    if not internal_state_hash:
+        raise ValueError(
+            "E6 warm-start bundle is missing model_state_sha256"
+        )
+    actual_state_hash = canonical_state_dict_hash(model_state)
+    if actual_state_hash != internal_state_hash:
+        raise ValueError(
+            "E6 warm-start bundle internal model_state_sha256 mismatch"
+        )
+    return actual_state_hash
+
+
+def _load_and_validate_e6_warmup_bundle(
+    path: Path,
+    *,
+    expected_seed: int,
+    expected_market_seed: int,
+    expected_n_assets: int,
+) -> str:
+    return _validate_e6_warmup_bundle_payload(
+        _load_e6_warmup_bundle_payload(path),
+        expected_seed=expected_seed,
+        expected_market_seed=expected_market_seed,
+        expected_n_assets=expected_n_assets,
+    )
 
 
 def canonical_state_dict_hash(state: Mapping[str, Any]) -> str:
@@ -1303,14 +2248,24 @@ def canonical_state_dict_hash(state: Mapping[str, Any]) -> str:
     return digest.hexdigest()
 
 
-def canonical_checkpoint_state_hash(path: Path) -> str:
+def canonical_checkpoint_state_hash(
+    path: Path,
+    *,
+    allow_e6_warmup_bundle: bool = False,
+) -> str:
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - production evaluator requires Torch
         raise RuntimeError(
             "PyTorch is required to verify canonical checkpoint-state provenance"
         ) from exc
-    return canonical_state_dict_hash(_state_dict_from_checkpoint(torch, path))
+    return canonical_state_dict_hash(
+        _state_dict_from_checkpoint(
+            torch,
+            path,
+            allow_e6_warmup_bundle=allow_e6_warmup_bundle,
+        )
+    )
 
 
 def _key_order(name: str) -> Tuple[Any, ...]:
@@ -1346,7 +2301,15 @@ class TorchCheckpointEvaluator:
         self.dtype = torch.float64 if run.network.dtype == "float64" else torch.float32
         self._consumption_helper = consumption_from_log_derivative
         self._portfolio_helper = portfolio_from_log_derivatives
-        state = _state_dict_from_checkpoint(torch, checkpoint)
+        is_warm_bundle = (
+            run.warm_start_bundle_path is not None
+            and checkpoint.resolve() == run.warm_start_bundle_path.resolve()
+        )
+        state = _state_dict_from_checkpoint(
+            torch,
+            checkpoint,
+            allow_e6_warmup_bundle=is_warm_bundle,
+        )
         weight_items = sorted(
             [
                 (key, tensor)
@@ -1490,12 +2453,23 @@ class TorchCheckpointEvaluator:
     def _mask_count(mask: Any) -> float:
         return float(mask.detach().sum().item())
 
-    def policy(self, tau_value: float, y_values: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Mapping[str, float]]:
+    def policy(
+        self,
+        tau_value: float,
+        y_values: np.ndarray,
+        *,
+        policy_extension: str = "boundary-projection",
+    ) -> Tuple[np.ndarray, np.ndarray, Mapping[str, float]]:
         torch = self.torch
         y_np = np.asarray(y_values, dtype=np.float64).reshape(-1)
+        eval_y_np, outside = _policy_extension_y(
+            self.run.problem, y_np, policy_extension
+        )
         tau_np = np.full_like(y_np, float(tau_value))
         tau_t = torch.as_tensor(tau_np[:, None], device=self.device, dtype=self.dtype)
-        y_t = torch.as_tensor(y_np[:, None], device=self.device, dtype=self.dtype).requires_grad_(True)
+        y_t = torch.as_tensor(
+            eval_y_np[:, None], device=self.device, dtype=self.dtype
+        ).requires_grad_(True)
         value = self.model(self._inputs(tau_t, y_t))
         value_y = torch.autograd.grad(
             value, y_t, grad_outputs=torch.ones_like(value), create_graph=True, retain_graph=True
@@ -1525,8 +2499,31 @@ class TorchCheckpointEvaluator:
             portfolio_min=spec.portfolio_min,
             portfolio_max=spec.portfolio_max,
         )
+        extension_level_clip = torch.zeros_like(consumption, dtype=torch.bool)
+        if str(policy_extension).strip().lower().replace("_", "-") == "boundary-projection":
+            # Evaluate G only at the projected network coordinate, hold the
+            # consumption/wealth ratio constant, and transfer it back to the
+            # actual FD wealth.  Reapply configured level bounds so the
+            # stabilized trainer policy contract remains true globally.
+            actual_y_t = torch.as_tensor(
+                y_np[:, None], device=self.device, dtype=self.dtype
+            )
+            kappa_boundary = consumption / torch.exp(y_t.detach())
+            consumption_extended = kappa_boundary * torch.exp(actual_y_t)
+            consumption = consumption_extended
+            if spec.consumption_min is not None:
+                extension_level_clip |= consumption < float(spec.consumption_min)
+                consumption = torch.clamp(
+                    consumption, min=float(spec.consumption_min)
+                )
+            if spec.consumption_max is not None:
+                extension_level_clip |= consumption > float(spec.consumption_max)
+                consumption = torch.clamp(
+                    consumption, max=float(spec.consumption_max)
+                )
         c_np = consumption.detach().cpu().numpy().reshape(-1)
         p_np = portfolio.detach().cpu().numpy()
+        self.policy_hash.update(str(policy_extension).encode("utf-8") + b"\0")
         self.policy_hash.update(np.asarray([tau_value], dtype="<f8").tobytes())
         self.policy_hash.update(np.asarray(y_np, dtype="<f8").tobytes())
         self.policy_hash.update(np.asarray(c_np, dtype="<f8").tobytes())
@@ -1541,7 +2538,9 @@ class TorchCheckpointEvaluator:
             "positive_curvature_count": self._mask_count(p_diag["positive_curvature"]),
             "kappa_clip_count": self._mask_count(c_diag["kappa_low_clip"] | c_diag["kappa_high_clip"]),
             "consumption_clip_count": self._mask_count(
-                c_diag["consumption_low_clip"] | c_diag["consumption_high_clip"]
+                c_diag["consumption_low_clip"]
+                | c_diag["consumption_high_clip"]
+                | extension_level_clip
             ),
             "portfolio_any_clip_count": self._mask_count(p_diag["portfolio_any_clip"]),
             # Store the component rate on a point-denominator scale so the FD
@@ -1552,6 +2551,7 @@ class TorchCheckpointEvaluator:
                 )
                 * n / component_n
             ),
+            "outside_collocation_count": float(np.count_nonzero(outside)),
         }
         variance = np.einsum(
             "bi,ij,bj->b", p_np, self.run.problem.sigma, p_np, optimize=True
@@ -1566,6 +2566,7 @@ class TorchCheckpointEvaluator:
         y_values: np.ndarray,
         *,
         chunk: int = 65536,
+        policy_extension: str = "boundary-projection",
     ) -> Tuple[Any, str, Dict[str, float]]:
         """Batch all frozen feedback coefficients for one FD tensor grid.
 
@@ -1578,7 +2579,12 @@ class TorchCheckpointEvaluator:
         y_grid = np.asarray(y_values, dtype=np.float64).reshape(-1)
         tt, yy = np.meshgrid(tau_grid, y_grid, indexing="ij")
         flat_tau, flat_y = tt.ravel(), yy.ravel()
-        _value, value_y, value_yy = self.bundle_at_points(flat_tau, flat_y, chunk=chunk)
+        eval_flat_y, outside_flat = _policy_extension_y(
+            self.run.problem, flat_y, policy_extension
+        )
+        _value, value_y, value_yy = self.bundle_at_points(
+            flat_tau, eval_flat_y, chunk=chunk
+        )
         n_times, n_y = tt.shape
         storage_dtype = np.float32 if self.dtype == torch.float32 else np.float64
         consumption = np.empty(flat_y.size, dtype=storage_dtype)
@@ -1588,13 +2594,18 @@ class TorchCheckpointEvaluator:
             "positive_curvature_count",
             "kappa_clip_count", "consumption_clip_count", "portfolio_any_clip_count",
             "portfolio_component_clip_count",
+            "outside_collocation_count",
         )
         counts = {key: np.zeros(n_times, dtype=np.float64) for key in count_keys}
         spec = self.run.policy
         for start in range(0, flat_y.size, int(chunk)):
             stop = min(start + int(chunk), flat_y.size)
             rows = np.arange(start, stop, dtype=np.int64) // n_y
-            y_t = torch.as_tensor(flat_y[start:stop, None], device=self.device, dtype=self.dtype)
+            y_t = torch.as_tensor(
+                eval_flat_y[start:stop, None],
+                device=self.device,
+                dtype=self.dtype,
+            )
             vy_t = torch.as_tensor(value_y[start:stop, None], device=self.device, dtype=self.dtype)
             vyy_t = torch.as_tensor(value_yy[start:stop, None], device=self.device, dtype=self.dtype)
             c_t, c_diag = self._consumption_helper(
@@ -1618,6 +2629,22 @@ class TorchCheckpointEvaluator:
                 portfolio_min=spec.portfolio_min,
                 portfolio_max=spec.portfolio_max,
             )
+            extension_level_clip = torch.zeros_like(c_t, dtype=torch.bool)
+            if str(policy_extension).strip().lower().replace("_", "-") == "boundary-projection":
+                actual_y_t = torch.as_tensor(
+                    flat_y[start:stop, None],
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                kappa_boundary = c_t / torch.exp(y_t)
+                c_extended = kappa_boundary * torch.exp(actual_y_t)
+                c_t = c_extended
+                if spec.consumption_min is not None:
+                    extension_level_clip |= c_t < float(spec.consumption_min)
+                    c_t = torch.clamp(c_t, min=float(spec.consumption_min))
+                if spec.consumption_max is not None:
+                    extension_level_clip |= c_t > float(spec.consumption_max)
+                    c_t = torch.clamp(c_t, max=float(spec.consumption_max))
             consumption[start:stop] = c_t.detach().cpu().numpy().reshape(-1)
             portfolio[start:stop] = p_t.detach().cpu().numpy()
 
@@ -1628,9 +2655,16 @@ class TorchCheckpointEvaluator:
                 "positive_curvature_count": p_diag["positive_curvature"].reshape(-1),
                 "kappa_clip_count": (c_diag["kappa_low_clip"] | c_diag["kappa_high_clip"]).reshape(-1),
                 "consumption_clip_count": (
-                    c_diag["consumption_low_clip"] | c_diag["consumption_high_clip"]
+                    c_diag["consumption_low_clip"]
+                    | c_diag["consumption_high_clip"]
+                    | extension_level_clip
                 ).reshape(-1),
                 "portfolio_any_clip_count": p_diag["portfolio_any_clip"].reshape(-1),
+                "outside_collocation_count": torch.as_tensor(
+                    outside_flat[start:stop],
+                    device=self.device,
+                    dtype=torch.bool,
+                ),
             }
             for key, mask in point_masks.items():
                 weights = mask.detach().cpu().numpy().astype(np.float64, copy=False)
@@ -1645,6 +2679,7 @@ class TorchCheckpointEvaluator:
         consumption_grid = consumption.reshape(n_times, n_y)
         portfolio_grid = portfolio.reshape(n_times, n_y, self.run.problem.n_assets)
         digest = hashlib.sha256()
+        digest.update(str(policy_extension).encode("utf-8") + b"\0")
         digest.update(np.asarray(tau_grid, dtype="<f8").tobytes())
         digest.update(np.asarray(y_grid, dtype="<f8").tobytes())
         digest.update(np.asarray(consumption_grid, dtype="<f8").tobytes())
@@ -1690,8 +2725,16 @@ class TorchCheckpointEvaluator:
         aggregate_diag["max_diffusion_variance"] = float(np.max(variance))
         return frozen_policy, digest.hexdigest(), aggregate_diag
 
-    def policy_diagnostics_on_grid(self, tau: np.ndarray, y: np.ndarray) -> Dict[str, float]:
-        _policy, _digest, diagnostics = self.precompute_policy(tau, y)
+    def policy_diagnostics_on_grid(
+        self,
+        tau: np.ndarray,
+        y: np.ndarray,
+        *,
+        policy_extension: str = "boundary-projection",
+    ) -> Dict[str, float]:
+        _policy, _digest, diagnostics = self.precompute_policy(
+            tau, y, policy_extension=policy_extension
+        )
         return diagnostics
 
 
@@ -1712,6 +2755,18 @@ def _clip_summary(diag: Mapping[str, float]) -> Dict[str, float]:
     }
 
 
+def _outside_summary(diag: Mapping[str, float]) -> Tuple[int, float]:
+    fraction = float(diag.get("policy_outside_collocation_count", 0.0))
+    points = float(diag.get("policy_points", 0.0))
+    count = int(round(fraction * points))
+    if fraction < 0.0 or fraction > 1.0 + 1e-12 or count < 0:
+        raise ValueError(
+            "invalid outside-collocation diagnostic "
+            f"(count={count}, fraction={fraction}, points={points})"
+        )
+    return count, min(1.0, fraction)
+
+
 def _map_variant(fd_diag: Mapping[str, float], ev_diag: Mapping[str, float]) -> Tuple[str, int]:
     fd = _clip_summary(fd_diag)
     ev = _clip_summary(ev_diag)
@@ -1728,7 +2783,11 @@ def _map_variant(fd_diag: Mapping[str, float], ev_diag: Mapping[str, float]) -> 
     return "locally_unmodified_on_sampled_xfd", 1
 
 
-def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
+def build_initial_policy(
+    run: RunSpec,
+    *,
+    policy_extension: str = "boundary-projection",
+) -> Tuple[Any, str]:
     """Reconstruct the trainer's deterministic outer-zero policy exactly.
 
     Random initialization is intentionally rejected: the historical trainer
@@ -1767,6 +2826,7 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
         portfolio_template = np.zeros(run.problem.n_assets, dtype=storage_dtype)
     policy_hash = stable_hash({
         "kind": "trainer-initial-policy",
+        "policy_extension": policy_extension,
         "pi_init_method": pi_method,
         "pi_init_scale": pi_scale,
         "c_init_method": c_method,
@@ -1779,9 +2839,14 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
         _tau: float,
         y: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, Mapping[str, float]]:
-        y_array = np.asarray(y, dtype=storage_dtype).reshape(-1)
-        wealth = np.exp(y_array)
-        n = int(y_array.size)
+        actual_y = np.asarray(y, dtype=storage_dtype).reshape(-1)
+        evaluated_y, outside = _policy_extension_y(
+            run.problem, actual_y, policy_extension
+        )
+        evaluated_y = np.asarray(evaluated_y, dtype=storage_dtype)
+        boundary_wealth = np.exp(evaluated_y)
+        actual_wealth = np.exp(actual_y)
+        n = int(actual_y.size)
         portfolio_raw = np.broadcast_to(
             portfolio_template.reshape(1, -1),
             (n, run.problem.n_assets),
@@ -1794,7 +2859,9 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
         portfolio_component_clipped = portfolio != portfolio_raw
 
         if c_method == "proportional":
-            consumption_raw = storage_dtype(run.problem.discount) * wealth
+            consumption_raw = (
+                storage_dtype(run.problem.discount) * boundary_wealth
+            )
         else:
             floor = (
                 1e-8
@@ -1802,14 +2869,35 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
                 else float(run.policy.consumption_min)
             )
             consumption_raw = np.full(n, floor, dtype=storage_dtype)
-        kappa_raw = consumption_raw / wealth
+        kappa_raw = consumption_raw / boundary_wealth
         kappa = kappa_raw.copy()
         if run.policy.kappa_min is not None:
             kappa = np.maximum(kappa, float(run.policy.kappa_min))
         if run.policy.kappa_max is not None:
             kappa = np.minimum(kappa, float(run.policy.kappa_max))
-        consumption_level_raw = kappa * wealth
-        consumption = consumption_level_raw.copy()
+        boundary_consumption_raw = kappa * boundary_wealth
+        boundary_consumption = boundary_consumption_raw.copy()
+        if run.policy.consumption_min is not None:
+            boundary_consumption = np.maximum(
+                boundary_consumption, float(run.policy.consumption_min)
+            )
+        if run.policy.consumption_max is not None:
+            boundary_consumption = np.minimum(
+                boundary_consumption, float(run.policy.consumption_max)
+            )
+        boundary_level_clipped = (
+            boundary_consumption != boundary_consumption_raw
+        )
+        if (
+            str(policy_extension).strip().lower().replace("_", "-")
+            == "boundary-projection"
+        ):
+            consumption_extended = (
+                boundary_consumption / boundary_wealth * actual_wealth
+            )
+        else:
+            consumption_extended = boundary_consumption
+        consumption = consumption_extended.copy()
         if run.policy.consumption_min is not None:
             consumption = np.maximum(
                 consumption, float(run.policy.consumption_min)
@@ -1818,9 +2906,10 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
             consumption = np.minimum(
                 consumption, float(run.policy.consumption_max)
             )
+        extension_level_clipped = consumption != consumption_extended
 
         kappa_clipped = kappa != kappa_raw
-        consumption_clipped = consumption != consumption_level_raw
+        consumption_clipped = boundary_level_clipped | extension_level_clipped
         portfolio_any_clipped = np.any(portfolio_component_clipped, axis=1)
         return consumption, portfolio, {
             "points": float(n),
@@ -1840,6 +2929,7 @@ def build_initial_policy(run: RunSpec) -> Tuple[Any, str]:
             "portfolio_component_clip_count": float(
                 np.count_nonzero(portfolio_component_clipped)
             ) / float(run.problem.n_assets),
+            "outside_collocation_count": float(np.count_nonzero(outside)),
         }
 
     return policy, policy_hash
@@ -1915,6 +3005,15 @@ def assess_refinement(
     abs_tolerance: float,
     rel_tolerance: float,
 ) -> None:
+    """Assess grid/domain convergence within each boundary closure.
+
+    Replacing the boundary closure changes the finite-domain BVP, so that
+    comparison is reported as a sensitivity diagnostic and is deliberately
+    excluded from the binary ``refinement_status`` gate.  For backward
+    compatibility, ``refinement_status`` and ``rho_sensitivity_envelope`` on
+    the unique primary row remain the canonical fields; their v2 semantics
+    are explicitly grid/domain-only.
+    """
     by_iter: Dict[int, List[Dict[str, Any]]] = {}
     for row in rows:
         by_iter.setdefault(int(row["source_iter"]), []).append(row)
@@ -1930,106 +3029,200 @@ def assess_refinement(
     for outer_rows in by_iter.values():
         lookup = {_variant_key(row): row for row in outer_rows}
         primary = lookup[(finest, largest_domain_margin, primary_boundary)]
-        rho = float(primary["rho_exact"])
-        if not math.isfinite(rho):
-            primary.update({
-                "grid_abs_change": float("nan"),
-                "grid_rel_change": float("nan"),
-                "domain_abs_change": float("nan"),
-                "domain_rel_change": float("nan"),
-                "boundary_abs_change": float("nan"),
-                "rho_sensitivity_envelope": float("nan"),
-                "refinement_status": "undefined_denominator",
-                "contraction_status": "undefined",
-            })
-            continue
-
-        comparisons: Dict[str, List[Optional[Dict[str, Any]]]] = {
-            "grid": [
-                lookup.get((factor, largest_domain_margin, primary_boundary))
-                for factor in coarse_factors
-            ],
-            "domain": [
-                lookup.get((finest, margin, primary_boundary))
-                for margin in smaller_domain_margins
-            ],
-            "boundary": [
-                lookup.get((finest, largest_domain_margin, boundary))
-                for boundary in audit_boundaries
-            ],
-        }
-        axis_deltas: List[float] = []
-        changes: Dict[str, float] = {}
-        checked = True
-        passed = True
-        tolerance = abs_tolerance + rel_tolerance * abs(rho)
-        for name, axis_rows in comparisons.items():
-            if not axis_rows or any(
-                comparison is None
-                or not math.isfinite(float(comparison["rho_exact"]))
-                for comparison in axis_rows
-            ):
-                checked = False
-                changes[name] = float("nan")
-                continue
-            axis_changes = [
-                abs(rho - float(comparison["rho_exact"]))
-                for comparison in axis_rows
-                if comparison is not None
-            ]
-            change = max(axis_changes)
-            changes[name] = change
-            axis_deltas.append(change)
-            passed = passed and all(value <= tolerance for value in axis_changes)
-        grid_change = changes.get("grid", float("nan"))
-        domain_change = changes.get("domain", float("nan"))
-        boundary_change = changes.get("boundary", float("nan"))
-        primary["grid_abs_change"] = grid_change
-        primary["grid_rel_change"] = grid_change / max(abs(rho), np.finfo(float).tiny)
-        primary["domain_abs_change"] = domain_change
-        primary["domain_rel_change"] = domain_change / max(abs(rho), np.finfo(float).tiny)
-        primary["boundary_abs_change"] = boundary_change
-        # This is a transparent sensitivity envelope, not a rigorous error
-        # bound: two-grid and finite-domain differences do not bound the
-        # remaining whole-space truncation/discretization error.
-        primary["rho_sensitivity_envelope"] = (
-            rho + sum(axis_deltas) if checked else float("nan")
-        )
-        if not bool(primary["is_verification"]):
-            primary["refinement_status"] = "not_checked"
-        elif largest_domain_margin >= 0.0:
-            primary["refinement_status"] = "fd_domain_not_enlarged_beyond_training"
-        elif not checked:
-            primary["refinement_status"] = "incomplete"
-        else:
-            primary["refinement_status"] = "pass" if passed else "fail"
-
-        map_unmodified = bool(int(primary["local_map_unmodified_on_xfd"]))
-        status_prefix = "" if map_unmodified else "sampled_modified_map_"
-        if primary["refinement_status"] == "pass":
-            primary["contraction_status"] = (
-                status_prefix + "sensitivity_stable_below_one"
-                if float(primary["rho_sensitivity_envelope"]) < 1.0
-                else status_prefix + "sensitivity_envelope_crosses_one"
-            )
-        elif rho < 1.0:
-            primary["contraction_status"] = (
-                status_prefix + "observed_below_one_without_full_sensitivity_pass"
-            )
-        else:
-            primary["contraction_status"] = status_prefix + "not_contractive"
-
         for row in outer_rows:
-            if row is primary:
-                continue
+            boundary = str(row["boundary"])
+            is_boundary_representative = (
+                int(row["grid_factor"]) == finest
+                and float(row["fd_margin"]) == largest_domain_margin
+            )
+            row["boundary_role"] = (
+                "primary" if boundary == primary_boundary else "sensitivity"
+            )
+            row["is_boundary_representative"] = int(
+                is_boundary_representative
+            )
+            row["refinement_semantics_version"] = (
+                REFINEMENT_SEMANTICS_VERSION
+            )
             row.setdefault("grid_abs_change", "")
             row.setdefault("grid_rel_change", "")
             row.setdefault("domain_abs_change", "")
             row.setdefault("domain_rel_change", "")
             row.setdefault("boundary_abs_change", "")
+            row.setdefault("boundary_rel_change", "")
+            row.setdefault("boundary_sensitivity_status", "variant")
+            row.setdefault("rho_grid_domain_sensitivity_envelope", "")
             row.setdefault("rho_sensitivity_envelope", "")
+            row.setdefault("grid_domain_refinement_status", "variant")
             row.setdefault("refinement_status", "variant")
             row.setdefault("contraction_status", "variant")
+
+        representatives: Dict[str, Dict[str, Any]] = {}
+        for boundary in boundaries:
+            representative = lookup.get(
+                (finest, largest_domain_margin, boundary)
+            )
+            if representative is None:
+                continue
+            representatives[boundary] = representative
+            rho = float(representative["rho_exact"])
+            if not math.isfinite(rho):
+                representative.update({
+                    "grid_abs_change": float("nan"),
+                    "grid_rel_change": float("nan"),
+                    "domain_abs_change": float("nan"),
+                    "domain_rel_change": float("nan"),
+                    "rho_grid_domain_sensitivity_envelope": float("nan"),
+                    "grid_domain_refinement_status": (
+                        "undefined_denominator"
+                    ),
+                })
+                if representative is primary:
+                    representative["rho_sensitivity_envelope"] = float("nan")
+                    representative["refinement_status"] = (
+                        "undefined_denominator"
+                    )
+                    representative["contraction_status"] = "undefined"
+                continue
+
+            comparisons: Dict[str, List[Optional[Dict[str, Any]]]] = {
+                "grid": [
+                    lookup.get((factor, largest_domain_margin, boundary))
+                    for factor in coarse_factors
+                ],
+                "domain": [
+                    lookup.get((finest, margin, boundary))
+                    for margin in smaller_domain_margins
+                ],
+            }
+            checked = True
+            passed = True
+            axis_deltas: List[float] = []
+            changes: Dict[str, float] = {}
+            tolerance = abs_tolerance + rel_tolerance * abs(rho)
+            for name, axis_rows in comparisons.items():
+                if not axis_rows or any(
+                    comparison is None
+                    or not math.isfinite(float(comparison["rho_exact"]))
+                    for comparison in axis_rows
+                ):
+                    checked = False
+                    changes[name] = float("nan")
+                    continue
+                axis_changes = [
+                    abs(rho - float(comparison["rho_exact"]))
+                    for comparison in axis_rows
+                    if comparison is not None
+                ]
+                change = max(axis_changes)
+                changes[name] = change
+                axis_deltas.append(change)
+                passed = passed and all(
+                    value <= tolerance for value in axis_changes
+                )
+
+            grid_change = changes.get("grid", float("nan"))
+            domain_change = changes.get("domain", float("nan"))
+            if not bool(int(representative["is_verification"])):
+                status = "not_checked"
+            elif largest_domain_margin >= 0.0:
+                status = "fd_domain_not_enlarged_beyond_training"
+            elif not checked:
+                status = "incomplete"
+            else:
+                status = "pass" if passed else "fail"
+            envelope = (
+                rho + sum(axis_deltas) if checked else float("nan")
+            )
+            representative.update({
+                "grid_abs_change": grid_change,
+                "grid_rel_change": (
+                    grid_change
+                    / max(abs(rho), np.finfo(float).tiny)
+                ),
+                "domain_abs_change": domain_change,
+                "domain_rel_change": (
+                    domain_change
+                    / max(abs(rho), np.finfo(float).tiny)
+                ),
+                "rho_grid_domain_sensitivity_envelope": envelope,
+                "grid_domain_refinement_status": status,
+            })
+            if representative is primary:
+                # Backward-compatible aliases.  Boundary replacement is not
+                # included in either the envelope or the pass/fail status.
+                representative["rho_sensitivity_envelope"] = envelope
+                representative["refinement_status"] = status
+
+        primary_rho = float(primary["rho_exact"])
+        if not audit_boundaries:
+            primary["boundary_abs_change"] = float("nan")
+            primary["boundary_rel_change"] = float("nan")
+            primary["boundary_sensitivity_status"] = "not_requested"
+        elif not bool(int(primary["is_verification"])):
+            primary["boundary_abs_change"] = float("nan")
+            primary["boundary_rel_change"] = float("nan")
+            primary["boundary_sensitivity_status"] = "not_checked"
+        else:
+            audit_representatives = [
+                representatives.get(boundary)
+                for boundary in audit_boundaries
+            ]
+            boundary_complete = (
+                math.isfinite(primary_rho)
+                and all(
+                    row is not None
+                    and math.isfinite(float(row["rho_exact"]))
+                    for row in audit_representatives
+                )
+            )
+            if boundary_complete:
+                boundary_deltas: List[float] = []
+                for boundary, audit in zip(
+                    audit_boundaries, audit_representatives
+                ):
+                    if audit is None:  # pragma: no cover - guarded above
+                        continue
+                    change = abs(
+                        float(audit["rho_exact"]) - primary_rho
+                    )
+                    boundary_deltas.append(change)
+                    audit["boundary_abs_change"] = change
+                    audit["boundary_rel_change"] = (
+                        change
+                        / max(abs(primary_rho), np.finfo(float).tiny)
+                    )
+                    audit["boundary_sensitivity_status"] = (
+                        f"reported_vs_{primary_boundary}"
+                    )
+                primary_change = max(boundary_deltas)
+                primary["boundary_abs_change"] = primary_change
+                primary["boundary_rel_change"] = (
+                    primary_change
+                    / max(abs(primary_rho), np.finfo(float).tiny)
+                )
+                primary["boundary_sensitivity_status"] = "reported"
+            else:
+                primary["boundary_abs_change"] = float("nan")
+                primary["boundary_rel_change"] = float("nan")
+                primary["boundary_sensitivity_status"] = "incomplete"
+
+        map_unmodified = bool(int(primary["local_map_unmodified_on_xfd"]))
+        status_prefix = "" if map_unmodified else "sampled_modified_map_"
+        if not math.isfinite(primary_rho):
+            primary["contraction_status"] = "undefined"
+        elif primary["refinement_status"] == "pass":
+            primary["contraction_status"] = (
+                status_prefix + "sensitivity_stable_below_one"
+                if float(primary["rho_sensitivity_envelope"]) < 1.0
+                else status_prefix + "sensitivity_envelope_crosses_one"
+            )
+        elif primary_rho < 1.0:
+            primary["contraction_status"] = (
+                status_prefix + "observed_below_one_without_full_sensitivity_pass"
+            )
+        else:
+            primary["contraction_status"] = status_prefix + "not_contractive"
 
 
 def assess_defect_refinement(
@@ -2041,12 +3234,14 @@ def assess_defect_refinement(
     abs_tolerance: float,
     rel_tolerance: float,
 ) -> None:
-    """Attach an independent FD sensitivity audit to each primary E4 defect.
+    """Attach boundary-specific grid/domain audits to every E4 defect.
 
     The next neural bundle is fixed while the frozen-policy FD value is
     recomputed over the same grid/domain/boundary variants used by the exact
     map audit.  Hence every reported change is a change in ``delta_X`` itself,
     rather than a proxy copied from the contraction-ratio refinement table.
+    Boundary replacement changes the BVP and is therefore reported separately
+    rather than entering the primary grid/domain refinement gate.
     """
     by_defect: Dict[int, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -2065,32 +3260,74 @@ def assess_defect_refinement(
     for defect_rows in by_defect.values():
         lookup = {_variant_key(row): row for row in defect_rows}
         primary = lookup[(finest, largest_domain_margin, primary_boundary)]
-        delta = float(primary["delta_X"])
-        if not math.isfinite(delta):
-            primary.update({
-                "defect_grid_abs_change": float("nan"),
-                "defect_grid_rel_change": float("nan"),
-                "defect_domain_abs_change": float("nan"),
-                "defect_domain_rel_change": float("nan"),
-                "defect_boundary_abs_change": float("nan"),
-                "defect_sensitivity_envelope": float("nan"),
-                "refinement_status": "undefined_defect",
-            })
-        else:
+        for row in defect_rows:
+            boundary = str(row["boundary"])
+            is_boundary_representative = (
+                int(row["grid_factor"]) == finest
+                and float(row["fd_margin"]) == largest_domain_margin
+            )
+            row["boundary_role"] = (
+                "primary" if boundary == primary_boundary else "sensitivity"
+            )
+            row["is_boundary_representative"] = int(
+                is_boundary_representative
+            )
+            row["refinement_semantics_version"] = (
+                REFINEMENT_SEMANTICS_VERSION
+            )
+            row.setdefault("defect_grid_abs_change", "")
+            row.setdefault("defect_grid_rel_change", "")
+            row.setdefault("defect_domain_abs_change", "")
+            row.setdefault("defect_domain_rel_change", "")
+            row.setdefault("defect_boundary_abs_change", "")
+            row.setdefault("defect_boundary_rel_change", "")
+            row.setdefault("boundary_sensitivity_status", "variant")
+            row.setdefault(
+                "defect_grid_domain_sensitivity_envelope", ""
+            )
+            row.setdefault("defect_sensitivity_envelope", "")
+            row.setdefault("grid_domain_refinement_status", "variant")
+            row.setdefault("refinement_status", "variant")
+
+        representatives: Dict[str, Dict[str, Any]] = {}
+        for boundary in boundaries:
+            representative = lookup.get(
+                (finest, largest_domain_margin, boundary)
+            )
+            if representative is None:
+                continue
+            representatives[boundary] = representative
+            delta = float(representative["delta_X"])
+            if not math.isfinite(delta):
+                representative.update({
+                    "defect_grid_abs_change": float("nan"),
+                    "defect_grid_rel_change": float("nan"),
+                    "defect_domain_abs_change": float("nan"),
+                    "defect_domain_rel_change": float("nan"),
+                    "defect_grid_domain_sensitivity_envelope": (
+                        float("nan")
+                    ),
+                    "grid_domain_refinement_status": "undefined_defect",
+                })
+                if representative is primary:
+                    representative["defect_sensitivity_envelope"] = (
+                        float("nan")
+                    )
+                    representative["refinement_status"] = (
+                        "undefined_defect"
+                    )
+                continue
+
             comparisons: Dict[str, List[Optional[Dict[str, Any]]]] = {
                 "grid": [
                     lookup.get(
-                        (factor, largest_domain_margin, primary_boundary)
+                        (factor, largest_domain_margin, boundary)
                     )
                     for factor in coarse_factors
                 ],
                 "domain": [
-                    lookup.get((finest, margin, primary_boundary))
+                    lookup.get((finest, margin, boundary))
                     for margin in smaller_domain_margins
-                ],
-                "boundary": [
-                    lookup.get((finest, largest_domain_margin, boundary))
-                    for boundary in audit_boundaries
                 ],
             }
             checked = True
@@ -2121,49 +3358,100 @@ def assess_defect_refinement(
 
             grid_change = changes.get("grid", float("nan"))
             domain_change = changes.get("domain", float("nan"))
-            boundary_change = changes.get("boundary", float("nan"))
-            primary.update({
+            if not bool(int(representative["is_verification"])):
+                status = "not_checked"
+            elif largest_domain_margin >= 0.0:
+                status = "fd_domain_not_enlarged_beyond_training"
+            elif not checked:
+                status = "incomplete"
+            else:
+                status = "pass" if passed else "fail"
+            envelope = (
+                delta + sum(axis_deltas) if checked else float("nan")
+            )
+            representative.update({
                 "defect_grid_abs_change": grid_change,
                 "defect_grid_rel_change": (
-                    grid_change / max(abs(delta), np.finfo(float).tiny)
+                    grid_change
+                    / max(abs(delta), np.finfo(float).tiny)
                 ),
                 "defect_domain_abs_change": domain_change,
                 "defect_domain_rel_change": (
-                    domain_change / max(abs(delta), np.finfo(float).tiny)
+                    domain_change
+                    / max(abs(delta), np.finfo(float).tiny)
                 ),
-                "defect_boundary_abs_change": boundary_change,
-                # A sensitivity envelope, not a rigorous FD error bound.
-                "defect_sensitivity_envelope": (
-                    delta + sum(axis_deltas) if checked else float("nan")
-                ),
+                "defect_grid_domain_sensitivity_envelope": envelope,
+                "grid_domain_refinement_status": status,
             })
-            if not bool(int(primary["is_verification"])):
-                primary["refinement_status"] = "not_checked"
-            elif largest_domain_margin >= 0.0:
-                primary["refinement_status"] = (
-                    "fd_domain_not_enlarged_beyond_training"
-                )
-            elif not checked:
-                primary["refinement_status"] = "incomplete"
-            else:
-                primary["refinement_status"] = "pass" if passed else "fail"
+            if representative is primary:
+                # Backward-compatible aliases with grid/domain-only v2
+                # semantics.
+                representative["defect_sensitivity_envelope"] = envelope
+                representative["refinement_status"] = status
 
-        for row in defect_rows:
-            if row is primary:
-                continue
-            row.setdefault("defect_grid_abs_change", "")
-            row.setdefault("defect_grid_rel_change", "")
-            row.setdefault("defect_domain_abs_change", "")
-            row.setdefault("defect_domain_rel_change", "")
-            row.setdefault("defect_boundary_abs_change", "")
-            row.setdefault("defect_sensitivity_envelope", "")
-            row.setdefault("refinement_status", "variant")
+        primary_delta = float(primary["delta_X"])
+        if not audit_boundaries:
+            primary["defect_boundary_abs_change"] = float("nan")
+            primary["defect_boundary_rel_change"] = float("nan")
+            primary["boundary_sensitivity_status"] = "not_requested"
+        elif not bool(int(primary["is_verification"])):
+            primary["defect_boundary_abs_change"] = float("nan")
+            primary["defect_boundary_rel_change"] = float("nan")
+            primary["boundary_sensitivity_status"] = "not_checked"
+        else:
+            audit_representatives = [
+                representatives.get(boundary)
+                for boundary in audit_boundaries
+            ]
+            boundary_complete = (
+                math.isfinite(primary_delta)
+                and all(
+                    row is not None
+                    and math.isfinite(float(row["delta_X"]))
+                    for row in audit_representatives
+                )
+            )
+            if boundary_complete:
+                boundary_deltas: List[float] = []
+                for boundary, audit in zip(
+                    audit_boundaries, audit_representatives
+                ):
+                    if audit is None:  # pragma: no cover - guarded above
+                        continue
+                    change = abs(
+                        float(audit["delta_X"]) - primary_delta
+                    )
+                    boundary_deltas.append(change)
+                    audit["defect_boundary_abs_change"] = change
+                    audit["defect_boundary_rel_change"] = (
+                        change
+                        / max(abs(primary_delta), np.finfo(float).tiny)
+                    )
+                    audit["boundary_sensitivity_status"] = (
+                        f"reported_vs_{primary_boundary}"
+                    )
+                primary_change = max(boundary_deltas)
+                primary["defect_boundary_abs_change"] = primary_change
+                primary["defect_boundary_rel_change"] = (
+                    primary_change
+                    / max(abs(primary_delta), np.finfo(float).tiny)
+                )
+                primary["boundary_sensitivity_status"] = "reported"
+            else:
+                primary["defect_boundary_abs_change"] = float("nan")
+                primary["defect_boundary_rel_change"] = float("nan")
+                primary["boundary_sensitivity_status"] = "incomplete"
 
 
 def required_defect_refinement_iterations(
     defect_rows: Sequence[Mapping[str, Any]],
 ) -> List[int]:
-    """Return the minimum E4 evidence set: delta_0, first/last adjacent, worst."""
+    """Return the minimum E4 evidence set: first/last defects and the worst.
+
+    Standard trajectories include delta_0, while E6 target branches begin at
+    delta_1 after their common warm-up.  The same data-driven selector supports
+    both without inventing an unavailable iteration.
+    """
     if not defect_rows:
         return []
     by_iter: Dict[int, float] = {}
@@ -2228,13 +3516,16 @@ def evaluate_run(
     denominator_tolerance: float,
     refinement_abs_tolerance: float,
     refinement_rel_tolerance: float,
+    policy_extension: str = "boundary-projection",
+    linear_residual_tolerance: float = 1.0e-8,
+    boundary_condition_limit: float = 1.0e12,
+    solver_ellipticity_tolerance: float = 0.0,
+    skip_e4: bool = False,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("_SUCCESS_EXACT_MAP", "_FAILED_EXACT_MAP", "_STALE_EXACT_MAP"):
-        marker = output / name
-        if marker.exists():
-            marker.unlink()
+    _quarantine_previous_outputs(output)
+    (output / "_INCOMPLETE_EXACT_MAP").touch()
 
     if any(value < 1 for value in grid_factors) or len(set(grid_factors)) != len(grid_factors):
         raise ValueError("grid factors must be unique positive integers")
@@ -2245,6 +3536,40 @@ def evaluate_run(
         )
     if len(set(fd_margins)) != len(fd_margins):
         raise ValueError("fd margins must be unique")
+    if (
+        not math.isfinite(linear_residual_tolerance)
+        or linear_residual_tolerance <= 0.0
+    ):
+        raise ValueError("linear residual tolerance must be finite and positive")
+    if (
+        not math.isfinite(boundary_condition_limit)
+        or boundary_condition_limit < 1.0
+    ):
+        raise ValueError("boundary condition limit must be finite and at least one")
+    if (
+        not math.isfinite(solver_ellipticity_tolerance)
+        or solver_ellipticity_tolerance < 0.0
+    ):
+        raise ValueError("solver ellipticity tolerance must be finite and nonnegative")
+    policy_extension = str(policy_extension).strip().lower().replace("_", "-")
+    if policy_extension not in POLICY_EXTENSIONS:
+        raise ValueError(f"unsupported policy extension {policy_extension!r}")
+    if not skip_e4 and run.checkpoint_selection != "all":
+        selected = [int(outer) for outer, _path in run.checkpoints]
+        if selected != list(range(1, selected[-1] + 1)):
+            raise ValueError(
+                "sparse checkpoint subsets require --skip-e4; E4 needs a "
+                "contiguous prefix beginning at outer 1"
+            )
+    if skip_e4 and run.checkpoint_selection == "all":
+        analysis_mode = "exact_map_only_pilot"
+    elif skip_e4:
+        analysis_mode = "sparse_exact_map_only_pilot"
+    elif run.checkpoint_selection != "all":
+        analysis_mode = "contiguous_prefix_exact_map_and_e4_pilot"
+    else:
+        analysis_mode = "exact_map_and_e4"
+    map_definition, whole_space_claim = _map_definition(policy_extension)
     boundaries = [str(value).replace("_", "-").lower() for value in boundaries]
     if not boundaries or any(value not in {"robin", "exact-dirichlet"} for value in boundaries):
         raise ValueError("boundaries must contain robin and/or exact-dirichlet")
@@ -2262,6 +3587,31 @@ def evaluate_run(
         run.checkpoints, verify_checkpoints
     )
     eval_y_min, eval_y_max = run.eval_y_bounds
+    containment_tolerance = (
+        64.0
+        * np.finfo(np.float64).eps
+        * max(
+            1.0,
+            abs(run.problem.y_min),
+            abs(run.problem.y_max),
+        )
+    )
+    for fd_margin in fd_margins:
+        candidate_fd_y_min, candidate_fd_y_max = shrink_bounds(
+            run.problem.y_min, run.problem.y_max, fd_margin
+        )
+        if (
+            candidate_fd_y_min > eval_y_min + containment_tolerance
+            or candidate_fd_y_max < eval_y_max - containment_tolerance
+        ):
+            raise ValueError(
+                "every FD domain must contain the complete effective Q_ev "
+                "window; "
+                f"fd_margin={fd_margin:.17g} gives "
+                f"[{candidate_fd_y_min:.17g}, {candidate_fd_y_max:.17g}], "
+                f"but Q_ev is [{eval_y_min:.17g}, {eval_y_max:.17g}]. "
+                "Use a smaller/negative --fd-margins value."
+            )
     eval_tau_min = run.problem.horizon / int(base_nt)
     eval_tau_max = run.problem.horizon
     implementation_hashes = {
@@ -2269,7 +3619,8 @@ def evaluate_run(
         "core": sha256_file(Path(__file__).with_name("merton_exact_map_core.py").resolve()),
         "policy": sha256_file(Path(__file__).with_name("merton_policy.py").resolve()),
     }
-    protocol_hash = stable_hash({
+    protocol_compatibility_payload = {
+        "compatibility_version": EXACT_PROTOCOL_COMPATIBILITY_VERSION,
         "training_group": run.group,
         "base_ny": base_ny,
         "base_nt": base_nt,
@@ -2277,29 +3628,49 @@ def evaluate_run(
         "evaluation_calendar_time_domain": "[0,T)",
         "primary_evaluation_window": {
             "eval_margin": run.eval_margin,
+            "eval_window_mode": run.eval_window_mode,
+            "eval_w_min_requested": run.eval_w_min_requested,
+            "eval_w_min_symmetric": run.eval_w_min_symmetric,
             "ev_tau_min": eval_tau_min,
             "ev_tau_max": eval_tau_max,
             "ev_y_min": eval_y_min,
             "ev_y_max": eval_y_max,
+            "ev_w_min": run.eval_w_bounds[0],
+            "ev_w_max": run.eval_w_bounds[1],
         },
         "grid_factors": list(grid_factors),
         "fd_margins": list(fd_margins),
         "boundaries": list(boundaries),
         "verify_checkpoints": verify_checkpoints,
+        "analysis_mode": analysis_mode,
+        "skip_e4": bool(skip_e4),
+        "e6_role": run.e6_role,
+        "checkpoint_indexing": run.checkpoint_indexing_provenance,
+        "initial_defect_mode": run.initial_defect_mode,
+        "policy_extension": policy_extension,
         "defect_refinement_selector": (
-            "delta0_plus_verify_checkpoints; paper evidence requires "
-            "delta0+first_adjacent+last_adjacent+worst"
+            "first_defect_plus_verify_checkpoints; paper evidence requires "
+            "first+last+worst defects"
         ),
         "drift_scheme": drift_scheme,
         "peclet_limit": peclet_limit,
         "theta_method": theta_method,
         "rannacher_steps": rannacher_steps,
         "denominator_tolerance": denominator_tolerance,
+        "linear_residual_tolerance": linear_residual_tolerance,
+        "boundary_condition_limit": boundary_condition_limit,
+        "solver_ellipticity_tolerance": solver_ellipticity_tolerance,
         "refinement_abs_tolerance": refinement_abs_tolerance,
         "refinement_rel_tolerance": refinement_rel_tolerance,
+        "refinement_semantics_version": REFINEMENT_SEMANTICS_VERSION,
+        "refinement_gate_axes": ["grid", "domain"],
+        "boundary_replacement_role": (
+            "separate_sensitivity_not_refinement_gate"
+        ),
         "implementation_hashes": implementation_hashes,
         "checkpoint_selection": run.checkpoint_selection,
-    })[:16]
+    }
+    protocol_hash = stable_hash(protocol_compatibility_payload)[:16]
     finest = max(grid_factors)
     largest_domain_margin = min(fd_margins)
     primary_boundary = boundaries[0]
@@ -2317,19 +3688,34 @@ def evaluate_run(
     defect_refinement_rows: List[Dict[str, Any]] = []
     residual_by_outer, residual_semantics = load_outer_residuals(run.run_dir)
     checkpoint_by_outer = dict(run.checkpoints)
+    checkpoint_source_to_outer: Dict[int, int] = {}
+    for checkpoint_outer, _checkpoint_path in run.checkpoints:
+        source = int(run.checkpoint_source_iters[int(checkpoint_outer)])
+        if source in checkpoint_source_to_outer:
+            raise ValueError(
+                f"duplicate paper source_iter={source} in checkpoint schedule"
+            )
+        checkpoint_source_to_outer[source] = int(checkpoint_outer)
     input_bundle_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
-    # E4 starts at n=0: checkpoint outer 1 is v_tilde_0, while alpha_0 is the
-    # configured analytic initialization (not G of a neural checkpoint).
+    # Standard E4 starts at n=0: checkpoint outer 1 is v_tilde_0, while
+    # alpha_0 is the configured analytic initialization (not G of a neural
+    # checkpoint). E6 target branches use a different predecessor block below.
     # Delta_0 is always recomputed over the complete FD variant family so its
     # refinement status is based on the defect itself, not copied from an
     # unrelated contraction-ratio check.
-    if 1 in checkpoint_by_outer:
+    if (
+        not skip_e4
+        and run.initial_defect_mode == "analytic-initial-policy"
+        and 1 in checkpoint_by_outer
+    ):
         first_checkpoint = checkpoint_by_outer[1]
         first_evaluator = TorchCheckpointEvaluator(first_checkpoint, run, device)
         first_bundle = first_evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
         input_bundle_cache[1] = first_bundle
-        initial_policy, initial_policy_contract_hash = build_initial_policy(run)
+        initial_policy, initial_policy_contract_hash = build_initial_policy(
+            run, policy_extension=policy_extension
+        )
         initial_ev_diag = policy_diagnostics_on_tensor_grid(
             initial_policy, run.problem, tau_eval, eval_y
         )
@@ -2395,6 +3781,9 @@ def evaluate_run(
                 drift_scheme=drift_scheme,
                 peclet_limit=peclet_limit,
                 boundary=boundary,
+                ellipticity_tolerance=solver_ellipticity_tolerance,
+                linear_residual_tolerance=linear_residual_tolerance,
+                boundary_condition_limit=boundary_condition_limit,
             )
             initial_map_bundle = evaluate_fd_bundle(
                 initial_solution, tau_eval, eval_y
@@ -2403,6 +3792,10 @@ def evaluate_run(
                 *first_bundle, initial_map_bundle, yy_eval
             )
             initial_fd_diag = initial_solution.diagnostics.as_dict()
+            (
+                initial_outside_count,
+                initial_outside_fraction,
+            ) = _outside_summary(initial_fd_diag)
             initial_variant, initial_unmodified = _map_variant(
                 initial_fd_diag, initial_ev_diag
             )
@@ -2416,14 +3809,20 @@ def evaluate_run(
                 "group": run.group,
                 "protocol_hash": protocol_hash,
                 "model_type": "pipinn",
+                "e6_role": run.e6_role,
                 "n_assets": run.problem.n_assets,
                 "seed": run.seed,
                 "market_seed": run.market_seed,
                 "eval_margin": run.eval_margin,
+                "eval_window_mode": run.eval_window_mode,
+                "eval_w_min_requested": run.eval_w_min_requested,
+                "eval_w_min_symmetric": run.eval_w_min_symmetric,
                 "ev_tau_min": float(tau_eval[0]),
                 "ev_tau_max": float(tau_eval[-1]),
                 "ev_y_min": float(eval_y[0]),
                 "ev_y_max": float(eval_y[-1]),
+                "ev_w_min": run.eval_w_bounds[0],
+                "ev_w_max": run.eval_w_bounds[1],
                 "defect_iter": 0,
                 "defect_kind": "initial_policy_evaluation",
                 "target_policy_iter": 0,
@@ -2436,6 +3835,11 @@ def evaluate_run(
                 "nt": initial_nt,
                 "is_primary": int(is_primary_initial),
                 "is_verification": 1,
+                "analysis_mode": analysis_mode,
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
+                "outside_collocation_count_fd": initial_outside_count,
+                "outside_collocation_fraction_fd": initial_outside_fraction,
                 "delta_value_sup": initial_delta["value_sup"],
                 "delta_vw_sup": initial_delta["vw_sup"],
                 "delta_vww_sup": initial_delta["vww_sup"],
@@ -2445,7 +3849,7 @@ def evaluate_run(
                 "delta_X": initial_delta["x_norm"],
                 "map_variant": initial_variant,
                 "local_map_unmodified_on_xfd": initial_unmodified,
-                "whole_space_map_claim": "not_verified_by_finite_domain",
+                "whole_space_map_claim": whole_space_claim,
             }
             defect_refinement_rows.append(initial_refinement_row)
             if is_primary_initial:
@@ -2457,6 +3861,8 @@ def evaluate_run(
                     "policy_hash": initial_policy_hash,
                     "ny": initial_ny,
                     "nt": initial_nt,
+                    "outside_count": initial_outside_count,
+                    "outside_fraction": initial_outside_fraction,
                 }
         if initial_primary is None:
             raise AssertionError("missing primary delta_0 FD variant")
@@ -2476,31 +3882,36 @@ def evaluate_run(
             initial_bundle_path,
             tau=tau_eval,
             y=eval_y,
+            derivative_coordinate=np.asarray(
+                "both_log_y_and_wealth_w", dtype="U32"
+            ),
             initial_consumption=np.stack(initial_c_rows, axis=0),
             initial_portfolio=np.stack(initial_pi_rows, axis=0),
-            fd_map_value=initial_primary["map_bundle"][0],
-            fd_map_vw=initial_primary["map_bundle"][1],
-            fd_map_vww=initial_primary["map_bundle"][2],
-            next_neural_value=first_bundle[0],
-            next_neural_vw=first_bundle[1],
-            next_neural_vww=first_bundle[2],
-            optimal_value=closed_form[0],
-            optimal_vw=closed_form[1],
-            optimal_vww=closed_form[2],
+            **bundle_storage_arrays(
+                "fd_map", initial_primary["map_bundle"], eval_y
+            ),
+            **bundle_storage_arrays("next_neural", first_bundle, eval_y),
+            **bundle_storage_arrays("optimal", closed_form, eval_y),
         )
         defect_rows.append({
             "problem": "merton",
             "group": run.group,
             "protocol_hash": protocol_hash,
             "model_type": "pipinn",
+            "e6_role": run.e6_role,
             "n_assets": run.problem.n_assets,
             "seed": run.seed,
             "market_seed": run.market_seed,
             "eval_margin": run.eval_margin,
+            "eval_window_mode": run.eval_window_mode,
+            "eval_w_min_requested": run.eval_w_min_requested,
+            "eval_w_min_symmetric": run.eval_w_min_symmetric,
             "ev_tau_min": float(tau_eval[0]),
             "ev_tau_max": float(tau_eval[-1]),
             "ev_y_min": float(eval_y[0]),
             "ev_y_max": float(eval_y[-1]),
+            "ev_w_min": run.eval_w_bounds[0],
+            "ev_w_max": run.eval_w_bounds[1],
             "defect_iter": 0,
             "defect_kind": "initial_policy_evaluation",
             "checkpoint_outer_iter": 0,
@@ -2519,6 +3930,15 @@ def evaluate_run(
             "ny": initial_primary["ny"],
             "nt": initial_primary["nt"],
             "is_verification": 1,
+            "analysis_mode": analysis_mode,
+            "policy_extension": policy_extension,
+            "map_definition": map_definition,
+            "outside_collocation_count_fd": (
+                initial_primary.get("outside_count", 0)
+            ),
+            "outside_collocation_fraction_fd": (
+                initial_primary.get("outside_fraction", 0.0)
+            ),
             "delta_value_sup": initial_primary["delta"]["value_sup"],
             "delta_vw_sup": initial_primary["delta"]["vw_sup"],
             "delta_vww_sup": initial_primary["delta"]["vww_sup"],
@@ -2542,12 +3962,318 @@ def evaluate_run(
             "refinement_status": "pending_defect_refinement",
             "map_variant": initial_primary["variant"],
             "local_map_unmodified_on_xfd": initial_primary["unmodified"],
-            "whole_space_map_claim": "not_verified_by_finite_domain",
+            "whole_space_map_claim": whole_space_claim,
+        })
+
+    # E6 branches begin after one common warm-up policy evaluation.  Their
+    # local checkpoint outer 1 is v~_1, while v~_0 lives only in the
+    # hash-validated warm-start bundle.  Re-evaluate G(v~_0) independently by
+    # FD and compare it with branch checkpoint 1 to obtain delta_1.  The
+    # warm-up residual is intentionally excluded; branch local outer 1 supplies
+    # the official post-restore p_res for this target-phase defect.
+    first_e6_outer = checkpoint_source_to_outer.get(1)
+    if (
+        not skip_e4
+        and run.initial_defect_mode == "warm-start-value"
+        and first_e6_outer is not None
+    ):
+        if run.warm_start_bundle_path is None:
+            raise AssertionError(
+                "E6 warm-start predecessor mode has no warm-start bundle"
+            )
+        first_checkpoint = checkpoint_by_outer[first_e6_outer]
+        predecessor_evaluator = TorchCheckpointEvaluator(
+            run.warm_start_bundle_path, run, device
+        )
+        predecessor_bundle = predecessor_evaluator.bundle_on_tensor_grid(
+            tau_eval, eval_y
+        )
+        first_evaluator = TorchCheckpointEvaluator(
+            first_checkpoint, run, device
+        )
+        first_bundle = first_evaluator.bundle_on_tensor_grid(
+            tau_eval, eval_y
+        )
+        input_bundle_cache[first_e6_outer] = first_bundle
+        predecessor_ev_diag = predecessor_evaluator.policy_diagnostics_on_grid(
+            tau_eval,
+            eval_y,
+            policy_extension=policy_extension,
+        )
+        predecessor_primary: Optional[Dict[str, Any]] = None
+        cached_predecessor_policy_key: Optional[Tuple[int, float]] = None
+        cached_predecessor_policy: Optional[Tuple[Any, str]] = None
+        for factor, fd_margin, boundary in [
+            (factor, margin, boundary)
+            for factor in sorted(grid_factors)
+            for margin in sorted(fd_margins)
+            for boundary in boundaries
+        ]:
+            predecessor_fd_y_min, predecessor_fd_y_max = shrink_bounds(
+                run.problem.y_min, run.problem.y_max, fd_margin
+            )
+            predecessor_base_intervals = max(
+                6,
+                int(round(
+                    (predecessor_fd_y_max - predecessor_fd_y_min)
+                    / training_y_width
+                    * (int(base_ny) - 1)
+                )),
+            )
+            predecessor_ny = (
+                predecessor_base_intervals * int(factor) + 1
+            )
+            predecessor_nt = int(base_nt) * int(factor)
+            predecessor_grid = FDGrid(
+                predecessor_fd_y_min,
+                predecessor_fd_y_max,
+                ny=predecessor_ny,
+                nt=predecessor_nt,
+            )
+            predecessor_policy_key = (int(factor), float(fd_margin))
+            if (
+                cached_predecessor_policy_key != predecessor_policy_key
+                or cached_predecessor_policy is None
+            ):
+                predecessor_fd_y = np.linspace(
+                    predecessor_fd_y_min,
+                    predecessor_fd_y_max,
+                    predecessor_ny,
+                    dtype=np.float64,
+                )
+                predecessor_dt = run.problem.horizon / predecessor_nt
+                predecessor_tau_mid = (
+                    np.arange(predecessor_nt, dtype=np.float64) + 0.5
+                ) * predecessor_dt
+                (
+                    predecessor_policy,
+                    predecessor_policy_hash,
+                    _precomputed_diag,
+                ) = predecessor_evaluator.precompute_policy(
+                    predecessor_tau_mid,
+                    predecessor_fd_y,
+                    policy_extension=policy_extension,
+                )
+                cached_predecessor_policy_key = predecessor_policy_key
+                cached_predecessor_policy = (
+                    predecessor_policy,
+                    predecessor_policy_hash,
+                )
+            else:
+                (
+                    predecessor_policy,
+                    predecessor_policy_hash,
+                ) = cached_predecessor_policy
+            predecessor_solution = solve_frozen_policy(
+                run.problem,
+                predecessor_policy,
+                predecessor_grid,
+                theta_method=theta_method,
+                rannacher_steps=rannacher_steps,
+                drift_scheme=drift_scheme,
+                peclet_limit=peclet_limit,
+                boundary=boundary,
+                ellipticity_tolerance=solver_ellipticity_tolerance,
+                linear_residual_tolerance=linear_residual_tolerance,
+                boundary_condition_limit=boundary_condition_limit,
+            )
+            predecessor_map_bundle = evaluate_fd_bundle(
+                predecessor_solution, tau_eval, eval_y
+            )
+            predecessor_delta = x_norm_components(
+                *first_bundle,
+                predecessor_map_bundle,
+                yy_eval,
+            )
+            predecessor_fd_diag = predecessor_solution.diagnostics.as_dict()
+            (
+                predecessor_outside_count,
+                predecessor_outside_fraction,
+            ) = _outside_summary(predecessor_fd_diag)
+            predecessor_variant, predecessor_unmodified = _map_variant(
+                predecessor_fd_diag, predecessor_ev_diag
+            )
+            is_primary_predecessor = (
+                factor,
+                fd_margin,
+                boundary,
+            ) == (finest, largest_domain_margin, primary_boundary)
+            defect_refinement_rows.append({
+                "problem": "merton",
+                "group": run.group,
+                "protocol_hash": protocol_hash,
+                "model_type": "pipinn",
+                "e6_role": run.e6_role,
+                "n_assets": run.problem.n_assets,
+                "seed": run.seed,
+                "market_seed": run.market_seed,
+                "eval_margin": run.eval_margin,
+                "eval_window_mode": run.eval_window_mode,
+                "eval_w_min_requested": run.eval_w_min_requested,
+                "eval_w_min_symmetric": run.eval_w_min_symmetric,
+                "ev_tau_min": float(tau_eval[0]),
+                "ev_tau_max": float(tau_eval[-1]),
+                "ev_y_min": float(eval_y[0]),
+                "ev_y_max": float(eval_y[-1]),
+                "ev_w_min": run.eval_w_bounds[0],
+                "ev_w_max": run.eval_w_bounds[1],
+                "defect_iter": 1,
+                "defect_kind": "e6_warm_start_policy_evaluation",
+                "target_policy_iter": 1,
+                "next_checkpoint_outer_iter": first_e6_outer,
+                "frozen_policy_sha256": predecessor_policy_hash,
+                "fd_margin": fd_margin,
+                "boundary": boundary,
+                "grid_factor": factor,
+                "ny": predecessor_ny,
+                "nt": predecessor_nt,
+                "is_primary": int(is_primary_predecessor),
+                "is_verification": 1,
+                "analysis_mode": analysis_mode,
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
+                "outside_collocation_count_fd": (
+                    predecessor_outside_count
+                ),
+                "outside_collocation_fraction_fd": (
+                    predecessor_outside_fraction
+                ),
+                "delta_value_sup": predecessor_delta["value_sup"],
+                "delta_vw_sup": predecessor_delta["vw_sup"],
+                "delta_vww_sup": predecessor_delta["vww_sup"],
+                "delta_vy_sup": predecessor_delta["vy_sup"],
+                "delta_vyy_sup": predecessor_delta["vyy_sup"],
+                "delta_bundle_sup": predecessor_delta["derivative_sup"],
+                "delta_X": predecessor_delta["x_norm"],
+                "map_variant": predecessor_variant,
+                "local_map_unmodified_on_xfd": predecessor_unmodified,
+                "whole_space_map_claim": whole_space_claim,
+            })
+            if is_primary_predecessor:
+                predecessor_primary = {
+                    "map_bundle": predecessor_map_bundle,
+                    "delta": predecessor_delta,
+                    "variant": predecessor_variant,
+                    "unmodified": predecessor_unmodified,
+                    "policy_hash": predecessor_policy_hash,
+                    "ny": predecessor_ny,
+                    "nt": predecessor_nt,
+                    "outside_count": predecessor_outside_count,
+                    "outside_fraction": predecessor_outside_fraction,
+                }
+        if predecessor_primary is None:
+            raise AssertionError("missing primary E6 delta_1 FD variant")
+
+        predecessor_bundle_path = (
+            output
+            / "evaluated_bundles"
+            / f"warm_start_to_outer_{first_e6_outer:04d}.npz"
+        )
+        atomic_npz(
+            predecessor_bundle_path,
+            tau=tau_eval,
+            y=eval_y,
+            derivative_coordinate=np.asarray(
+                "both_log_y_and_wealth_w", dtype="U32"
+            ),
+            **bundle_storage_arrays(
+                "input", predecessor_bundle, eval_y
+            ),
+            **bundle_storage_arrays(
+                "fd_map", predecessor_primary["map_bundle"], eval_y
+            ),
+            **bundle_storage_arrays(
+                "next_neural", first_bundle, eval_y
+            ),
+            **bundle_storage_arrays("optimal", closed_form, eval_y),
+        )
+        defect_rows.append({
+            "problem": "merton",
+            "group": run.group,
+            "protocol_hash": protocol_hash,
+            "model_type": "pipinn",
+            "e6_role": run.e6_role,
+            "n_assets": run.problem.n_assets,
+            "seed": run.seed,
+            "market_seed": run.market_seed,
+            "eval_margin": run.eval_margin,
+            "eval_window_mode": run.eval_window_mode,
+            "eval_w_min_requested": run.eval_w_min_requested,
+            "eval_w_min_symmetric": run.eval_w_min_symmetric,
+            "ev_tau_min": float(tau_eval[0]),
+            "ev_tau_max": float(tau_eval[-1]),
+            "ev_y_min": float(eval_y[0]),
+            "ev_y_max": float(eval_y[-1]),
+            "ev_w_min": run.eval_w_bounds[0],
+            "ev_w_max": run.eval_w_bounds[1],
+            "defect_iter": 1,
+            "defect_kind": "e6_warm_start_policy_evaluation",
+            "checkpoint_outer_iter": 0,
+            "source_iter": 0,
+            "target_policy_iter": 1,
+            "next_checkpoint_outer_iter": first_e6_outer,
+            "next_neural_iter": 1,
+            "checkpoint_state_sha256": (
+                run.warm_start_model_state_hash
+            ),
+            "next_checkpoint_state_sha256": (
+                canonical_checkpoint_state_hash(first_checkpoint)
+            ),
+            "frozen_policy_sha256": predecessor_primary["policy_hash"],
+            "fd_margin": largest_domain_margin,
+            "boundary": primary_boundary,
+            "grid_factor": finest,
+            "ny": predecessor_primary["ny"],
+            "nt": predecessor_primary["nt"],
+            "is_verification": 1,
+            "analysis_mode": analysis_mode,
+            "policy_extension": policy_extension,
+            "map_definition": map_definition,
+            "outside_collocation_count_fd": predecessor_primary[
+                "outside_count"
+            ],
+            "outside_collocation_fraction_fd": predecessor_primary[
+                "outside_fraction"
+            ],
+            "delta_value_sup": predecessor_primary["delta"]["value_sup"],
+            "delta_vw_sup": predecessor_primary["delta"]["vw_sup"],
+            "delta_vww_sup": predecessor_primary["delta"]["vww_sup"],
+            "delta_vy_sup": predecessor_primary["delta"]["vy_sup"],
+            "delta_vyy_sup": predecessor_primary["delta"]["vyy_sup"],
+            "delta_bundle_sup": predecessor_primary["delta"][
+                "derivative_sup"
+            ],
+            "delta_X": predecessor_primary["delta"]["x_norm"],
+            "defect_grid_abs_change": "",
+            "defect_grid_rel_change": "",
+            "defect_domain_abs_change": "",
+            "defect_domain_rel_change": "",
+            "defect_boundary_abs_change": "",
+            "defect_sensitivity_envelope": "",
+            "p_res_post_restore": residual_by_outer.get(
+                first_e6_outer, ""
+            ),
+            "p_res_source": "",
+            "residual_semantics": residual_semantics,
+            "evaluated_bundle_path": str(
+                predecessor_bundle_path.relative_to(output)
+            ),
+            "evaluated_bundle_sha256": sha256_file(
+                predecessor_bundle_path
+            ),
+            "refinement_status": "pending_defect_refinement",
+            "map_variant": predecessor_primary["variant"],
+            "local_map_unmodified_on_xfd": predecessor_primary[
+                "unmodified"
+            ],
+            "whole_space_map_claim": whole_space_claim,
         })
 
     for checkpoint_index, (outer, checkpoint) in enumerate(run.checkpoints, start=1):
-        source_iter = int(outer) - 1
-        target_policy_iter = int(outer)
+        source_iter = int(run.checkpoint_source_iters[int(outer)])
+        target_policy_iter = int(
+            run.checkpoint_target_policy_iters[int(outer)]
+        )
         print(
             f"[exact-map] seed={run.seed} checkpoint={checkpoint_index}/{len(run.checkpoints)} "
             f"outer={outer} (v_{source_iter} -> policy {target_policy_iter}): {checkpoint.name}"
@@ -2559,16 +4285,28 @@ def evaluate_run(
         if input_bundle is None:
             input_bundle = evaluator.bundle_on_tensor_grid(tau_eval, eval_y)
         input_metric = x_norm_components(*input_bundle, closed_form, yy_eval)
-        ev_policy_diag = evaluator.policy_diagnostics_on_grid(tau_eval, eval_y)
+        ev_policy_diag = evaluator.policy_diagnostics_on_grid(
+            tau_eval, eval_y, policy_extension=policy_extension
+        )
         is_verification = outer in verification_outers
         cached_policy_key: Optional[Tuple[int, float]] = None
         cached_policy: Optional[Tuple[Any, str]] = None
-        next_outer = int(outer) + 1
+        next_outer = checkpoint_source_to_outer.get(source_iter + 1)
         next_checkpoint = checkpoint_by_outer.get(next_outer)
+        next_source_iter: Optional[int] = None
         next_bundle: Optional[
             Tuple[np.ndarray, np.ndarray, np.ndarray]
         ] = None
-        if next_checkpoint is not None:
+        if not skip_e4 and next_outer is not None and next_checkpoint is not None:
+            next_source_iter = int(
+                run.checkpoint_source_iters[int(next_outer)]
+            )
+            if next_source_iter != target_policy_iter:
+                raise ValueError(
+                    "checkpoint indexing is not adjacent in paper algorithm "
+                    f"space: source={source_iter}, policy={target_policy_iter}, "
+                    f"next_source={next_source_iter}"
+                )
             if next_outer not in input_bundle_cache:
                 next_evaluator = TorchCheckpointEvaluator(
                     next_checkpoint, run, device
@@ -2610,7 +4348,9 @@ def evaluate_run(
                 fd_dt = run.problem.horizon / nt
                 tau_midpoints = (np.arange(nt, dtype=np.float64) + 0.5) * fd_dt
                 frozen_policy, policy_hash, _precomputed_diag = evaluator.precompute_policy(
-                    tau_midpoints, fd_y_grid
+                    tau_midpoints,
+                    fd_y_grid,
+                    policy_extension=policy_extension,
                 )
                 cached_policy_key = policy_key
                 cached_policy = (frozen_policy, policy_hash)
@@ -2625,6 +4365,9 @@ def evaluate_run(
                 drift_scheme=drift_scheme,
                 peclet_limit=peclet_limit,
                 boundary=boundary,
+                ellipticity_tolerance=solver_ellipticity_tolerance,
+                linear_residual_tolerance=linear_residual_tolerance,
+                boundary_condition_limit=boundary_condition_limit,
             )
             map_bundle = evaluate_fd_bundle(solution, tau_eval, eval_y)
             map_metric = x_norm_components(*map_bundle, closed_form, yy_eval)
@@ -2635,11 +4378,13 @@ def evaluate_run(
             rho_exact = float(map_metric["x_norm"] / denominator) if denominator_defined else float("nan")
             fd_clip = _clip_summary(fd_diag)
             ev_clip = _clip_summary(ev_policy_diag)
+            outside_count, outside_fraction = _outside_summary(fd_diag)
             row: Dict[str, Any] = {
                 "problem": "merton",
                 "group": run.group,
                 "protocol_hash": protocol_hash,
                 "model_type": "pipinn",
+                "e6_role": run.e6_role,
                 "n_assets": run.problem.n_assets,
                 "seed": run.seed,
                 "market_seed": run.market_seed,
@@ -2657,10 +4402,15 @@ def evaluate_run(
                 "checkpoint_state_sha256": checkpoint_state_hash,
                 "market_sha256": run.market_hash,
                 "eval_margin": run.eval_margin,
+                "eval_window_mode": run.eval_window_mode,
+                "eval_w_min_requested": run.eval_w_min_requested,
+                "eval_w_min_symmetric": run.eval_w_min_symmetric,
                 "ev_tau_min": float(tau_eval[0]),
                 "ev_tau_max": float(tau_eval[-1]),
                 "ev_y_min": float(eval_y[0]),
                 "ev_y_max": float(eval_y[-1]),
+                "ev_w_min": run.eval_w_bounds[0],
+                "ev_w_max": run.eval_w_bounds[1],
                 "fd_margin": fd_margin,
                 "fd_y_min": fd_y_min,
                 "fd_y_max": fd_y_max,
@@ -2674,25 +4424,16 @@ def evaluate_run(
                 "dt": run.problem.horizon / nt,
                 "is_primary": int((factor, fd_margin, boundary) == primary_variant),
                 "is_verification": int(is_verification),
-                "e_input_value": input_metric["value_sup"],
-                "e_input_vw": input_metric["vw_sup"],
-                "e_input_vww": input_metric["vww_sup"],
-                "e_input_vy": input_metric["vy_sup"],
-                "e_input_vyy": input_metric["vyy_sup"],
-                "e_input_deriv": input_metric["derivative_sup"],
-                "e_input_X": denominator,
-                "e_map_value": map_metric["value_sup"],
-                "e_map_vw": map_metric["vw_sup"],
-                "e_map_vww": map_metric["vww_sup"],
-                "e_map_vy": map_metric["vy_sup"],
-                "e_map_vyy": map_metric["vyy_sup"],
-                "e_map_deriv": map_metric["derivative_sup"],
-                "e_map_X": map_metric["x_norm"],
+                "analysis_mode": analysis_mode,
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
+                "outside_collocation_count_fd": outside_count,
+                "outside_collocation_fraction_fd": outside_fraction,
                 "rho_exact": rho_exact,
                 "denominator_defined": int(denominator_defined),
                 "map_variant": map_variant,
                 "local_map_unmodified_on_xfd": unmodified,
-                "whole_space_map_claim": "not_verified_by_finite_domain",
+                "whole_space_map_claim": whole_space_claim,
                 "checkpoint_selection": run.checkpoint_selection,
                 "vw_guard_frac_fd": fd_clip["vw"],
                 "pi_numerator_guard_frac_fd": fd_clip["numerator"],
@@ -2719,8 +4460,23 @@ def evaluate_run(
                 "max_peclet": fd_diag["max_peclet"],
                 "upwind_fraction": fd_diag["upwind_fraction"],
                 "max_linear_residual": fd_diag["max_linear_residual"],
+                "linear_residual_tolerance": linear_residual_tolerance,
+                "boundary_elimination_size": fd_diag[
+                    "boundary_elimination_size"
+                ],
+                "boundary_elimination_rank": fd_diag[
+                    "boundary_elimination_rank"
+                ],
+                "boundary_elimination_cond_inf": fd_diag[
+                    "boundary_elimination_cond_inf"
+                ],
+                "min_linear_system_lu_pivot_ratio": fd_diag[
+                    "min_linear_system_lu_pivot_ratio"
+                ],
                 "policy_hash": policy_hash,
             }
+            row.update(metric_to_columns("e_input", input_metric))
+            row.update(metric_to_columns("e_map", map_metric))
             rows.append(row)
 
             # E4: the source checkpoint produces alpha_K and the FD map
@@ -2738,15 +4494,21 @@ def evaluate_run(
                     "group": run.group,
                     "protocol_hash": protocol_hash,
                     "model_type": "pipinn",
+                    "e6_role": run.e6_role,
                     "n_assets": run.problem.n_assets,
                     "seed": run.seed,
                     "market_seed": run.market_seed,
                     "eval_margin": run.eval_margin,
+                    "eval_window_mode": run.eval_window_mode,
+                    "eval_w_min_requested": run.eval_w_min_requested,
+                    "eval_w_min_symmetric": run.eval_w_min_symmetric,
                     "ev_tau_min": float(tau_eval[0]),
                     "ev_tau_max": float(tau_eval[-1]),
                     "ev_y_min": float(eval_y[0]),
                     "ev_y_max": float(eval_y[-1]),
-                    "defect_iter": int(outer),
+                    "ev_w_min": run.eval_w_bounds[0],
+                    "ev_w_max": run.eval_w_bounds[1],
+                    "defect_iter": target_policy_iter,
                     "defect_kind": "adjacent_policy_evaluation",
                     "target_policy_iter": target_policy_iter,
                     "next_checkpoint_outer_iter": next_outer,
@@ -2758,6 +4520,11 @@ def evaluate_run(
                     "nt": nt,
                     "is_primary": int(row["is_primary"]),
                     "is_verification": int(is_verification),
+                    "analysis_mode": analysis_mode,
+                    "policy_extension": policy_extension,
+                    "map_definition": map_definition,
+                    "outside_collocation_count_fd": outside_count,
+                    "outside_collocation_fraction_fd": outside_fraction,
                     "delta_value_sup": delta_metric["value_sup"],
                     "delta_vw_sup": delta_metric["vw_sup"],
                     "delta_vww_sup": delta_metric["vww_sup"],
@@ -2767,9 +4534,7 @@ def evaluate_run(
                     "delta_X": delta_metric["x_norm"],
                     "map_variant": map_variant,
                     "local_map_unmodified_on_xfd": unmodified,
-                    "whole_space_map_claim": (
-                        "not_verified_by_finite_domain"
-                    ),
+                    "whole_space_map_claim": whole_space_claim,
                 })
 
                 if int(row["is_primary"]) == 1:
@@ -2781,39 +4546,48 @@ def evaluate_run(
                         bundle_path,
                         tau=tau_eval,
                         y=eval_y,
-                        input_value=input_bundle[0],
-                        input_vw=input_bundle[1],
-                        input_vww=input_bundle[2],
-                        fd_map_value=map_bundle[0],
-                        fd_map_vw=map_bundle[1],
-                        fd_map_vww=map_bundle[2],
-                        next_neural_value=next_bundle[0],
-                        next_neural_vw=next_bundle[1],
-                        next_neural_vww=next_bundle[2],
-                        optimal_value=closed_form[0],
-                        optimal_vw=closed_form[1],
-                        optimal_vww=closed_form[2],
+                        derivative_coordinate=np.asarray(
+                            "both_log_y_and_wealth_w", dtype="U32"
+                        ),
+                        **bundle_storage_arrays(
+                            "input", input_bundle, eval_y
+                        ),
+                        **bundle_storage_arrays(
+                            "fd_map", map_bundle, eval_y
+                        ),
+                        **bundle_storage_arrays(
+                            "next_neural", next_bundle, eval_y
+                        ),
+                        **bundle_storage_arrays(
+                            "optimal", closed_form, eval_y
+                        ),
                     )
                     defect_rows.append({
                         "problem": "merton",
                         "group": run.group,
                         "protocol_hash": protocol_hash,
                         "model_type": "pipinn",
+                        "e6_role": run.e6_role,
                         "n_assets": run.problem.n_assets,
                         "seed": run.seed,
                         "market_seed": run.market_seed,
                         "eval_margin": run.eval_margin,
+                        "eval_window_mode": run.eval_window_mode,
+                        "eval_w_min_requested": run.eval_w_min_requested,
+                        "eval_w_min_symmetric": run.eval_w_min_symmetric,
                         "ev_tau_min": float(tau_eval[0]),
                         "ev_tau_max": float(tau_eval[-1]),
                         "ev_y_min": float(eval_y[0]),
                         "ev_y_max": float(eval_y[-1]),
-                        "defect_iter": int(outer),
+                        "ev_w_min": run.eval_w_bounds[0],
+                        "ev_w_max": run.eval_w_bounds[1],
+                        "defect_iter": target_policy_iter,
                         "defect_kind": "adjacent_policy_evaluation",
                         "checkpoint_outer_iter": int(outer),
                         "source_iter": source_iter,
                         "target_policy_iter": target_policy_iter,
                         "next_checkpoint_outer_iter": next_outer,
-                        "next_neural_iter": next_outer - 1,
+                        "next_neural_iter": next_source_iter,
                         "checkpoint_state_sha256": checkpoint_state_hash,
                         "next_checkpoint_state_sha256": (
                             canonical_checkpoint_state_hash(next_checkpoint)
@@ -2825,6 +4599,11 @@ def evaluate_run(
                         "ny": ny,
                         "nt": nt,
                         "is_verification": int(is_verification),
+                        "analysis_mode": analysis_mode,
+                        "policy_extension": policy_extension,
+                        "map_definition": map_definition,
+                        "outside_collocation_count_fd": outside_count,
+                        "outside_collocation_fraction_fd": outside_fraction,
                         "delta_value_sup": delta_metric["value_sup"],
                         "delta_vw_sup": delta_metric["vw_sup"],
                         "delta_vww_sup": delta_metric["vww_sup"],
@@ -2850,9 +4629,7 @@ def evaluate_run(
                         "refinement_status": "pending_defect_refinement",
                         "map_variant": map_variant,
                         "local_map_unmodified_on_xfd": unmodified,
-                        "whole_space_map_claim": (
-                            "not_verified_by_finite_domain"
-                        ),
+                        "whole_space_map_claim": whole_space_claim,
                     })
 
     assess_refinement(
@@ -2882,12 +4659,18 @@ def evaluate_run(
         int(row["defect_iter"]): row for row in primary_defect_refinement
     }
     evidence_fields = (
+        "boundary_role",
         "defect_grid_abs_change",
         "defect_grid_rel_change",
         "defect_domain_abs_change",
         "defect_domain_rel_change",
         "defect_boundary_abs_change",
+        "defect_boundary_rel_change",
+        "boundary_sensitivity_status",
+        "defect_grid_domain_sensitivity_envelope",
         "defect_sensitivity_envelope",
+        "grid_domain_refinement_status",
+        "refinement_semantics_version",
         "refinement_status",
         "is_verification",
     )
@@ -2900,12 +4683,34 @@ def evaluate_run(
     if len(primary_rows) != len(run.checkpoints):
         raise AssertionError("expected exactly one primary exact-map row per checkpoint")
     expected_defect_iterations = (
-        ([0] if 1 in checkpoint_by_outer else [])
-        + [
-            int(outer)
-            for outer, _path in run.checkpoints
-            if int(outer) + 1 in checkpoint_by_outer
-        ]
+        []
+        if skip_e4
+        else (
+            (
+                [0]
+                if (
+                    run.initial_defect_mode
+                    == "analytic-initial-policy"
+                    and 0 in checkpoint_source_to_outer
+                )
+                else (
+                    [1]
+                    if (
+                        run.initial_defect_mode == "warm-start-value"
+                        and 1 in checkpoint_source_to_outer
+                    )
+                    else []
+                )
+            )
+            + [
+                int(run.checkpoint_target_policy_iters[int(outer)])
+                for outer, _path in run.checkpoints
+                if (
+                    int(run.checkpoint_source_iters[int(outer)]) + 1
+                    in checkpoint_source_to_outer
+                )
+            ]
+        )
     )
     observed_defect_iterations = sorted(
         int(row["defect_iter"]) for row in defect_rows
@@ -2918,13 +4723,34 @@ def evaluate_run(
         )
     for defect in defect_rows:
         defect_iter = int(defect["defect_iter"])
+        expected_next_outer = checkpoint_source_to_outer.get(defect_iter)
         if not (
             int(defect["target_policy_iter"]) == defect_iter
             and int(defect["next_neural_iter"]) == defect_iter
-            and int(defect["next_checkpoint_outer_iter"]) == defect_iter + 1
+            and expected_next_outer is not None
+            and int(defect["next_checkpoint_outer_iter"])
+            == expected_next_outer
         ):
             raise AssertionError(f"mis-indexed E4 defect row: {defect}")
     defect_refinement_summary = summarize_defect_refinement(defect_rows)
+    verified_primary_rows = [
+        row for row in primary_rows if bool(int(row["is_verification"]))
+    ]
+    verified_primary_statuses = [
+        str(row.get("grid_domain_refinement_status", ""))
+        for row in verified_primary_rows
+    ]
+    if not verified_primary_statuses:
+        grid_domain_refinement_evidence_status = "not_checked"
+    elif all(status == "pass" for status in verified_primary_statuses):
+        grid_domain_refinement_evidence_status = "pass"
+    elif any(status == "fail" for status in verified_primary_statuses):
+        grid_domain_refinement_evidence_status = "fail"
+    else:
+        grid_domain_refinement_evidence_status = "incomplete"
+    defect_grid_domain_refinement_evidence_status = (
+        defect_refinement_summary["evidence_status"]
+    )
     write_csv(output / "exact_map_refinement.csv", rows, RATIO_FIELDS)
     write_csv(output / "exact_map_ratios.csv", primary_rows, RATIO_FIELDS)
     write_csv(output / "exact_map_defects.csv", defect_rows, DEFECT_FIELDS)
@@ -2955,7 +4781,91 @@ def evaluate_run(
         "network": asdict(run.network),
         "metadata_provenance": run.metadata_provenance,
         "training_protocol": run.training_protocol,
+        "e6_role": run.e6_role,
+        "initial_defect_mode": run.initial_defect_mode,
+        "checkpoint_indexing": {
+            **run.checkpoint_indexing_provenance,
+            "checkpoint_outer_to_source_iter": {
+                str(outer): int(source)
+                for outer, source in sorted(
+                    run.checkpoint_source_iters.items()
+                )
+            },
+            "checkpoint_outer_to_target_policy_iter": {
+                str(outer): int(target)
+                for outer, target in sorted(
+                    run.checkpoint_target_policy_iters.items()
+                )
+            },
+        },
+        "warm_start_predecessor": (
+            {
+                "path": str(run.warm_start_bundle_path),
+                "file_sha256": run.warm_start_bundle_file_hash,
+                "model_state_sha256": run.warm_start_model_state_hash,
+                "source_iter": 0,
+                "target_policy_iter": 1,
+                "warmup_excluded_from_outer_history": True,
+            }
+            if run.warm_start_bundle_path is not None
+            else None
+        ),
         "eval_margin": run.eval_margin,
+        "eval_window_mode": run.eval_window_mode,
+        "eval_w_min_requested": run.eval_w_min_requested,
+        "eval_w_min_symmetric": run.eval_w_min_symmetric,
+        "evaluation_bounds": {
+            "y_min": run.eval_y_bounds[0],
+            "y_max": run.eval_y_bounds[1],
+            "w_min": run.eval_w_bounds[0],
+            "w_max": run.eval_w_bounds[1],
+            "upper_bound_source": "symmetric_eval_margin",
+            "lower_bound_source": (
+                "explicit_eval_w_min"
+                if run.eval_window_mode == "lower-wealth-override"
+                else "symmetric_eval_margin"
+            ),
+        },
+        "analysis_mode": analysis_mode,
+        "paper_aggregation_eligible": bool(
+            not skip_e4 and run.checkpoint_selection == "all"
+        ),
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "whole_space_map_claim": whole_space_claim,
+        "collocation_bounds": {
+            "y_min": run.problem.y_min,
+            "y_max": run.problem.y_max,
+            "w_min": math.exp(run.problem.y_min),
+            "w_max": math.exp(run.problem.y_max),
+            "interpretation": "saved nominal training bounds",
+        },
+        "policy_extension_semantics": {
+            "network_evaluation": (
+                "clip y to saved nominal bounds"
+                if policy_extension == "boundary-projection"
+                else "evaluate the neural policy at the raw FD y coordinate"
+            ),
+            "portfolio": "pi(t,y)=pi_network(t,projected_y)",
+            "consumption": (
+                "kappa_boundary=c_network(t,projected_y)/exp(projected_y); "
+                "c_extended=kappa_boundary*exp(actual_y), followed by the "
+                "configured consumption-level bounds when present"
+            ),
+        },
+        "outside_collocation_summary": {
+            "max_count_fd": max(
+                int(row["outside_collocation_count_fd"])
+                for row in primary_rows
+            ),
+            "max_fraction_fd": max(
+                float(row["outside_collocation_fraction_fd"])
+                for row in primary_rows
+            ),
+            "counting_domain": (
+                "FD tensor grid policy queries across all time midpoints"
+            ),
+        },
         "grid": {
             "base_ny": base_ny,
             "base_nt": base_nt,
@@ -2970,11 +4880,36 @@ def evaluate_run(
                 "Use robin as the paper primary. exact-dirichlet is only an "
                 "optimal-reference sensitivity audit."
             ),
+            "refinement_semantics_version": REFINEMENT_SEMANTICS_VERSION,
+            "refinement_gate_axes": ["grid", "domain"],
+            "boundary_replacement_role": (
+                "separate_sensitivity_not_refinement_gate"
+            ),
+            "boundary_specific_refinement": (
+                "grid/domain changes and grid_domain_refinement_status are "
+                "computed independently within each boundary closure on its "
+                "finest-grid/largest-domain representative"
+            ),
+            "legacy_field_semantics": {
+                "refinement_status": (
+                    "primary-boundary grid/domain-only gate"
+                ),
+                "rho_sensitivity_envelope": (
+                    "primary rho plus grid and domain changes only"
+                ),
+                "boundary_abs_change": (
+                    "diagnostic boundary-replacement sensitivity; never a "
+                    "refinement gate"
+                ),
+            },
             "verify_checkpoints": verify_checkpoints,
             "drift_scheme": drift_scheme,
             "peclet_limit": peclet_limit,
             "theta_method": theta_method,
             "initial_full_dt_backward_euler_steps": rannacher_steps,
+            "linear_residual_tolerance": linear_residual_tolerance,
+            "boundary_condition_limit": boundary_condition_limit,
+            "solver_ellipticity_tolerance": solver_ellipticity_tolerance,
             "evaluation_time_coordinate": "tau=T-t",
             "evaluation_time_calendar_domain": "[0,T)",
             "evaluation_terminal_face_included": False,
@@ -2982,17 +4917,31 @@ def evaluate_run(
             "evaluation_tau_max": float(tau_eval[-1]),
             "evaluation_y_min": float(eval_y[0]),
             "evaluation_y_max": float(eval_y[-1]),
+            "evaluation_w_min": run.eval_w_bounds[0],
+            "evaluation_w_max": run.eval_w_bounds[1],
         },
         "norm": "sup|V-V*| + sup sqrt((V_w-V*_w)^2 + (V_ww-V*_ww)^2)",
         "e4_defect": {
             "definition": (
-                "delta_0=||v_tilde_0-v^{alpha_0}||_Xev from the configured "
-                "initial policy; for n>=1, delta_n=||v_tilde_n-"
-                "E(G(v_tilde_(n-1)))||_Xev from adjacent checkpoints, all on "
-                "the primary FD/evaluation grid"
+                (
+                    "target-branch delta_1=||v_tilde_1-"
+                    "E(G(v_tilde_0))||_Xev from the hash-validated common "
+                    "warm-start predecessor; subsequent delta_n use adjacent "
+                    "branch checkpoints"
+                )
+                if run.initial_defect_mode == "warm-start-value"
+                else (
+                    "delta_0=||v_tilde_0-v^{alpha_0}||_Xev from the "
+                    "configured analytic initial policy; for n>=1, delta_n="
+                    "||v_tilde_n-E(G(v_tilde_(n-1)))||_Xev from adjacent "
+                    "checkpoints"
+                )
             ),
             "residual_semantics": residual_semantics,
             "n_defect_iterations": len(defect_rows),
+            "status": (
+                "skipped_by_exact_map_pilot" if skip_e4 else "computed"
+            ),
             "defect_iterations": observed_defect_iterations,
             "defect_coverage": (
                 "complete_for_saved_schedule"
@@ -3000,7 +4949,7 @@ def evaluate_run(
                 == sorted(expected_defect_iterations) else "incomplete"
             ),
             "refinement_selector": (
-                "delta0_plus_source_outer_in_verify_checkpoints"
+                "first_defect_plus_source_outer_in_verify_checkpoints"
             ),
             "refinement_required_iterations": (
                 defect_refinement_summary["required_iterations"]
@@ -3011,18 +4960,43 @@ def evaluate_run(
             "refinement_evidence_status": (
                 defect_refinement_summary["evidence_status"]
             ),
+            "grid_domain_refinement_evidence_status": (
+                defect_grid_domain_refinement_evidence_status
+            ),
             "refinement_table": "exact_map_defect_refinement.csv",
             "evaluated_bundle_storage": (
                 "evaluated_bundles/*.npz; tau/y plus initial controls or neural "
-                "input, FD-map, next-neural, and optimal (value,V_w,V_ww) "
-                "arrays; SHA-256 in exact_map_defects.csv"
+                "input, FD-map, next-neural, and optimal arrays. Every value "
+                "bundle stores value plus both (V_y,V_yy) and correctly "
+                "converted (V_w,V_ww); derivative_coordinate documents this. "
+                "SHA-256 is recorded in exact_map_defects.csv"
             ),
         },
         "protocol_hash": protocol_hash,
+        "protocol_compatibility_version": (
+            EXACT_PROTOCOL_COMPATIBILITY_VERSION
+        ),
+        "protocol_compatibility_payload": (
+            protocol_compatibility_payload
+        ),
         "implementation_hashes": implementation_hashes,
         "refinement_abs_tolerance": refinement_abs_tolerance,
         "refinement_rel_tolerance": refinement_rel_tolerance,
+        "refinement_semantics_version": REFINEMENT_SEMANTICS_VERSION,
+        "refinement_gate_axes": ["grid", "domain"],
+        "boundary_replacement_role": (
+            "separate_sensitivity_not_refinement_gate"
+        ),
+        "grid_domain_refinement_evidence_status": (
+            grid_domain_refinement_evidence_status
+        ),
+        "defect_grid_domain_refinement_evidence_status": (
+            defect_grid_domain_refinement_evidence_status
+        ),
         "denominator_tolerance": denominator_tolerance,
+        "linear_residual_tolerance": linear_residual_tolerance,
+        "boundary_condition_limit": boundary_condition_limit,
+        "solver_ellipticity_tolerance": solver_ellipticity_tolerance,
         "checkpoint_hashes": {
             str(outer): sha256_file(path) for outer, path in run.checkpoints
         },
@@ -3031,7 +5005,10 @@ def evaluate_run(
             for outer, path in run.checkpoints
         },
         "checkpoint_schedule_outer": run.checkpoint_schedule,
-        "checkpoint_schedule_source_n": [outer - 1 for outer in run.checkpoint_schedule],
+        "checkpoint_schedule_source_n": [
+            int(run.checkpoint_source_iters[outer])
+            for outer in run.checkpoint_schedule
+        ],
         "checkpoint_manifest": (
             {
                 "path": str(run.checkpoint_manifest_path),
@@ -3048,11 +5025,40 @@ def evaluate_run(
             if run.final_checkpoint is not None else None
         ),
         "checkpoint_selection": run.checkpoint_selection,
-        "whole_space_map_claim": "not_verified_by_finite_domain",
     }
     atomic_json(output / "exact_map_config.json", protocol)
     status = {
         "status": "success",
+        "analysis_mode": analysis_mode,
+        "e6_role": run.e6_role,
+        "initial_defect_mode": run.initial_defect_mode,
+        "checkpoint_indexing": run.checkpoint_indexing_provenance,
+        "eval_margin": run.eval_margin,
+        "eval_window_mode": run.eval_window_mode,
+        "eval_w_min_requested": run.eval_w_min_requested,
+        "eval_w_min_symmetric": run.eval_w_min_symmetric,
+        "ev_y_min": run.eval_y_bounds[0],
+        "ev_y_max": run.eval_y_bounds[1],
+        "ev_w_min": run.eval_w_bounds[0],
+        "ev_w_max": run.eval_w_bounds[1],
+        "protocol_hash": protocol_hash,
+        "protocol_compatibility_version": (
+            EXACT_PROTOCOL_COMPATIBILITY_VERSION
+        ),
+        "refinement_semantics_version": REFINEMENT_SEMANTICS_VERSION,
+        "refinement_gate_axes": ["grid", "domain"],
+        "boundary_replacement_role": (
+            "separate_sensitivity_not_refinement_gate"
+        ),
+        "paper_aggregation_eligible": bool(
+            not skip_e4 and run.checkpoint_selection == "all"
+        ),
+        "policy_extension": policy_extension,
+        "map_definition": map_definition,
+        "whole_space_map_claim": whole_space_claim,
+        "e4_status": (
+            "skipped_by_exact_map_pilot" if skip_e4 else "computed"
+        ),
         "n_checkpoints": len(run.checkpoints),
         "n_primary_rows": len(primary_rows),
         "n_refinement_rows": len(rows),
@@ -3072,6 +5078,12 @@ def evaluate_run(
         "defect_refinement_evidence_status": (
             defect_refinement_summary["evidence_status"]
         ),
+        "grid_domain_refinement_evidence_status": (
+            grid_domain_refinement_evidence_status
+        ),
+        "defect_grid_domain_refinement_evidence_status": (
+            defect_grid_domain_refinement_evidence_status
+        ),
         "n_defect_refinement_rows": len(defect_refinement_rows),
         "n_defect_refinement_pass": sum(
             str(row.get("refinement_status", "")) == "pass"
@@ -3087,6 +5099,32 @@ def evaluate_run(
             not int(row["local_map_unmodified_on_xfd"]) for row in primary_rows
         ),
         "map_variants": sorted({str(row["map_variant"]) for row in primary_rows}),
+        "max_outside_collocation_count_fd": max(
+            int(row["outside_collocation_count_fd"]) for row in primary_rows
+        ),
+        "max_outside_collocation_fraction_fd": max(
+            float(row["outside_collocation_fraction_fd"])
+            for row in primary_rows
+        ),
+        "max_linear_residual": max(
+            float(row["max_linear_residual"]) for row in primary_rows
+        ),
+        "linear_residual_tolerance": linear_residual_tolerance,
+        "all_linear_residuals_within_tolerance": all(
+            float(row["max_linear_residual"])
+            <= float(linear_residual_tolerance)
+            for row in primary_rows
+        ),
+        "max_boundary_elimination_cond_inf": max(
+            float(row["boundary_elimination_cond_inf"])
+            for row in primary_rows
+        ),
+        "boundary_condition_limit": boundary_condition_limit,
+        "min_linear_system_lu_pivot_ratio": min(
+            float(row["min_linear_system_lu_pivot_ratio"])
+            for row in primary_rows
+        ),
+        "solver_ellipticity_tolerance": solver_ellipticity_tolerance,
         "max_activation_fractions": {
             field: max(float(row[field]) for row in primary_rows)
             for field in ACTIVATION_FIELDS
@@ -3094,6 +5132,9 @@ def evaluate_run(
         "all_primary_ratios_finite": all(math.isfinite(float(row["rho_exact"])) for row in primary_rows),
     }
     atomic_json(output / "exact_map_status.json", status)
+    incomplete_marker = output / "_INCOMPLETE_EXACT_MAP"
+    if incomplete_marker.exists():
+        incomplete_marker.unlink()
     (output / "_SUCCESS_EXACT_MAP").touch()
     return primary_rows, rows
 
@@ -3124,6 +5165,45 @@ def mean_std_ci(values: Sequence[float]) -> Tuple[float, float, float, float]:
     return mean, std, mean - half, mean + half
 
 
+def validate_plot_options(
+    *,
+    dpi: int,
+    fig_width: float,
+    fig_height: float,
+    font_size: float,
+    line_width: float,
+    line_alpha: float,
+    marker_size: float,
+    band_alpha: float,
+    grid_alpha: float,
+    floor_alpha: float,
+    bbox_inches: str,
+) -> None:
+    for name, value in (
+        ("dpi", dpi),
+        ("fig_width", fig_width),
+        ("fig_height", fig_height),
+        ("font_size", font_size),
+        ("line_width", line_width),
+    ):
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{name} must be positive and finite")
+    if not math.isfinite(float(marker_size)) or float(marker_size) < 0.0:
+        raise ValueError("marker_size must be nonnegative and finite")
+    for name, value, positive in (
+        ("line_alpha", line_alpha, True),
+        ("band_alpha", band_alpha, False),
+        ("grid_alpha", grid_alpha, False),
+        ("floor_alpha", floor_alpha, False),
+    ):
+        lower_ok = float(value) > 0.0 if positive else float(value) >= 0.0
+        if not math.isfinite(float(value)) or not lower_ok or float(value) > 1.0:
+            interval = "(0,1]" if positive else "[0,1]"
+            raise ValueError(f"{name} must be finite and lie in {interval}")
+    if bbox_inches not in ("tight", "standard"):
+        raise ValueError("bbox_inches must be 'tight' or 'standard'")
+
+
 def aggregate_exact_map(
     result_dirs: Sequence[Path],
     output: Path,
@@ -3134,12 +5214,55 @@ def aggregate_exact_map(
     allow_unverified: bool,
     require_locally_unmodified_map: bool,
     make_plot: bool,
-    plot_format: str,
-    dpi: int,
+    plot_format: Optional[str] = None,
+    dpi: int = 300,
+    plot_formats: Optional[Sequence[str]] = None,
+    fig_width: float = 6.0,
+    fig_height: float = 4.0,
+    font_size: float = 12.0,
+    font_family: str = "",
+    line_width: float = 1.8,
+    line_alpha: float = 1.0,
+    marker_size: float = 4.0,
+    band_alpha: float = 0.18,
+    iteration_tick_step: int = 3,
+    grid_alpha: float = 0.3,
+    floor_alpha: float = 0.8,
+    bbox_inches: str = "tight",
     min_seeds: int = 2,
     ellipticity_tolerance: float = 0.0,
     allow_degenerate_diffusion: bool = False,
+    allow_neural_extrapolation: bool = False,
 ) -> None:
+    if plot_formats is None:
+        resolved_plot_formats = parse_plot_formats(plot_format or "png")
+    elif isinstance(plot_formats, str):
+        resolved_plot_formats = parse_plot_formats(plot_formats)
+    else:
+        resolved_plot_formats = parse_plot_formats(
+            ",".join(str(value) for value in plot_formats)
+        )
+    validate_plot_options(
+        dpi=dpi,
+        fig_width=fig_width,
+        fig_height=fig_height,
+        font_size=font_size,
+        line_width=line_width,
+        line_alpha=line_alpha,
+        marker_size=marker_size,
+        band_alpha=band_alpha,
+        grid_alpha=grid_alpha,
+        floor_alpha=floor_alpha,
+        bbox_inches=bbox_inches,
+    )
+    if (
+        isinstance(iteration_tick_step, bool)
+        or int(iteration_tick_step) != iteration_tick_step
+        or int(iteration_tick_step) < 1
+    ):
+        raise ValueError("iteration_tick_step must be a positive integer")
+    iteration_tick_step = int(iteration_tick_step)
+
     if isinstance(min_seeds, bool) or int(min_seeds) != min_seeds or int(min_seeds) < 1:
         raise ValueError("min_seeds must be a positive integer")
     min_seeds = int(min_seeds)
@@ -3155,34 +5278,161 @@ def aggregate_exact_map(
         result_dir = result_dir.expanduser().resolve()
         if not (result_dir / "_SUCCESS_EXACT_MAP").is_file():
             raise ValueError(f"exact-map output is not marked successful: {result_dir}")
+        exact_cfg: Optional[Dict[str, Any]] = None
+        exact_cfg_path = result_dir / "exact_map_config.json"
+        if exact_cfg_path.is_file():
+            loaded_cfg = json.loads(
+                exact_cfg_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(loaded_cfg, Mapping):
+                raise ValueError(
+                    f"{exact_cfg_path}: exact-map config must be an object"
+                )
+            exact_cfg = dict(loaded_cfg)
         for row in read_csv(result_dir / "exact_map_ratios.csv"):
+            required_components = [
+                f"{prefix}_{suffix}"
+                for prefix in ("e_input", "e_map")
+                for suffix in ("value", "vw", "vww", "vy", "vyy", "deriv", "X")
+            ]
+            missing_components = [
+                key for key in required_components
+                if key not in row or str(row[key]).strip() == ""
+            ]
+            if missing_components:
+                raise ValueError(
+                    f"{result_dir}: exact-map component columns are missing/blank: "
+                    f"{missing_components}"
+                )
             parsed: Dict[str, Any] = dict(row)
+            # Compatibility fallback for exact-map outputs generated before
+            # the explicit lower-wealth sweep existed. Their effective
+            # endpoints are already unambiguously stored in log wealth.
+            parsed.setdefault("eval_window_mode", "symmetric-margin")
+            parsed.setdefault(
+                "ev_w_min", math.exp(float(parsed["ev_y_min"]))
+            )
+            parsed.setdefault(
+                "ev_w_max", math.exp(float(parsed["ev_y_max"]))
+            )
+            parsed.setdefault("eval_w_min_requested", "")
+            parsed.setdefault(
+                "eval_w_min_symmetric", parsed["ev_w_min"]
+            )
+            requested_text = str(
+                parsed.get("eval_w_min_requested", "")
+            ).strip()
+            parsed["eval_w_min_requested"] = (
+                None if not requested_text else float(requested_text)
+            )
             for key in (
                 "n_assets", "seed", "market_seed", "source_iter", "target_policy_iter",
                 "local_map_unmodified_on_xfd", "is_verification",
+                "outside_collocation_count_fd",
             ):
                 parsed[key] = int(float(parsed[key]))
             for key in (
-                "horizon", "gamma", "discount", "bequest", "risk_free", "eval_margin",
-                "fd_margin", "e_input_X", "e_map_X", "rho_exact",
+                "horizon", "gamma", "discount", "bequest", "risk_free",
+                "eval_margin", "eval_w_min_symmetric",
+                "ev_y_min", "ev_y_max",
+                "ev_w_min", "ev_w_max",
+                "fd_margin", *required_components, "rho_exact",
                 "rho_sensitivity_envelope", *ACTIVATION_FIELDS, *ELLIPTICITY_FIELDS,
+                "outside_collocation_fraction_fd", "max_linear_residual",
+                "linear_residual_tolerance", "boundary_elimination_cond_inf",
+                "min_linear_system_lu_pivot_ratio",
             ):
                 parsed[key] = float(parsed[key])
+            for key in required_components:
+                if not math.isfinite(float(parsed[key])):
+                    raise ValueError(
+                        f"{result_dir}: exact-map component {key} must be finite"
+                    )
+            if not (
+                math.isclose(
+                    math.log(float(parsed["ev_w_min"])),
+                    float(parsed["ev_y_min"]),
+                    rel_tol=0.0,
+                    abs_tol=5e-12,
+                )
+                and math.isclose(
+                    math.log(float(parsed["ev_w_max"])),
+                    float(parsed["ev_y_max"]),
+                    rel_tol=0.0,
+                    abs_tol=5e-12,
+                )
+            ):
+                raise ValueError(
+                    f"{result_dir}: recorded wealth/log-wealth evaluation "
+                    "endpoints are inconsistent"
+                )
+            if not (
+                float(parsed["ev_w_min"])
+                < float(parsed["ev_w_max"])
+            ):
+                raise ValueError(
+                    f"{result_dir}: evaluation wealth bounds are invalid"
+                )
+            if (
+                not math.isfinite(float(parsed["max_linear_residual"]))
+                or float(parsed["max_linear_residual"])
+                > float(parsed["linear_residual_tolerance"])
+            ):
+                raise ValueError(
+                    f"{result_dir}: linear residual exceeds its recorded hard "
+                    "tolerance"
+                )
             parsed["result_dir"] = str(result_dir)
+            source_protocol_hash = str(parsed["protocol_hash"])
+            parsed["source_protocol_hash"] = source_protocol_hash
+            if exact_cfg is not None:
+                declared_protocol_hash = str(
+                    exact_cfg.get("protocol_hash", "")
+                )
+                if (
+                    declared_protocol_hash
+                    and declared_protocol_hash != source_protocol_hash
+                ):
+                    raise ValueError(
+                        f"{result_dir}: exact-map row/config protocol hash "
+                        "mismatch"
+                    )
+                parsed["protocol_compatibility_hash"] = (
+                    exact_protocol_compatibility_hash(
+                        exact_cfg,
+                        training_group=str(parsed["group"]),
+                    )
+                )
+            else:
+                # Unit-test fixtures and very early pilot outputs may not
+                # carry exact_map_config.json.  Their original producer hash
+                # is the only available protocol evidence.
+                parsed["protocol_compatibility_hash"] = (
+                    source_protocol_hash
+                )
             records.append(parsed)
     if not records:
         raise ValueError("no exact-map primary rows were found")
 
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+    groups: Dict[
+        Tuple[str, str, float, float], List[Dict[str, Any]]
+    ] = {}
     for row in records:
-        groups.setdefault(str(row["group"]), []).append(row)
+        window_key = (
+            str(row["group"]),
+            str(row["eval_window_mode"]),
+            float(row["ev_w_min"]),
+            float(row["ev_w_max"]),
+        )
+        groups.setdefault(window_key, []).append(row)
     expected = set(int(seed) for seed in expected_seeds)
     per_seed_rows: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
     floor_summary_rows: List[Dict[str, Any]] = []
     worst_rows: List[Dict[str, Any]] = []
 
-    for group, group_rows in sorted(groups.items()):
+    for window_key, group_rows in sorted(groups.items()):
+        group = window_key[0]
         seeds = sorted({int(row["seed"]) for row in group_rows})
         if expected and set(seeds) != expected and not allow_incomplete:
             raise ValueError(f"group={group}: exact-map seeds={seeds}, expected={sorted(expected)}")
@@ -3205,10 +5455,50 @@ def aggregate_exact_map(
                 f"group={group}: training seeds do not share one fixed market_seed"
             )
         fixed_market_seed = next(iter(market_seeds))
-        protocols = {str(row["protocol_hash"]) for row in group_rows if int(row["seed"]) in selected}
+        protocols = {
+            str(row["protocol_compatibility_hash"])
+            for row in group_rows
+            if int(row["seed"]) in selected
+        }
         if len(protocols) != 1:
             raise ValueError(f"group={group}: exact-map runs use different FD/evaluation protocols")
         protocol_hash = next(iter(protocols))
+        analysis_modes = {
+            str(row["analysis_mode"])
+            for row in group_rows
+            if int(row["seed"]) in selected
+        }
+        if analysis_modes != {"exact_map_and_e4"} and not allow_incomplete:
+            raise ValueError(
+                f"group={group}: paper aggregation requires "
+                f"analysis_mode=exact_map_and_e4; found {sorted(analysis_modes)}"
+            )
+        extensions = {
+            str(row["policy_extension"])
+            for row in group_rows
+            if int(row["seed"]) in selected
+        }
+        definitions = {
+            str(row["map_definition"])
+            for row in group_rows
+            if int(row["seed"]) in selected
+        }
+        if len(extensions) != 1 or len(definitions) != 1:
+            raise ValueError(
+                f"group={group}: mixed policy extension/map definitions"
+            )
+        policy_extension = next(iter(extensions))
+        map_definition = next(iter(definitions))
+        if (
+            policy_extension != "boundary-projection"
+            or map_definition
+            != "finite_domain_boundary_projected_policy_extension"
+        ) and not allow_neural_extrapolation:
+            raise ValueError(
+                f"group={group}: paper aggregation requires the finite-domain "
+                "boundary-projected policy extension; pass "
+                "--allow-neural-extrapolation only for a documented sensitivity"
+            )
         selections = {
             str(row["checkpoint_selection"])
             for row in group_rows
@@ -3334,6 +5624,17 @@ def aggregate_exact_map(
                     "horizon": source["horizon"],
                     "gamma": source["gamma"],
                     "eval_margin": source["eval_margin"],
+                    "eval_window_mode": source["eval_window_mode"],
+                    "eval_w_min_requested": source[
+                        "eval_w_min_requested"
+                    ],
+                    "eval_w_min_symmetric": source[
+                        "eval_w_min_symmetric"
+                    ],
+                    "ev_y_min": source["ev_y_min"],
+                    "ev_y_max": source["ev_y_max"],
+                    "ev_w_min": source["ev_w_min"],
+                    "ev_w_max": source["ev_w_max"],
                     "network_dtype": source["network_dtype"],
                     "seed": seed,
                     "market_seed": fixed_market_seed,
@@ -3358,6 +5659,19 @@ def aggregate_exact_map(
                     "map_variant": source["map_variant"],
                     "local_map_unmodified_on_xfd": source["local_map_unmodified_on_xfd"],
                     "whole_space_map_claim": source["whole_space_map_claim"],
+                    "analysis_mode": source["analysis_mode"],
+                    "policy_extension": source["policy_extension"],
+                    "map_definition": source["map_definition"],
+                    "outside_collocation_count_fd": source[
+                        "outside_collocation_count_fd"
+                    ],
+                    "outside_collocation_fraction_fd": source[
+                        "outside_collocation_fraction_fd"
+                    ],
+                    "max_linear_residual": source["max_linear_residual"],
+                    "linear_residual_tolerance": source[
+                        "linear_residual_tolerance"
+                    ],
                     "checkpoint_selection": source["checkpoint_selection"],
                     "contraction_status": source["contraction_status"],
                 }
@@ -3416,9 +5730,22 @@ def aggregate_exact_map(
                 "horizon": group_rows[0]["horizon"],
                 "gamma": group_rows[0]["gamma"],
                 "eval_margin": group_rows[0]["eval_margin"],
+                "eval_window_mode": group_rows[0]["eval_window_mode"],
+                "eval_w_min_requested": group_rows[0][
+                    "eval_w_min_requested"
+                ],
+                "eval_w_min_symmetric": group_rows[0][
+                    "eval_w_min_symmetric"
+                ],
+                "ev_y_min": group_rows[0]["ev_y_min"],
+                "ev_y_max": group_rows[0]["ev_y_max"],
+                "ev_w_min": group_rows[0]["ev_w_min"],
+                "ev_w_max": group_rows[0]["ev_w_max"],
                 "network_dtype": group_rows[0]["network_dtype"],
                 "market_seed": fixed_market_seed,
-                "whole_space_map_claim": "not_verified_by_finite_domain",
+                "whole_space_map_claim": group_rows[0]["whole_space_map_claim"],
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
                 "source_iter": outer,
                 "target_policy_iter": outer + 1,
                 "n_seeds": len(selected),
@@ -3453,6 +5780,20 @@ def aggregate_exact_map(
                 ),
                 "map_variants": "|".join(map_variants),
                 "contraction_statuses": "|".join(contraction_statuses),
+                "outside_collocation_fraction_fd_max": max(
+                    float(by_seed[seed][outer][
+                        "outside_collocation_fraction_fd"
+                    ])
+                    for seed in selected
+                ),
+                "max_linear_residual": max(
+                    float(by_seed[seed][outer]["max_linear_residual"])
+                    for seed in selected
+                ),
+                "linear_residual_tolerance": min(
+                    float(by_seed[seed][outer]["linear_residual_tolerance"])
+                    for seed in selected
+                ),
             }
             summary_row.update(activation_maxima)
             summary_rows.append(summary_row)
@@ -3484,9 +5825,22 @@ def aggregate_exact_map(
                 "horizon": group_rows[0]["horizon"],
                 "gamma": group_rows[0]["gamma"],
                 "eval_margin": group_rows[0]["eval_margin"],
+                "eval_window_mode": group_rows[0]["eval_window_mode"],
+                "eval_w_min_requested": group_rows[0][
+                    "eval_w_min_requested"
+                ],
+                "eval_w_min_symmetric": group_rows[0][
+                    "eval_w_min_symmetric"
+                ],
+                "ev_y_min": group_rows[0]["ev_y_min"],
+                "ev_y_max": group_rows[0]["ev_y_max"],
+                "ev_w_min": group_rows[0]["ev_w_min"],
+                "ev_w_max": group_rows[0]["ev_w_max"],
                 "network_dtype": group_rows[0]["network_dtype"],
                 "market_seed": fixed_market_seed,
-                "whole_space_map_claim": "not_verified_by_finite_domain",
+                "whole_space_map_claim": group_rows[0]["whole_space_map_claim"],
+                "policy_extension": policy_extension,
+                "map_definition": map_definition,
                 "source_iter": outer,
                 "target_policy_iter": outer + 1,
                 "n_finite_seeds": len(values),
@@ -3565,9 +5919,22 @@ def aggregate_exact_map(
             "horizon": group_rows[0]["horizon"],
             "gamma": group_rows[0]["gamma"],
             "eval_margin": group_rows[0]["eval_margin"],
+            "eval_window_mode": group_rows[0]["eval_window_mode"],
+            "eval_w_min_requested": group_rows[0][
+                "eval_w_min_requested"
+            ],
+            "eval_w_min_symmetric": group_rows[0][
+                "eval_w_min_symmetric"
+            ],
+            "ev_y_min": group_rows[0]["ev_y_min"],
+            "ev_y_max": group_rows[0]["ev_y_max"],
+            "ev_w_min": group_rows[0]["ev_w_min"],
+            "ev_w_max": group_rows[0]["ev_w_max"],
             "network_dtype": group_rows[0]["network_dtype"],
             "market_seed": fixed_market_seed,
-            "whole_space_map_claim": "not_verified_by_finite_domain",
+            "whole_space_map_claim": group_rows[0]["whole_space_map_claim"],
+            "policy_extension": policy_extension,
+            "map_definition": map_definition,
             "floor_multiple": floor_multiple,
             "n_seeds": len(selected),
             "n_common_iterations": len(common),
@@ -3596,25 +5963,48 @@ def aggregate_exact_map(
             "contraction_statuses": "|".join(sorted({
                 str(row["contraction_status"]) for row in regular_source_rows
             })),
+            "outside_collocation_fraction_fd_max": max(
+                float(row["outside_collocation_fraction_fd"])
+                for row in regular_source_rows
+            ),
+            "max_linear_residual": max(
+                float(row["max_linear_residual"])
+                for row in regular_source_rows
+            ),
+            "linear_residual_tolerance": min(
+                float(row["linear_residual_tolerance"])
+                for row in regular_source_rows
+            ),
         }
         worst_row.update(worst_activation_maxima)
         worst_rows.append(worst_row)
 
     output.mkdir(parents=True, exist_ok=True)
     activation_max_fields = [f"{field}_max" for field in ACTIVATION_FIELDS]
+    evaluation_window_fields = [
+        "eval_margin", "eval_window_mode", "eval_w_min_requested",
+        "eval_w_min_symmetric", "ev_y_min", "ev_y_max", "ev_w_min",
+        "ev_w_max",
+    ]
     per_seed_fields = [
-        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma", "eval_margin",
+        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma",
+        *evaluation_window_fields,
         "network_dtype", "seed", "market_seed", "checkpoint_outer_iter", "source_iter",
         "target_policy_iter", "checkpoint_state_sha256",
         "e_input_X", "e_map_X", "rho_exact", "rho_sensitivity_envelope",
         "floor", "floor_basis", "floor_multiple", "regular", "common_regular", "refinement_status",
         "map_variant", "local_map_unmodified_on_xfd", "whole_space_map_claim",
+        "analysis_mode", "policy_extension", "map_definition",
+        "outside_collocation_count_fd", "outside_collocation_fraction_fd",
+        "max_linear_residual", "linear_residual_tolerance",
         "checkpoint_selection", "contraction_status", *ACTIVATION_FIELDS,
         *ELLIPTICITY_FIELDS,
     ]
     summary_fields = [
-        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma", "eval_margin",
-        "network_dtype", "market_seed", "whole_space_map_claim", "source_iter",
+        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma",
+        *evaluation_window_fields,
+        "network_dtype", "market_seed", "whole_space_map_claim",
+        "policy_extension", "map_definition", "source_iter",
         "target_policy_iter", "n_seeds",
         "rho_exact_mean", "rho_exact_std", "rho_exact_ci95_low", "rho_exact_ci95_high",
         "rho_sensitivity_envelope_mean", "rho_sensitivity_envelope_std",
@@ -3625,11 +6015,15 @@ def aggregate_exact_map(
         "diffusion_variance_min_across_seeds", "diffusion_variance_max_across_seeds",
         "diffusion_variance_ev_min_across_seeds", "diffusion_variance_ev_max_across_seeds",
         "ellipticity_tolerance", "all_seed_diffusion_variance_above_tolerance",
+        "outside_collocation_fraction_fd_max", "max_linear_residual",
+        "linear_residual_tolerance",
         "map_status", "map_variants", "contraction_statuses", *activation_max_fields,
     ]
     worst_fields = [
-        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma", "eval_margin",
-        "network_dtype", "market_seed", "whole_space_map_claim", "floor_multiple",
+        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma",
+        *evaluation_window_fields,
+        "network_dtype", "market_seed", "whole_space_map_claim",
+        "policy_extension", "map_definition", "floor_multiple",
         "n_seeds", "n_common_iterations",
         "max_of_seed_mean_rho_exact", "mean_of_seed_max_rho_exact",
         "std_of_seed_max_rho_exact", "ci95_low_of_seed_max", "ci95_high_of_seed_max",
@@ -3638,6 +6032,8 @@ def aggregate_exact_map(
         "regular_diffusion_variance_min", "regular_diffusion_variance_max",
         "ellipticity_tolerance", "all_regular_diffusion_variance_above_tolerance",
         "all_regular_locally_unmodified_map",
+        "outside_collocation_fraction_fd_max", "max_linear_residual",
+        "linear_residual_tolerance",
         "map_status", "map_variants", "contraction_statuses", *activation_max_fields,
     ]
     # Exact PI-map evidence is a separate FD experiment, not the empirical
@@ -3645,8 +6041,10 @@ def aggregate_exact_map(
     write_csv(output / "exact_map_ratios_by_seed.csv", per_seed_rows, per_seed_fields)
     write_csv(output / "exact_map_ratio_summary.csv", summary_rows, summary_fields)
     write_csv(output / "exact_map_floor_summary.csv", floor_summary_rows, [
-        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma", "eval_margin",
-        "network_dtype", "market_seed", "whole_space_map_claim", "source_iter",
+        "group", "protocol_hash", "problem", "n_assets", "horizon", "gamma",
+        *evaluation_window_fields,
+        "network_dtype", "market_seed", "whole_space_map_claim",
+        "policy_extension", "map_definition", "source_iter",
         "target_policy_iter", "n_finite_seeds",
         "n_requested_seeds", "rho_exact_mean", "rho_exact_std", "floor_dominated",
         "map_status", "map_variants", "contraction_statuses", *activation_max_fields,
@@ -3662,6 +6060,64 @@ def aggregate_exact_map(
         "require_locally_unmodified_map": require_locally_unmodified_map,
         "ellipticity_tolerance": ellipticity_tolerance,
         "allow_degenerate_diffusion": allow_degenerate_diffusion,
+        "allow_neural_extrapolation": allow_neural_extrapolation,
+        "plot": {
+            "enabled": bool(make_plot),
+            "formats": list(resolved_plot_formats),
+            "x_scale": "linear",
+            "y_scale": "log",
+            "x_label": "Iteration",
+            "y_label": r"Exact-map ratio $\varrho_n^{\mathrm{FD}}$",
+            "series_label": r"Exact-map ratio $\varrho_n^{\mathrm{FD}}$",
+            "line_style": "solid",
+            "aggregation_band": "pointwise seed mean plus/minus one sample SD",
+            "floor_filter_used": bool(float(floor_multiple) > 0.0),
+            "eligibility_definition": (
+                "all finite exact-map ratios"
+                if float(floor_multiple) == 0.0
+                else (
+                    "strict e_n > floor_multiple times the late "
+                    "neural-input-error scale"
+                )
+            ),
+            # Retained as an empty compatibility field. Eligibility is an
+            # audit/filtering property, not the plotted series name.
+            "eligible_label": "",
+            "floor_dominated_label": (
+                "Floor-dominated" if float(floor_multiple) > 0.0 else ""
+            ),
+            "contraction_threshold": 1.0,
+            "legend_location": "inside upper right",
+            "legend_bbox_to_anchor": [0.98, 0.92],
+            "dpi": int(dpi),
+            "fig_width": float(fig_width),
+            "fig_height": float(fig_height),
+            "font_size": float(font_size),
+            "font_family": str(font_family),
+            "line_width": float(line_width),
+            "line_alpha": float(line_alpha),
+            "marker_size": float(marker_size),
+            "band_alpha": float(band_alpha),
+            "iteration_tick_step": iteration_tick_step,
+            "iteration_ticks": list(
+                range(
+                    0,
+                    max(int(row["source_iter"]) for row in summary_rows) + 1,
+                    iteration_tick_step,
+                )
+            ),
+            "grid_alpha": float(grid_alpha),
+            "floor_alpha": float(floor_alpha),
+            "bbox_inches": str(bbox_inches),
+        },
+        "evaluation_windows": sorted({
+            (
+                str(row["eval_window_mode"]),
+                float(row["ev_w_min"]),
+                float(row["ev_w_max"]),
+            )
+            for row in records
+        }),
     })
 
     if make_plot:
@@ -3669,56 +6125,166 @@ def aggregate_exact_map(
 
         matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
+        from matplotlib.colors import to_rgb
 
-        fig, ax = plt.subplots(figsize=(6.5, 4.2))
-        for group in sorted({str(row["group"]) for row in summary_rows}):
-            plot_rows = sorted(
-                [row for row in summary_rows if str(row["group"]) == group],
-                key=lambda row: int(row["source_iter"]),
-            )
-            x = np.asarray([row["source_iter"] for row in plot_rows], dtype=float)
-            mean = np.asarray([row["rho_exact_mean"] for row in plot_rows], dtype=float)
-            std = np.asarray([row["rho_exact_std"] for row in plot_rows], dtype=float)
-            n_assets = int(plot_rows[0]["n_assets"])
-            gamma = float(plot_rows[0]["gamma"])
-            locally_unmodified = all(
-                int(row["all_seed_locally_unmodified_map"]) for row in plot_rows
-            )
-            map_label = (
-                "sampled G locally unmodified"
-                if locally_unmodified
-                else "implemented G (sampled modification active)"
-            )
-            ax.plot(
-                x, mean, marker="o", markersize=3.0, linewidth=1.5,
-                label=f"Merton, N={n_assets}, gamma={gamma:g}; {map_label}",
-            )
-            ax.fill_between(x, mean - std, mean + std, alpha=0.2)
-            floor_rows = sorted(
-                [row for row in floor_summary_rows if str(row["group"]) == group],
-                key=lambda row: int(row["source_iter"]),
-            )
-            if floor_rows:
-                ax.scatter(
-                    [row["source_iter"] for row in floor_rows],
-                    [row["rho_exact_mean"] for row in floor_rows],
-                    marker="x", s=24, color="0.55", alpha=0.8,
-                    label="optional late-scale filter" if group == sorted({str(r["group"]) for r in summary_rows})[0] else "_nolegend_",
+        def blend_on_white(color: Any, alpha: float) -> Tuple[float, float, float]:
+            rgb = np.asarray(to_rgb(color), dtype=float)
+            return tuple(float(value) for value in alpha * rgb + (1.0 - alpha))
+
+        groups = sorted({str(row["group"]) for row in summary_rows})
+        rc_params: Dict[str, Any] = {"font.size": float(font_size)}
+        if str(font_family).strip():
+            rc_params["font.family"] = str(font_family).strip()
+        save_bbox = "tight" if bbox_inches == "tight" else None
+
+        for current_format in resolved_plot_formats:
+            eps_compatible = current_format == "eps"
+            with matplotlib.rc_context(rc_params):
+                fig, ax = plt.subplots(
+                    figsize=(float(fig_width), float(fig_height))
                 )
-        ax.axhline(1.0, color="black", linestyle="--", linewidth=1.1)
-        ax.set_xlabel(r"Paper source iteration $n$")
-        ax.set_ylabel(r"$\widehat{\rho}^{\mathrm{exact}}_n$")
-        ax.grid(True, alpha=0.3)
-        ax.legend(frameon=False)
-        fig.savefig(output / f"exact_map_contraction.{plot_format}", dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
+                blue = "#0072B2"
+                for group in groups:
+                    plot_rows = sorted(
+                        [
+                            row for row in summary_rows
+                            if str(row["group"]) == group
+                        ],
+                        key=lambda row: int(row["source_iter"]),
+                    )
+                    x = np.asarray(
+                        [row["source_iter"] for row in plot_rows], dtype=float
+                    )
+                    mean = np.asarray(
+                        [row["rho_exact_mean"] for row in plot_rows], dtype=float
+                    )
+                    std = np.asarray(
+                        [row["rho_exact_std"] for row in plot_rows], dtype=float
+                    )
+                    (line,) = ax.plot(
+                        x,
+                        mean,
+                        color=blue,
+                        linestyle="-",
+                        marker="o",
+                        markersize=float(marker_size),
+                        linewidth=float(line_width),
+                        alpha=1.0 if eps_compatible else float(line_alpha),
+                        label=(
+                            r"Exact-map ratio $\varrho_n^{\mathrm{FD}}$"
+                            if group == groups[0]
+                            else "_nolegend_"
+                        ),
+                    )
+                    line_color = line.get_color()
+                    if eps_compatible and line_alpha < 1.0:
+                        line.set_color(blend_on_white(line_color, line_alpha))
+                    lower = np.where(mean - std > 0.0, mean - std, np.nan)
+                    ax.fill_between(
+                        x,
+                        lower,
+                        mean + std,
+                        color=(
+                            blend_on_white(line_color, band_alpha)
+                            if eps_compatible
+                            else line_color
+                        ),
+                        alpha=1.0 if eps_compatible else float(band_alpha),
+                    )
+                    floor_rows = sorted(
+                        [
+                            row for row in floor_summary_rows
+                            if str(row["group"]) == group
+                        ],
+                        key=lambda row: int(row["source_iter"]),
+                    )
+                    if floor_rows:
+                        ax.scatter(
+                            [row["source_iter"] for row in floor_rows],
+                            [row["rho_exact_mean"] for row in floor_rows],
+                            marker="x",
+                            s=24,
+                            color=(
+                                blend_on_white("0.55", floor_alpha)
+                                if eps_compatible
+                                else "0.55"
+                            ),
+                            alpha=1.0 if eps_compatible else float(floor_alpha),
+                            label=(
+                                "Floor-dominated"
+                                if group == groups[0]
+                                else "_nolegend_"
+                            ),
+                        )
+                ax.axhline(
+                    1.0,
+                    color="black",
+                    linestyle="--",
+                    linewidth=max(1.0, 0.8 * float(line_width)),
+                    label="Contraction threshold",
+                )
+                ax.set_yscale("log", nonpositive="clip")
+                ax.set_xlabel("Iteration")
+                ax.set_ylabel(r"Exact-map ratio $\varrho_n^{\mathrm{FD}}$")
+                ax.set_xticks(
+                    np.arange(
+                        0,
+                        max(
+                            int(row["source_iter"])
+                            for row in summary_rows
+                        ) + 1,
+                        iteration_tick_step,
+                        dtype=int,
+                    )
+                )
+                if eps_compatible:
+                    ax.grid(
+                        True,
+                        color=blend_on_white("black", grid_alpha),
+                        alpha=1.0,
+                        which="both",
+                        linewidth=0.6,
+                    )
+                else:
+                    ax.grid(
+                        True,
+                        alpha=float(grid_alpha),
+                        which="both",
+                        linewidth=0.6,
+                    )
+                ax.tick_params(axis="both", labelsize=0.9 * float(font_size))
+                legend_font: Dict[str, Any] = {
+                    "size": 0.8 * float(font_size)
+                }
+                if str(font_family).strip():
+                    legend_font["family"] = str(font_family).strip()
+                ax.legend(
+                    frameon=False,
+                    loc="upper right",
+                    bbox_to_anchor=(0.98, 0.92),
+                    borderaxespad=0.0,
+                    prop=legend_font,
+                )
+                fig.tight_layout()
+                fig.savefig(
+                    output / f"exact_map_contraction.{current_format}",
+                    dpi=int(dpi),
+                    bbox_inches=save_bbox,
+                )
+                plt.close(fig)
 
 
 def discover_result_dirs(root: Path) -> List[Path]:
+    root = root.expanduser().resolve()
     return sorted(
         path.parent
-        for path in root.expanduser().resolve().rglob("_SUCCESS_EXACT_MAP")
-        if (path.parent / "exact_map_ratios.csv").is_file()
+        for path in root.rglob("_SUCCESS_EXACT_MAP")
+        if (
+            "stale_outputs" not in path.relative_to(root).parts
+            and (path.parent / "exact_map_ratios.csv").is_file()
+            and (path.parent / "exact_map_config.json").is_file()
+            and (path.parent / "exact_map_status.json").is_file()
+        )
     )
 
 
@@ -3858,6 +6424,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-name-regex", default="")
     parser.add_argument("--weight-dir", default="", help="Override weight directory (single --run-dir only).")
     parser.add_argument("--checkpoint", action="append", default=[], help="Explicit value_net_iterNNNN.pt (single run only).")
+    parser.add_argument(
+        "--checkpoints",
+        default="",
+        help=(
+            "Exploratory comma-separated outer indices, e.g. 1,5,10,15,20. "
+            "Arbitrary sparse subsets require --skip-e4."
+        ),
+    )
     parser.add_argument("--output", default="", help="Single-run output; default <run-dir>/exact_map_fd.")
     parser.add_argument("--aggregate-output", default="", help="Default <out-root>/exact_map_paper.")
     parser.add_argument("--aggregate-only", action="store_true")
@@ -3889,6 +6463,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--eval-margin", type=float, default=None)
+    parser.add_argument(
+        "--eval-w-mins",
+        default="",
+        help=(
+            "Optional absolute lower endpoint(s) for Q_ev in wealth "
+            "coordinates, as a comma/space-separated list. Each value must "
+            "remain within the saved training wealth interval and below the "
+            "upper endpoint implied by --eval-margin. The upper endpoint, FD "
+            "domains, checkpoints, and trained network are unchanged. Every "
+            "explicit value is written to a separate "
+            "eval_w_min_<value>/ result directory."
+        ),
+    )
+    parser.add_argument(
+        "--skip-e4",
+        action="store_true",
+        help=(
+            "Exact-map-only pilot mode. It permits sparse --checkpoints and "
+            "is never paper-aggregation eligible."
+        ),
+    )
 
     parser.add_argument("--base-ny", type=int, default=401)
     parser.add_argument("--base-nt", type=int, default=400)
@@ -3917,11 +6512,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Extra h/domain/boundary variants for exact ratios and adjacent "
             "E4 defects: all, none, first/middle/last, or explicit outer "
-            "indices. delta_0 is always verified; paper E4 aggregation "
-            "requires delta_0 plus first/last/worst adjacent evidence."
+            "indices. The first available defect is always verified (delta_0 "
+            "for standard runs, delta_1 for E6 target branches); paper E4 "
+            "aggregation requires first/last/worst defect evidence."
         ),
     )
-    parser.add_argument("--drift-scheme", choices=("central", "adaptive", "monotone"), default="adaptive")
+    parser.add_argument(
+        "--drift-scheme",
+        choices=("central", "adaptive", "monotone"),
+        default="central",
+    )
     parser.add_argument("--peclet-limit", type=float, default=1.0)
     parser.add_argument("--theta-method", type=float, default=0.5)
     parser.add_argument(
@@ -3931,6 +6531,37 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Initial full-dt backward-Euler damping steps; this is not the "
             "classical two-half-step Rannacher construction."
+        ),
+    )
+    parser.add_argument(
+        "--linear-residual-tolerance",
+        type=float,
+        default=1e-8,
+        help="Hard upper bound for every normalized tridiagonal solve residual.",
+    )
+    parser.add_argument(
+        "--boundary-condition-limit",
+        type=float,
+        default=1e12,
+        help="Hard upper bound for the lateral-boundary elimination condition number.",
+    )
+    parser.add_argument(
+        "--solver-ellipticity-tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Require every FD-sampled pi^T Sigma pi to be strictly above this "
+            "solver-level threshold."
+        ),
+    )
+    parser.add_argument(
+        "--policy-extension",
+        choices=POLICY_EXTENSIONS,
+        default="boundary-projection",
+        help=(
+            "Define the frozen policy outside saved nominal collocation "
+            "bounds. boundary-projection is the finite-domain primary; "
+            "neural-extrapolation is sensitivity-only."
         ),
     )
     parser.add_argument("--denominator-tolerance", type=float, default=1e-12)
@@ -3992,9 +6623,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-degenerate-diffusion", action="store_true",
         help="Exploratory only: do not reject regular rows at/below the ellipticity tolerance.",
     )
+    parser.add_argument(
+        "--allow-neural-extrapolation",
+        action="store_true",
+        help=(
+            "Exploratory aggregation only: permit raw neural-extrapolation "
+            "finite-domain maps instead of the boundary-projected primary."
+        ),
+    )
     parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument("--format", choices=("png", "pdf", "svg", "eps"), default="png")
+    parser.add_argument(
+        "--formats",
+        default="",
+        help=(
+            "Comma/space-separated figure formats, e.g. png,eps. "
+            "Default: png."
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        choices=SUPPORTED_PLOT_FORMATS,
+        default="",
+        help=(
+            "Legacy single-format option. Use --formats for new commands; "
+            "it cannot be combined with --formats."
+        ),
+    )
     parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--fig-width", type=float, default=6.0)
+    parser.add_argument("--fig-height", type=float, default=4.0)
+    parser.add_argument("--font-size", type=float, default=12.0)
+    parser.add_argument("--font-family", default="")
+    parser.add_argument("--line-width", type=float, default=1.8)
+    parser.add_argument("--line-alpha", type=float, default=1.0)
+    parser.add_argument("--marker-size", type=float, default=4.0)
+    parser.add_argument("--band-alpha", type=float, default=0.18)
+    parser.add_argument(
+        "--iteration-tick-step",
+        type=int,
+        default=3,
+        help=(
+            "Spacing between integer iteration ticks in exact-map figures "
+            "(default: 3)."
+        ),
+    )
+    parser.add_argument("--grid-alpha", type=float, default=0.3)
+    parser.add_argument("--floor-alpha", type=float, default=0.8)
+    parser.add_argument(
+        "--bbox-inches",
+        choices=("tight", "standard"),
+        default="tight",
+    )
     return parser
 
 
@@ -4004,6 +6683,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.self_test:
         return run_self_test()
 
+    try:
+        plot_formats = resolve_plot_formats(args.formats, args.format)
+    except ValueError as exc:
+        parser.error(str(exc))
+    plot_kwargs = {
+        "plot_formats": plot_formats,
+        "dpi": args.dpi,
+        "fig_width": args.fig_width,
+        "fig_height": args.fig_height,
+        "font_size": args.font_size,
+        "font_family": args.font_family,
+        "line_width": args.line_width,
+        "line_alpha": args.line_alpha,
+        "marker_size": args.marker_size,
+        "band_alpha": args.band_alpha,
+        "iteration_tick_step": args.iteration_tick_step,
+        "grid_alpha": args.grid_alpha,
+        "floor_alpha": args.floor_alpha,
+        "bbox_inches": args.bbox_inches,
+    }
+    try:
+        if args.iteration_tick_step < 1:
+            raise ValueError(
+                "--iteration-tick-step must be a positive integer"
+            )
+        validate_plot_options(
+            dpi=args.dpi,
+            fig_width=args.fig_width,
+            fig_height=args.fig_height,
+            font_size=args.font_size,
+            line_width=args.line_width,
+            line_alpha=args.line_alpha,
+            marker_size=args.marker_size,
+            band_alpha=args.band_alpha,
+            grid_alpha=args.grid_alpha,
+            floor_alpha=args.floor_alpha,
+            bbox_inches=args.bbox_inches,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     expected_seeds = parse_seed_spec(args.expected_seeds)
     if args.aggregate_only:
         if args.result_dir:
@@ -4032,11 +6751,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             allow_unverified=args.allow_unverified,
             require_locally_unmodified_map=args.require_locally_unmodified_map,
             make_plot=not args.no_plot,
-            plot_format=args.format,
-            dpi=args.dpi,
             min_seeds=args.min_seeds,
             ellipticity_tolerance=args.ellipticity_tolerance,
             allow_degenerate_diffusion=args.allow_degenerate_diffusion,
+            allow_neural_extrapolation=args.allow_neural_extrapolation,
+            **plot_kwargs,
         )
         print(f"[done] exact-map aggregate: {aggregate_output}")
         return 0
@@ -4049,65 +6768,134 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("provide --run-dir, --out-root, --aggregate-only, or --self-test")
     if not run_dirs:
         raise SystemExit("no structured Merton PI-PINN runs were found")
-    if (args.weight_dir or args.checkpoint or args.output) and len(run_dirs) != 1:
-        parser.error("--weight-dir, --checkpoint, and --output require exactly one --run-dir")
+    if args.checkpoint and args.checkpoints:
+        parser.error("--checkpoint and --checkpoints are mutually exclusive")
+    if (
+        args.weight_dir or args.checkpoint or args.checkpoints or args.output
+    ) and len(run_dirs) != 1:
+        parser.error(
+            "--weight-dir, --checkpoint, --checkpoints, and --output require "
+            "exactly one --run-dir"
+        )
 
     grid_factors = parse_int_list(args.grid_factors)
     fd_margins = parse_float_list(args.fd_margins)
     boundaries = [item.strip() for item in args.boundaries.split(",") if item.strip()]
+    if args.eval_w_mins.strip():
+        eval_w_min_values = parse_float_list(args.eval_w_mins)
+        if any(
+            not math.isfinite(value) or value <= 0.0
+            for value in eval_w_min_values
+        ):
+            parser.error("--eval-w-mins values must be finite and positive")
+        if len(set(eval_w_min_values)) != len(eval_w_min_values):
+            parser.error("--eval-w-mins values must be unique")
+        output_names = [
+            eval_w_min_output_name(value) for value in eval_w_min_values
+        ]
+        if len(set(output_names)) != len(output_names):
+            parser.error(
+                "--eval-w-mins values map to non-unique output directory names"
+            )
+        eval_w_min_overrides: List[Optional[float]] = list(eval_w_min_values)
+    else:
+        eval_w_min_overrides = [None]
     result_dirs: List[Path] = []
     for run_dir in run_dirs:
-        output = (
+        output_base = (
             Path(args.output).expanduser().resolve()
             if args.output
             else run_dir / "exact_map_fd"
         )
-        result_dirs.append(output)
-        try:
-            run = load_run_spec(
-                run_dir,
-                explicit_checkpoints=[Path(value) for value in args.checkpoint],
-                weight_dir_override=Path(args.weight_dir) if args.weight_dir else None,
-                policy_mode_override=args.policy_mode,
-                time_coordinate_override=args.network_time_coordinate,
-                eval_margin_override=args.eval_margin,
-                network_dtype=args.network_dtype,
+        for eval_w_min_override in eval_w_min_overrides:
+            output = (
+                output_base
+                if eval_w_min_override is None
+                else output_base / eval_w_min_output_name(
+                    eval_w_min_override
+                )
             )
-            evaluate_run(
-                run,
-                output,
-                device=args.device,
-                base_ny=args.base_ny,
-                base_nt=args.base_nt,
-                eval_ny=args.eval_ny,
-                grid_factors=grid_factors,
-                fd_margins=fd_margins,
-                boundaries=boundaries,
-                verify_checkpoints=args.verify_checkpoints,
-                drift_scheme=args.drift_scheme,
-                peclet_limit=args.peclet_limit,
-                theta_method=args.theta_method,
-                rannacher_steps=args.rannacher_steps,
-                denominator_tolerance=args.denominator_tolerance,
-                refinement_abs_tolerance=args.refinement_abs_tolerance,
-                refinement_rel_tolerance=args.refinement_rel_tolerance,
-            )
-            print(f"[done] exact-map run: {output}")
-        except Exception as exc:
-            output.mkdir(parents=True, exist_ok=True)
-            success_marker = output / "_SUCCESS_EXACT_MAP"
-            if success_marker.exists():
-                success_marker.unlink()
-            marker = output / "_FAILED_EXACT_MAP"
-            marker.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
-            atomic_json(output / "exact_map_status.json", {
-                "status": "failed",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            })
-            raise
+            result_dirs.append(output)
+            try:
+                run = load_run_spec(
+                    run_dir,
+                    explicit_checkpoints=[
+                        Path(value) for value in args.checkpoint
+                    ],
+                    weight_dir_override=(
+                        Path(args.weight_dir) if args.weight_dir else None
+                    ),
+                    policy_mode_override=args.policy_mode,
+                    time_coordinate_override=args.network_time_coordinate,
+                    eval_margin_override=args.eval_margin,
+                    eval_w_min_override=eval_w_min_override,
+                    network_dtype=args.network_dtype,
+                )
+                if args.checkpoints:
+                    requested = set(parse_int_list(args.checkpoints))
+                    available = {
+                        int(outer): path for outer, path in run.checkpoints
+                    }
+                    missing = sorted(requested - set(available))
+                    if missing:
+                        raise ValueError(
+                            "requested checkpoint outer indices are "
+                            f"unavailable: {missing}"
+                        )
+                    run.checkpoints = [
+                        (outer, available[outer])
+                        for outer in sorted(requested)
+                    ]
+                    run.checkpoint_selection = "explicit_subset"
+                evaluate_run(
+                    run,
+                    output,
+                    device=args.device,
+                    base_ny=args.base_ny,
+                    base_nt=args.base_nt,
+                    eval_ny=args.eval_ny,
+                    grid_factors=grid_factors,
+                    fd_margins=fd_margins,
+                    boundaries=boundaries,
+                    verify_checkpoints=args.verify_checkpoints,
+                    drift_scheme=args.drift_scheme,
+                    peclet_limit=args.peclet_limit,
+                    theta_method=args.theta_method,
+                    rannacher_steps=args.rannacher_steps,
+                    denominator_tolerance=args.denominator_tolerance,
+                    refinement_abs_tolerance=args.refinement_abs_tolerance,
+                    refinement_rel_tolerance=args.refinement_rel_tolerance,
+                    policy_extension=args.policy_extension,
+                    linear_residual_tolerance=(
+                        args.linear_residual_tolerance
+                    ),
+                    boundary_condition_limit=args.boundary_condition_limit,
+                    solver_ellipticity_tolerance=(
+                        args.solver_ellipticity_tolerance
+                    ),
+                    skip_e4=args.skip_e4,
+                )
+                print(f"[done] exact-map run: {output}")
+            except Exception as exc:
+                output.mkdir(parents=True, exist_ok=True)
+                # Preserve any prior or partially generated evidence under a
+                # noncanonical audit path.  A failed attempt therefore
+                # exposes no stale CSV/NPZ that could be mistaken for output.
+                _quarantine_previous_outputs(output)
+                marker = output / "_FAILED_EXACT_MAP"
+                marker.write_text(
+                    f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+                )
+                atomic_json(output / "exact_map_status.json", {
+                    "status": "failed",
+                    "eval_w_min_requested": eval_w_min_override,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
+                raise
 
-    if len(result_dirs) > 1 or args.out_root:
+    should_auto_aggregate = len(run_dirs) > 1 or bool(args.out_root)
+    if should_auto_aggregate and not args.skip_e4:
         aggregate_output = (
             Path(args.aggregate_output).expanduser().resolve()
             if args.aggregate_output
@@ -4122,13 +6910,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             allow_unverified=args.allow_unverified,
             require_locally_unmodified_map=args.require_locally_unmodified_map,
             make_plot=not args.no_plot,
-            plot_format=args.format,
-            dpi=args.dpi,
             min_seeds=args.min_seeds,
             ellipticity_tolerance=args.ellipticity_tolerance,
             allow_degenerate_diffusion=args.allow_degenerate_diffusion,
+            allow_neural_extrapolation=args.allow_neural_extrapolation,
+            **plot_kwargs,
         )
         print(f"[done] exact-map aggregate: {aggregate_output}")
+    elif args.skip_e4 and should_auto_aggregate:
+        print(
+            "[pilot] --skip-e4 outputs were generated without paper aggregation"
+        )
     return 0
 
 

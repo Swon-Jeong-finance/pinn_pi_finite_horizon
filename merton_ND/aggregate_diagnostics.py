@@ -16,7 +16,8 @@ Merton-specific manuscript mapping
 
 The Kim--Omberg-only quantities ``m_ww``, ``M_num``, and
 ``M_num/(w_min*m_ww)`` are deliberately not fabricated for Merton.  Their
-not-applicable status is written to ``e1_diagnostics_coverage.csv``.
+not-applicable status is written to the outer-window-specific
+``e1_diagnostics_coverage_outer_ge_*.csv`` artifact.
 """
 from __future__ import annotations
 
@@ -209,6 +210,10 @@ class RunSummary:
     outer_first: int
     outer_last: int
     n_outer_rows: int
+    outer_min: int
+    outer_used_first: int
+    outer_used_last: int
+    n_outer_rows_used: int
     metrics: Dict[str, float]
     sources: Dict[str, str]
 
@@ -267,7 +272,11 @@ def _summarize_run(
     status: str,
     *,
     allow_incomplete: bool,
+    outer_min: int = 1,
 ) -> RunSummary:
+    outer_min = int(outer_min)
+    if outer_min < 1:
+        raise ValueError(f"outer_min must be at least 1, got {outer_min}")
     model = str(config.get("model_type", ""))
     specs = metric_specs(model)
     rows = _read_outer_rows(run_dir)
@@ -300,12 +309,24 @@ def _summarize_run(
     if int(config.get("diag_every", 1) or 1) != 1 and not allow_incomplete:
         raise ValueError("paper E1 requires diag_every=1 (every outer iteration)")
 
+    eligible = [
+        (iteration, row)
+        for iteration, row in zip(outer, rows)
+        if iteration >= outer_min
+    ]
+    if not eligible:
+        raise ValueError(
+            f"no qualifying E1 rows for outer_min={outer_min}; "
+            f"run contains outer iterations 1..{outer[-1]}"
+        )
+    n_eligible = len(eligible)
+
     reduced: Dict[str, float] = {}
     sources: Dict[str, str] = {}
     missing: List[str] = []
     for metric, spec in specs.items():
         vals: List[float] = []
-        for iteration, row in zip(outer, rows):
+        for iteration, row in eligible:
             raw = row.get(spec.source, "")
             if str(raw).strip() == "":
                 missing.append(f"outer={iteration}:{spec.source}")
@@ -314,7 +335,7 @@ def _summarize_run(
                 vals.append(_finite(raw, label=f"outer={iteration}:{spec.source}"))
             except ValueError as exc:
                 missing.append(str(exc))
-        if len(vals) != len(rows):
+        if len(vals) != n_eligible:
             continue
         reduced[metric] = min(vals) if spec.reducer == "min" else max(vals)
         sources[metric] = spec.source
@@ -349,6 +370,10 @@ def _summarize_run(
         outer_first=outer[0],
         outer_last=outer[-1],
         n_outer_rows=len(outer),
+        outer_min=outer_min,
+        outer_used_first=eligible[0][0],
+        outer_used_last=eligible[-1][0],
+        n_outer_rows_used=n_eligible,
         metrics=reduced,
         sources=sources,
     )
@@ -381,8 +406,12 @@ def aggregate_diagnostics(
     include_stopped: bool = False,
     allow_incomplete: bool = False,
     strict_market_snapshots: bool = False,
+    outer_min: int = 1,
 ) -> Dict[str, str]:
     """Validate, aggregate, and write E1 artifacts; raise on paper-contract errors."""
+    outer_min = int(outer_min)
+    if outer_min < 1:
+        raise ValueError(f"outer_min must be at least 1, got {outer_min}")
     out_root = os.path.abspath(out_root)
     output = os.path.abspath(output or os.path.join(out_root, "diagnostic_summary"))
     os.makedirs(output, exist_ok=True)
@@ -405,6 +434,7 @@ def aggregate_diagnostics(
             index_rows.append({
                 "run_dir": os.path.relpath(run_dir, out_root), "selected": 0,
                 "used": 0, "reason": "timing_mode_excluded",
+                "outer_min": outer_min,
             })
             continue
         status = run_status(run_dir)
@@ -437,6 +467,7 @@ def aggregate_diagnostics(
             "group": group, "model_type": model, "n_assets": config.get("n_assets"),
             "seed": seed, "status": status, "selected": 1, "used": int(used),
             "reason": "" if used else "status_not_accepted",
+            "outer_min": outer_min,
         }
         index_rows.append(idx)
         if not used:
@@ -449,7 +480,8 @@ def aggregate_diagnostics(
                 errors.append(f"{run_dir}: invalid market_params.npz: {exc}")
         try:
             summaries.append(_summarize_run(
-                run_dir, config, status, allow_incomplete=allow_incomplete))
+                run_dir, config, status, allow_incomplete=allow_incomplete,
+                outer_min=outer_min))
         except Exception as exc:
             idx["used"] = 0
             idx["reason"] = f"diagnostic_validation_failed: {exc}"
@@ -501,6 +533,10 @@ def aggregate_diagnostics(
             "run_dir": os.path.relpath(run.run_dir, out_root),
             "outer_first": run.outer_first, "outer_last": run.outer_last,
             "n_outer_rows": run.n_outer_rows,
+            "outer_min": run.outer_min,
+            "outer_used_first": run.outer_used_first,
+            "outer_used_last": run.outer_used_last,
+            "n_outer_rows_used": run.n_outer_rows_used,
             "policy_bounds_mode": run.config.get("policy_bounds_mode", ""),
             "diag_points": run.config.get("diag_points", ""),
             "diag_margin": primary_diag_margin(run.config),
@@ -518,12 +554,14 @@ def aggregate_diagnostics(
         table: Dict[str, Any] = {
             "group": group, "model_type": model, "n_assets": runs[0].n_assets,
             "n_seeds": len(runs), "seeds": ",".join(str(run.seed) for run in runs),
+            "outer_min": outer_min,
             "policy_bounds_mode": runs[0].config.get("policy_bounds_mode", ""),
         }
         for metric, spec in specs.items():
             available = [run for run in runs if metric in run.metrics]
             coverage_rows.append({
                 "group": group, "model_type": model, "n_assets": runs[0].n_assets,
+                "outer_min": outer_min,
                 "concept": metric, "status": (
                     "available" if len(available) == len(runs) else "incomplete"),
                 "source": spec.source, "scope": spec.scope,
@@ -540,6 +578,7 @@ def aggregate_diagnostics(
             paper_extreme = min(values) if spec.reducer == "min" else max(values)
             long_rows.append({
                 "group": group, "model_type": model, "n_assets": runs[0].n_assets,
+                "outer_min": outer_min,
                 "metric": metric, "source": spec.source, "scope": spec.scope,
                 "outer_reducer": spec.reducer, "setting_reducer": spec.reducer,
                 "n_seeds": len(values), "seeds": ",".join(str(run.seed) for run in runs),
@@ -562,11 +601,13 @@ def aggregate_diagnostics(
         ):
             coverage_rows.append({
                 "group": group, "model_type": model, "n_assets": runs[0].n_assets,
+                "outer_min": outer_min,
                 "concept": concept, "status": "not_applicable_merton",
                 "source": "", "scope": "", "note": note,
             })
         coverage_rows.append({
             "group": group, "model_type": model, "n_assets": runs[0].n_assets,
+            "outer_min": outer_min,
             "concept": "vartheta_per_asset_component_ranges",
             "status": "not_recorded",
             "source": "pi_component_min/max_*",
@@ -577,39 +618,52 @@ def aggregate_diagnostics(
         })
         table_rows.append(table)
 
+    outer_suffix = f"_outer_ge_{outer_min}"
     paths = {
-        "runs_index": os.path.join(output, "e1_runs_index.csv"),
-        "per_run": os.path.join(output, "e1_diagnostics_per_run.csv"),
-        "summary_long": os.path.join(output, "e1_diagnostics_summary_long.csv"),
-        "table": os.path.join(output, "e1_diagnostics_table.csv"),
-        "coverage": os.path.join(output, "e1_diagnostics_coverage.csv"),
-        "metadata": os.path.join(output, "e1_diagnostics_metadata.json"),
-        "settings": os.path.join(output, "e1_diagnostics_settings.json"),
+        "runs_index": os.path.join(
+            output, f"e1_runs_index{outer_suffix}.csv"),
+        "per_run": os.path.join(
+            output, f"e1_diagnostics_per_run{outer_suffix}.csv"),
+        "summary_long": os.path.join(
+            output, f"e1_diagnostics_summary_long{outer_suffix}.csv"),
+        "table": os.path.join(
+            output, f"e1_diagnostics_table{outer_suffix}.csv"),
+        "coverage": os.path.join(
+            output, f"e1_diagnostics_coverage{outer_suffix}.csv"),
+        "metadata": os.path.join(
+            output, f"e1_diagnostics_metadata{outer_suffix}.json"),
+        "settings": os.path.join(
+            output, f"e1_diagnostics_settings{outer_suffix}.json"),
     }
     index_fields = [
         "run_dir", "updated_at", "group", "model_type", "n_assets", "seed",
-        "status", "selected", "used", "reason",
+        "status", "selected", "used", "reason", "outer_min",
     ]
     per_run_fields = [
         "group", "model_type", "n_assets", "seed", "status", "run_dir",
-        "outer_first", "outer_last", "n_outer_rows", "policy_bounds_mode",
+        "outer_first", "outer_last", "n_outer_rows", "outer_min",
+        "outer_used_first", "outer_used_last", "n_outer_rows_used",
+        "policy_bounds_mode",
         "diag_points", "diag_margin", *metric_names,
     ]
     long_fields = [
-        "group", "model_type", "n_assets", "metric", "source", "scope",
+        "group", "model_type", "n_assets", "outer_min",
+        "metric", "source", "scope",
         "outer_reducer", "setting_reducer", "n_seeds", "seeds",
         "paper_extreme_across_seed_outer", "seed_extrema_mean", "seed_extrema_std",
         "seed_extrema_sem", "seed_extrema_ci95_lo", "seed_extrema_ci95_hi",
         "description",
     ]
     table_metric_names = sorted({key for row in table_rows for key in row if key not in {
-        "group", "model_type", "n_assets", "n_seeds", "seeds", "policy_bounds_mode"}})
+        "group", "model_type", "n_assets", "n_seeds", "seeds",
+        "outer_min", "policy_bounds_mode"}})
     table_fields = [
         "group", "model_type", "n_assets", "n_seeds", "seeds",
-        "policy_bounds_mode", *table_metric_names,
+        "outer_min", "policy_bounds_mode", *table_metric_names,
     ]
     coverage_fields = [
-        "group", "model_type", "n_assets", "concept", "status", "source", "scope", "note",
+        "group", "model_type", "n_assets", "outer_min",
+        "concept", "status", "source", "scope", "note",
     ]
     _atomic_csv(paths["runs_index"], index_rows, index_fields)
     _atomic_csv(paths["per_run"], per_run_rows, per_run_fields)
@@ -618,15 +672,19 @@ def aggregate_diagnostics(
     _atomic_csv(paths["coverage"], coverage_rows, coverage_fields)
     _atomic_json(paths["settings"], configs)
     _atomic_json(paths["metadata"], {
-        "schema_version": 1,
+        "schema_version": 2,
         "out_root": out_root,
         "n_selected_runs": len(summaries),
         "n_groups": len(groups),
+        "outer_min": outer_min,
+        "outer_window": f"outer_iter >= {outer_min}",
         "inference_unit": "training_seed",
         "iteration_handling": (
-            "reduce within each seed over outer iterations, then compute seed-level statistics"),
+            f"reduce within each seed over outer iterations >= {outer_min}, "
+            "then compute seed-level statistics"),
         "ci95": "two-sided Student-t interval over seed-level extrema",
-        "paper_extreme": "global min/max across seeds and outer iterations",
+        "paper_extreme": (
+            f"global min/max across seeds and outer iterations >= {outer_min}"),
         "merton_mapping": {
             "ellipticity": "scalar pi^T Sigma pi is the sole state-covariance eigenvalue",
             "derivative_margins": ["m_y", "M_y", "m_c"],
@@ -650,6 +708,13 @@ def main() -> None:
     parser.add_argument("--expected-n-assets", default="")
     parser.add_argument("--expected-models", default="")
     parser.add_argument("--min-seeds", type=int, default=1)
+    parser.add_argument(
+        "--outer-min", type=int, default=1,
+        help=(
+            "First outer iteration included in within-seed extrema. "
+            "Use 1 for all iterations or 2 to exclude the single burn-in outer."
+        ),
+    )
     parser.add_argument("--include-stopped", action="store_true")
     parser.add_argument(
         "--allow-incomplete-diagnostics", action="store_true",
@@ -667,6 +732,7 @@ def main() -> None:
             include_stopped=args.include_stopped,
             allow_incomplete=args.allow_incomplete_diagnostics,
             strict_market_snapshots=args.strict_market_snapshots,
+            outer_min=args.outer_min,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc

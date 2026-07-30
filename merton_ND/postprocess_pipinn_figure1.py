@@ -9,9 +9,9 @@ on the run's fixed Q_ev diagnostic set.  At recorded outer iteration ``k``,
 * ``c_vs_closed_form`` and ``pi_vs_closed_form`` compare alpha_k with the
   closed-form Merton policy.
 
-The figure shows pointwise arithmetic means across training seeds with
-plus/minus one sample-standard-deviation bands.  It never treats outer
-iterations as independent replicates.
+The two separate paper panels show pointwise arithmetic means across training
+seeds with plus/minus one sample-standard-deviation bands.  They never treat
+outer iterations as independent replicates.
 """
 from __future__ import annotations
 
@@ -70,12 +70,26 @@ METRIC_DEFINITIONS = {
 }
 
 OUTPUT_BASENAME = "figure1_pipinn_control_convergence"
+PANEL_TAGS = {
+    "successive": "diff",
+    "closed_form": "cf",
+}
+PANEL_OUTPUT_BASENAMES = {
+    panel: f"{OUTPUT_BASENAME}_{tag}" for panel, tag in PANEL_TAGS.items()
+}
 OWNED_OUTPUTS = {
     "figure1_control_trajectories.csv",
     "figure1_pointwise_summary.csv",
     "figure1_runs_used.csv",
     "figure1_metadata.json",
+    # The old combined two-panel artifact is cleanup-only.  New runs write
+    # one paper-ready file per panel.
     *(f"{OUTPUT_BASENAME}.{fmt}" for fmt in ("png", "pdf", "svg", "eps")),
+    *(
+        f"{basename}.{fmt}"
+        for basename in PANEL_OUTPUT_BASENAMES.values()
+        for fmt in ("png", "pdf", "svg", "eps")
+    ),
 }
 
 
@@ -365,14 +379,18 @@ def figure_log_floor(summary_rows: Sequence[Mapping[str, Any]]) -> float:
     return max(np.finfo(float).tiny, min(positive_plot_values) * 1.0e-3)
 
 
-def create_figure(
+def create_panel_figure(
     summary_rows: Sequence[Mapping[str, Any]],
     *,
-    figure_size: Tuple[float, float],
-    font_size: float,
-    font_family: str,
-    eps_compatible: bool,
+    panel: str,
+    figure_size: Tuple[float, float] = (6.0, 4.0),
+    font_size: float = 22.0,
+    font_family: str = "",
+    eps_compatible: bool = False,
+    line_width: float = 1.5,
+    line_alpha: float = 1.0,
 ):
+    """Create one legacy-style paper panel with a seed mean +/- sample-SD band."""
     import matplotlib
 
     matplotlib.use("Agg", force=True)
@@ -380,11 +398,14 @@ def create_figure(
     from matplotlib.colors import to_rgb
     from matplotlib.ticker import MaxNLocator
 
+    if panel not in PANELS:
+        raise ValueError(f"unknown Figure-1 panel {panel!r}; choose from {list(PANELS)}")
+
     colors = {
-        C_DIFF: "#0072B2",
-        C_CLOSED_FORM: "#0072B2",
-        PI_DIFF: "#D55E00",
-        PI_CLOSED_FORM: "#D55E00",
+        C_DIFF: "b",
+        C_CLOSED_FORM: "b",
+        PI_DIFF: "r",
+        PI_CLOSED_FORM: "r",
     }
     plot_floor = figure_log_floor(summary_rows)
 
@@ -392,13 +413,12 @@ def create_figure(
         rgb = np.asarray(to_rgb(color), dtype=float)
         return tuple((1.0 - white_fraction) * rgb + white_fraction)
 
-    label_font = {"fontfamily": font_family} if font_family else {}
-    fig, axes = plt.subplots(1, 2, figsize=figure_size, sharex=True)
-    panel_titles = {
-        "successive": "(a) Successive policy iterates",
-        "closed_form": "(b) Distance to closed form",
-    }
-    for ax, (panel, metrics) in zip(axes, PANELS.items()):
+    rc_params: Dict[str, Any] = {"font.size": font_size}
+    if font_family:
+        rc_params["font.family"] = font_family
+    with plt.rc_context(rc_params):
+        fig, ax = plt.subplots(figsize=figure_size)
+        metrics = PANELS[panel]
         for metric in metrics:
             rows = sorted(
                 [row for row in summary_rows if row["metric"] == metric],
@@ -424,35 +444,34 @@ def create_figure(
                 x,
                 mean_plot,
                 color=color,
-                linewidth=2.0,
+                linewidth=line_width,
+                alpha=line_alpha,
                 label=METRIC_LABELS[metric],
             )
 
         ax.set_yscale("log")
         ax.xaxis.set_major_locator(MaxNLocator(integer=True, min_n_ticks=5))
-        ax.set_xlabel("Outer iteration", fontsize=font_size, **label_font)
-        ax.set_title(panel_titles[panel], fontsize=font_size, **label_font)
-        ax.tick_params(axis="both", labelsize=0.9 * font_size)
+        ax.set_xlabel("Iteration", fontsize=font_size)
+        # Paper styling intentionally has neither a panel title nor a y label.
+        ax.set_title("")
+        ax.set_ylabel("")
+        ax.tick_params(axis="both", labelsize=font_size)
         if font_family:
             for tick_label in (*ax.get_xticklabels(), *ax.get_yticklabels()):
                 tick_label.set_fontfamily(font_family)
         grid_kwargs: Dict[str, Any] = {
-            "which": "both",
-            "alpha": 1.0 if eps_compatible else 0.22,
-            "linewidth": 0.6,
+            "alpha": 1.0 if eps_compatible else 0.3,
         }
         if eps_compatible:
-            grid_kwargs["color"] = "#D9D9D9"
+            # Black at alpha=.3 over white, preblended because EPS has no alpha.
+            grid_kwargs["color"] = "#B2B2B2"
         ax.grid(True, **grid_kwargs)
-        legend_font: Dict[str, Any] = {"size": 0.78 * font_size}
+        legend_font: Dict[str, Any] = {"size": font_size}
         if font_family:
             legend_font["family"] = font_family
         ax.legend(frameon=False, prop=legend_font, loc="best")
 
-    axes[0].set_ylabel(
-        r"Mean squared control discrepancy", fontsize=font_size, **label_font
-    )
-    fig.tight_layout()
+        fig.tight_layout()
     return fig
 
 
@@ -468,8 +487,8 @@ def write_csv(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Create the two-panel Merton PI-PINN Figure 1 from fixed-Q_ev "
-            "outer-history control diagnostics."
+            "Create two separate legacy-style Merton PI-PINN Figure-1 panels "
+            "from fixed-Q_ev outer-history control diagnostics."
         )
     )
     parser.add_argument("--out-root", required=True)
@@ -505,10 +524,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--formats", default="png,pdf")
     parser.add_argument("--dpi", type=int, default=300)
-    parser.add_argument("--fig-width", type=float, default=9.6)
-    parser.add_argument("--fig-height", type=float, default=3.4)
-    parser.add_argument("--font-size", type=float, default=10.0)
+    parser.add_argument(
+        "--fig-width",
+        type=float,
+        default=6.0,
+        help="Width in inches of each separate panel (default: 6.0).",
+    )
+    parser.add_argument(
+        "--fig-height",
+        type=float,
+        default=4.0,
+        help="Height in inches of each separate panel (default: 4.0).",
+    )
+    parser.add_argument(
+        "--font-size",
+        type=float,
+        default=22.0,
+        help="Global paper font size in points (default: 22).",
+    )
     parser.add_argument("--font-family", default="")
+    parser.add_argument(
+        "--line-width",
+        type=float,
+        default=1.5,
+        help="Seed-mean line width (default: 1.5).",
+    )
+    parser.add_argument(
+        "--line-alpha",
+        type=float,
+        default=1.0,
+        help="Seed-mean line opacity in (0,1] (default: 1.0).",
+    )
     parser.add_argument(
         "--bbox-inches", choices=("tight", "standard"), default="tight"
     )
@@ -527,9 +573,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         ("--fig-width", args.fig_width),
         ("--fig-height", args.fig_height),
         ("--font-size", args.font_size),
+        ("--line-width", args.line_width),
     ):
         if not math.isfinite(float(value)) or float(value) <= 0.0:
             raise ValueError(f"{name} must be positive and finite")
+    if (
+        not math.isfinite(float(args.line_alpha))
+        or not 0.0 < float(args.line_alpha) <= 1.0
+    ):
+        raise ValueError("--line-alpha must be finite and lie in (0,1]")
 
     formats = parse_formats(args.formats)
     expected_seeds = set(parse_seed_spec(args.expected_seeds))
@@ -621,23 +673,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     figure_files: List[str] = []
     if not args.no_plots:
         for fmt in formats:
-            figure = create_figure(
-                summary_rows,
-                figure_size=(args.fig_width, args.fig_height),
-                font_size=args.font_size,
-                font_family=args.font_family,
-                eps_compatible=(fmt == "eps"),
-            )
-            path = output / f"{OUTPUT_BASENAME}.{fmt}"
-            figure.savefig(
-                path,
-                dpi=args.dpi,
-                bbox_inches=None if args.bbox_inches == "standard" else "tight",
-            )
-            import matplotlib.pyplot as plt
+            for panel in PANELS:
+                figure = create_panel_figure(
+                    summary_rows,
+                    panel=panel,
+                    figure_size=(args.fig_width, args.fig_height),
+                    font_size=args.font_size,
+                    font_family=args.font_family,
+                    eps_compatible=(fmt == "eps"),
+                    line_width=args.line_width,
+                    line_alpha=args.line_alpha,
+                )
+                path = output / f"{PANEL_OUTPUT_BASENAMES[panel]}.{fmt}"
+                figure.savefig(
+                    path,
+                    dpi=args.dpi,
+                    bbox_inches=None if args.bbox_inches == "standard" else "tight",
+                )
+                import matplotlib.pyplot as plt
 
-            plt.close(figure)
-            figure_files.append(path.name)
+                plt.close(figure)
+                figure_files.append(path.name)
 
     metadata = {
         "artifact": "Merton PI-PINN paper Figure 1",
@@ -683,6 +739,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "sd_band_nonpositive_lower_points_plot_floored": masked_sd_points,
         "raw_zero_values_preserved": True,
+        "figure_layout": "two_separate_panels",
+        "panel_tags": PANEL_TAGS,
+        "panel_output_basenames": PANEL_OUTPUT_BASENAMES,
+        "legacy_combined_output_cleanup_only": OUTPUT_BASENAME,
+        "plot_style": {
+            "figure_size_inches_each": [args.fig_width, args.fig_height],
+            "font_size_pt": args.font_size,
+            "font_family": args.font_family,
+            "consumption_color": "blue",
+            "portfolio_color": "red",
+            "line_width": args.line_width,
+            "line_alpha": args.line_alpha,
+            "x_label": "Iteration",
+            "title": None,
+            "y_label": None,
+            "grid_alpha": 0.3,
+            "legend_frame": False,
+        },
         "figure_files": figure_files,
         "formats_requested": formats,
         "dpi": args.dpi,

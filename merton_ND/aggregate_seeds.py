@@ -72,6 +72,7 @@ GROUP_IGNORE_KEYS = {
     "n_x",
     # eval_margin is evaluation-only and carried per metrics row instead.
     "eval_margin",
+    "eval_w_min",
 }
 
 HEADLINE_METRICS = [
@@ -213,7 +214,10 @@ def _overlay_eval_config(run_dir: str, args: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return args
     out = dict(args)
-    for k in ("test_points", "eval_margin", "n_tau", "n_x", "w_levels"):
+    for k in (
+        "test_points", "eval_margin", "eval_w_min",
+        "n_tau", "n_x", "w_levels",
+    ):
         if k in eval_args:
             out[k] = eval_args[k]
     return out

@@ -27,6 +27,7 @@ FULL_WINDOW_METRIC_NAMES = (
     "RelL2_pi",
     "MaxErr_V",
     "e_D_sup",
+    "e_Xev",
     "MaxErr_c",
     "MaxErr_pi",
 )
@@ -156,6 +157,10 @@ def full_window_metrics(
         "MaxErr_c": float(np.max(np.abs(c_pred64 - c_ref64))),
         "MaxErr_pi": float(np.max(np.abs(pi_pred64 - pi_ref64))),
     }
-    metrics.update(derivative_bundle_metrics(Vw_pred, Vww_pred, Vw_ref, Vww_ref))
+    metrics.update(derivative_bundle_metrics(
+        Vw_pred, Vww_pred, Vw_ref, Vww_ref))
+    # Manuscript X_ev norm: ||dV||_infinity plus the vector-valued sup norm
+    # of the physical-wealth derivative bundle D V=(V_w,V_ww).
+    metrics["e_Xev"] = metrics["MaxErr_V"] + metrics["e_D_sup"]
     # A fixed order is useful for deterministic logs/CSV snapshots.
     return {name: metrics[name] for name in FULL_WINDOW_METRIC_NAMES}

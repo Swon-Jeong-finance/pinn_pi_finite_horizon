@@ -236,6 +236,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # the same trained network. The margin shrinks only y=log W; time retains
     # its full range, as in Q_ev=(0,T)xOmega_ev.
     p.add_argument("--eval-margin", type=str, default="0.10,0.0,0.05,0.15,0.20")
+    p.add_argument(
+        "--eval-w-min",
+        type=mxu.none_or_float,
+        default=None,
+        help=(
+            "Optional one-sided lower wealth endpoint for final/eval-only "
+            "evaluation. eval-margin still determines the upper endpoint."
+        ),
+    )
     p.add_argument("--test-points", type=int, default=100000)
     p.add_argument("--n-tau", type=int, default=100)
     p.add_argument("--n-x", type=int, default=100)
@@ -2282,6 +2291,7 @@ def eval_pinn_on_grid_margin(
     Nt: int = 100,
     Nw: int = 100,
     margin: float = 0.0,
+    eval_w_min: Optional[float] = None,
     chunk: int = 4000,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Grid evaluation on an eval window shrunk by HALF-WIDTH `margin`.
@@ -2293,7 +2303,9 @@ def eval_pinn_on_grid_margin(
     """
     was_training = value_net.training
     value_net.eval()
-    y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, margin)
+    window = mxu.resolve_eval_window(
+        y_min, y_max, margin, eval_w_min=eval_w_min)
+    y_lo, y_hi = window["ev_y_min"], window["ev_y_max"]
     t_vals = np.linspace(t_min, t_max - 1e-3, Nt)
     w_vals = np.exp(np.linspace(y_lo, y_hi, Nw))
     tt, ww = np.meshgrid(t_vals, w_vals, indexing="ij")
@@ -2417,6 +2429,7 @@ def eval_fulldim_test_metrics(
     value_net: nn.Module,
     n_points: int,
     margins: List[float],
+    eval_w_min: Optional[float] = None,
 ) -> Dict[float, Dict[str, float]]:
     """Fixed corresponding (t,y) test points for every nested window."""
     rng = np.random.default_rng(104729 + int(MARKET_SEED))
@@ -2425,7 +2438,9 @@ def eval_fulldim_test_metrics(
     t_np = u_t * (T_FINAL - 1e-3)
     output: Dict[float, Dict[str, float]] = {}
     for margin in margins:
-        y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
+        window = mxu.resolve_eval_window(
+            y_min, y_max, float(margin), eval_w_min=eval_w_min)
+        y_lo, y_hi = window["ev_y_min"], window["ev_y_max"]
         y_np = y_lo + u_y * (y_hi - y_lo)
         w_np = np.exp(y_np)
         output[float(margin)] = eval_metrics_on_points(value_net, t_np, w_np)
@@ -2773,6 +2788,15 @@ def main():
 
         Nt, Nw = int(ARGS.n_tau), int(ARGS.n_x)
         margins = mxu.parse_eval_margins(ARGS.eval_margin)
+        eval_windows = {
+            float(margin): mxu.resolve_eval_window(
+                y_min,
+                y_max,
+                float(margin),
+                eval_w_min=ARGS.eval_w_min,
+            )
+            for margin in margins
+        }
         final_weight_path = os.path.join(weight_dir, "value_net_final.pt")
         best_weight_path = os.path.join(weight_dir, "value_net_best_diag.pt")
 
@@ -2816,12 +2840,17 @@ def main():
 
         if int(ARGS.test_points) > 0:
             metrics_by_margin = eval_fulldim_test_metrics(
-                value_net, int(ARGS.test_points), margins)
+                value_net,
+                int(ARGS.test_points),
+                margins,
+                eval_w_min=ARGS.eval_w_min,
+            )
         else:
             # Deterministic 2D-grid fallback (also useful for a cheap smoke).
             metrics_by_margin: Dict[float, Dict[str, float]] = {}
             for margin in margins:
-                y_lo, y_hi = mxu.shrink_bounds(y_min, y_max, float(margin))
+                window = eval_windows[float(margin)]
+                y_lo, y_hi = window["ev_y_min"], window["ev_y_max"]
                 t_vals = np.linspace(t_min, t_max - 1e-3, Nt)
                 w_vals = np.exp(np.linspace(y_lo, y_hi, Nw))
                 tt, ww = np.meshgrid(t_vals, w_vals, indexing="ij")
@@ -2831,13 +2860,27 @@ def main():
         metric_rows = []
         for margin in margins:
             metrics = metrics_by_margin[float(margin)]
+            window = eval_windows[float(margin)]
             for key, val in metrics.items():
                 metric_rows.append({
                     "timestamp": mxu.now_iso(), "model_type": ARGS.model_type,
                     "run_tag": ARGS.run_tag, "scope": "fulldim", "eval_margin": margin,
+                    "eval_window_mode": window["eval_window_mode"],
+                    "eval_w_min_requested": window["eval_w_min_requested"],
+                    "eval_w_min_symmetric": window["eval_w_min_symmetric"],
+                    "ev_y_min": window["ev_y_min"],
+                    "ev_y_max": window["ev_y_max"],
+                    "ev_w_min": window["ev_w_min"],
+                    "ev_w_max": window["ev_w_max"],
                     "metric": key, "value": val})
         mxu.append_csv_rows(recorder.metrics_csv, metric_rows,
-                            ["timestamp", "model_type", "run_tag", "scope", "eval_margin", "metric", "value"])
+                            [
+                                "timestamp", "model_type", "run_tag", "scope",
+                                "eval_margin", "eval_window_mode",
+                                "eval_w_min_requested",
+                                "eval_w_min_symmetric", "ev_y_min", "ev_y_max",
+                                "ev_w_min", "ev_w_max", "metric", "value",
+                            ])
 
         eval_source = (
             f"{int(ARGS.test_points)} fixed random points"
@@ -2847,9 +2890,11 @@ def main():
         print(f"\nEvaluation metrics by margin ({eval_source}):")
         for margin in margins:
             is_primary = float(margin) == float(margins[0])
+            window = eval_windows[float(margin)]
             print(
                 f"\n--- eval_margin={float(margin):.2f}"
-                f"{' (primary)' if is_primary else ''} ---"
+                f"{' (primary)' if is_primary else ''}; "
+                f"W=[{window['ev_w_min']:.6g},{window['ev_w_max']:.6g}] ---"
             )
             for key, value in metrics_by_margin[float(margin)].items():
                 print(f"  {key}: {value:.6e}")
@@ -2857,7 +2902,13 @@ def main():
         if not skip_figures and not ARGS.eval_only:
             plot_loss_history(loss_history, save_path=os.path.join(out_dir, "plots", "loss_history.png"), show=False)
             tt, ww, V_pinn, c_pinn, pi_pinn, pi_norm = eval_pinn_on_grid_margin(
-                value_net, Nt=Nt, Nw=Nw, margin=margins[0], chunk=4000)
+                value_net,
+                Nt=Nt,
+                Nw=Nw,
+                margin=margins[0],
+                eval_w_min=ARGS.eval_w_min,
+                chunk=4000,
+            )
             plot_comparison_heatmaps(
                 tt, ww, V_pinn, c_pinn, pi_norm,
                 save_path=os.path.join(out_dir, "plots", "comparison_heatmap.png"), show=False)
@@ -2873,12 +2924,23 @@ def main():
                     shutil.copyfile(metrics_final_path, backup)
                 os.replace(recorder.metrics_csv, metrics_final_path)
                 recorder.metrics_csv = metrics_final_path
+            primary_window = eval_windows[float(margins[0])]
             recorder.mark_success_eval(
                 elapsed_sec=elapsed, primary_margin=margins[0],
                 final_weight_path=final_weight_path,
                 loaded_weight_path=loaded_weight_path,
-                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins)
+                eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins,
+                **{
+                    key: primary_window[key]
+                    for key in (
+                        "eval_window_mode", "eval_w_min_requested",
+                        "eval_w_min_symmetric", "ev_y_min", "ev_y_max",
+                        "ev_w_min", "ev_w_max",
+                    )
+                },
+            )
         else:
+            primary_window = eval_windows[float(margins[0])]
             recorder.mark_success(
                 elapsed_sec=elapsed, epochs=epochs,
                 total_optimizer_steps=stop_info.get("total_optimizer_steps"),
@@ -2898,6 +2960,14 @@ def main():
                 hjb_guard_tau_denom_final=stop_info.get("hjb_guard_tau_denom_final"),
                 train_gpu_peak_mem_bytes=train_gpu_peak,
                 eval_gpu_peak_mem_bytes=eval_gpu_peak, eval_margins=margins,
+                **{
+                    key: primary_window[key]
+                    for key in (
+                        "eval_window_mode", "eval_w_min_requested",
+                        "eval_w_min_symmetric", "ev_y_min", "ev_y_max",
+                        "ev_w_min", "ev_w_max",
+                    )
+                },
                 **{key: stop_info.get(key) for key in (
                     SCHEDULER_STATUS_FIELDS
                     + QSEL_ROLLBACK_STATUS_FIELDS

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTHONUNBUFFERED=1
 
 # Merton (with-consumption) PINN / PI-PINN sweep driver.
 # Independent of the Liu tune script; mirrors its UX (BASE dicts, seed sweep,
@@ -16,8 +15,6 @@ export PYTHONUNBUFFERED=1
 #     bash tune_merton.sh out  # no finite action boxes in either method
 #   PIPINN_OVERRIDES="e3b_checkpoints=1" bash tune_merton.sh out  # exact-map trajectory
 #   AGGREGATE=0 bash tune_merton.sh ...        # skip the seed-aggregation step
-#   MERGE_CONFIG_GROUPS=1 bash tune_merton.sh ...
-#       # explicitly combine split config groups within each method x N x M cell
 #   FORCE_RERUN=1 bash tune_merton.sh ...      # ignore previous _SUCCESS
 #   EVAL_ONLY=1 bash tune_merton.sh ...        # re-evaluate from saved weights
 
@@ -38,11 +35,6 @@ FORCE_RERUN="${FORCE_RERUN:-0}"      # 1: rerun regardless of previous status
 EVAL_ONLY="${EVAL_ONLY:-0}"          # 1: skip training, re-evaluate from weights
 ALLOW_LEGACY_BEST_EVAL="${ALLOW_LEGACY_BEST_EVAL:-0}"  # eval-only diagnostic/legacy fallback
 AGGREGATE="${AGGREGATE:-1}"          # 1: run aggregate_seeds after the sweep
-MERGE_CONFIG_GROUPS="${MERGE_CONFIG_GROUPS:-0}"  # 1: opt-in recovery merge
-case "$MERGE_CONFIG_GROUPS" in
-  0|1) ;;
-  *) echo "[error] MERGE_CONFIG_GROUPS must be 0 or 1" >&2; exit 2 ;;
-esac
 
 # Paper sweep defaults: N={10,50}, methods={PINN,PI-PINN}, and ten fixed
 # training seeds {1,2,3,5,7,11,17,23,42,101}.
@@ -56,6 +48,7 @@ PINN_OVERRIDES="${PINN_OVERRIDES:-}"
 PIPINN_OVERRIDES="${PIPINN_OVERRIDES:-}"
 
 # Cap CPU thread pools: parallel workers otherwise oversubscribe cores.
+export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -152,7 +145,7 @@ declare -A BASE_PINN=(
   [lr]=5e-4
   [outer_iters]=20
   [eval_epochs]=2000
-  [resample_every]=200
+  [resample_every]=0
   # Direct-PINN plateau scheduling uses only fixed held-out Q_sel. Patience is
   # counted in Q_sel checks (one check per val_every optimizer steps), not in
   # stochastic training steps. With val_every=25, 25 checks correspond to
@@ -164,9 +157,9 @@ declare -A BASE_PINN=(
   # Emergency rollback uses only raw p_sel on fixed Q_sel. It restores the
   # last admissible model+Adam snapshot, halves LR, resets the plateau state,
   # and refreshes the coupled training batch. The third trigger fails the run.
-  [qsel_rollback_factor]=10.0
+  [qsel_rollback_factor]=100.0
   [qsel_rollback_lr_factor]=1.0
-  [qsel_rollback_max_rescues]=2
+  [qsel_rollback_max_rescues]=100
   # Direct nonlinear-HJB guard. Use PINN_OVERRIDES or an explicit run_pinn
   # override for comparisons with the historical abs/hard continuations.
   [hjb_guard_mode]=softplus
@@ -496,13 +489,9 @@ run_all_jobs() {
 
 run_pinn   n_assets=10
 # run_pipinn n_assets=10
-# run_pipinn n_assets=10 w_eta=15.0
-# run_pipinn n_assets=10 w_eta=10.0
 
 run_pinn   n_assets=50
 # run_pipinn n_assets=50
-# run_pipinn n_assets=50 w_eta=15.0
-# run_pipinn n_assets=50 w_eta=10.0
 
 
 
@@ -515,18 +504,13 @@ fi
 
 if [[ "$AGGREGATE" == "1" && "$EVAL_ONLY" != "1" ]]; then
   echo "[info] aggregating seeds -> $OUT_ROOT"
-  aggregate_args=(
-    --out-root "$OUT_ROOT"
-    --expected-seeds "$SEEDS"
-    --expected-n-assets "$(printf '%s\n' "${!ENQUEUED_N[@]}" | sort -n | paste -sd, -)"
-    --expected-m-states "1"
-    --expected-models "pinn,pipinn"
+  "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" \
+    --out-root "$OUT_ROOT" \
+    --expected-seeds "$SEEDS" \
+    --expected-n-assets "$(printf '%s\n' "${!ENQUEUED_N[@]}" | sort -n | paste -sd, -)" \
+    --expected-m-states "1" \
+    --expected-models "pinn,pipinn" \
     --strict-market-snapshots
-  )
-  if [[ "$MERGE_CONFIG_GROUPS" == "1" ]]; then
-    aggregate_args+=(--merge-config-groups)
-  fi
-  "$PYTHON_BIN" "$SCRIPT_DIR/aggregate_seeds.py" "${aggregate_args[@]}"
 fi
 
 echo "[done] Merton sweep complete: $OUT_ROOT"
