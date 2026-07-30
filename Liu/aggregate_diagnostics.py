@@ -7,11 +7,16 @@ minimum ellipticity and maximum guard fraction).  Mean, sample standard
 deviation, and Student-t 95% intervals are then computed across those seed
 extrema, avoiding pseudo-replication of outer rows.
 
-PI-PINN indexing is kept explicit: ellipticity belongs to the frozen policy
-``alpha_{n-1}``, while curvature/numerator/normalized-control diagnostics
-belong to the improved policy ``alpha_n`` represented by the completed value
-iterate.  Direct PINN rows are labelled as greedy-policy diagnostics at the
-pseudo-outer training block.
+The optional ``--outer-min`` window is applied only after the source runs and
+their complete diagnostic histories have been validated.  Window-specific
+filenames and provenance keep the all-outer and post-burn-in reductions
+separate.
+
+PI-PINN indexing is kept explicit: ellipticity and clipping belong to the
+frozen policy ``alpha_{n-1}``, while curvature/numerator/guard and
+normalized-control diagnostics belong to the improved policy ``alpha_n``
+represented by the completed value iterate.  Direct PINN rows are labelled as
+greedy-policy diagnostics at the pseudo-outer training block.
 """
 from __future__ import annotations
 
@@ -57,15 +62,44 @@ except ImportError:  # package-style import during tests
     from .aggregate_seeds import t_crit_95  # type: ignore
 
 
-SCHEMA_VERSION = 1
-OUTPUT_FILES = (
-    "diagnostics_raw.csv",
-    "diagnostics_per_seed.csv",
-    "diagnostics_setting_summary.csv",
-    "diagnostics_assumption_summary.csv",
-    "diagnostic_groups.json",
-    "diagnostics_manifest.json",
+class DiagnosticsError(RuntimeError):
+    pass
+
+
+SCHEMA_VERSION = 2
+OUTPUT_FILE_STEMS = (
+    ("raw", "diagnostics_raw", ".csv"),
+    ("per_seed", "diagnostics_per_seed", ".csv"),
+    ("setting", "diagnostics_setting_summary", ".csv"),
+    ("assumptions", "diagnostics_assumption_summary", ".csv"),
+    ("groups", "diagnostic_groups", ".json"),
+    ("manifest", "diagnostics_manifest", ".json"),
 )
+
+
+def validate_outer_min(value: Any) -> int:
+    outer_min = int(value)
+    if outer_min < 1:
+        raise DiagnosticsError(f"outer_min must be at least 1, got {outer_min}")
+    return outer_min
+
+
+def output_files(outer_min: int = 1) -> Dict[str, str]:
+    """Return window-specific artifact names.
+
+    The suffix is present even for the default window so that an all-outer
+    table and a post-burn-in table can safely coexist in one output directory.
+    """
+    outer_min = validate_outer_min(outer_min)
+    suffix = f"_outer_ge_{outer_min}"
+    return {
+        key: f"{stem}{suffix}{extension}"
+        for key, stem, extension in OUTPUT_FILE_STEMS
+    }
+
+
+# Convenience for callers that enumerate default-window outputs.
+OUTPUT_FILES = tuple(output_files(1).values())
 
 # These values cannot alter the learned network or the training-time
 # diagnostic design.  In particular, e3b_checkpoints is only a saving knob.
@@ -97,10 +131,6 @@ COMMON_REQUIRED = (
     "vartheta_l2_min", "vartheta_l2_max",
     "vartheta_component_min", "vartheta_component_max", "vartheta_abs_max",
 )
-
-
-class DiagnosticsError(RuntimeError):
-    pass
 
 
 def canonical_json(value: Any) -> str:
@@ -329,14 +359,47 @@ def reduce_values(values: Sequence[float], direction: str) -> float:
     return min(values) if direction == "min" else max(values)
 
 
-def per_seed_extrema(raw_rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def rows_in_outer_window(
+    raw_rows: Sequence[Mapping[str, Any]],
+    outer_min: int = 1,
+) -> List[Dict[str, Any]]:
+    """Select post-hoc E1 rows without changing the training artifacts."""
+    outer_min = validate_outer_min(outer_min)
+    selected = [
+        {**dict(row), "outer_min": outer_min}
+        for row in raw_rows
+        if int(row["outer_iter"]) >= outer_min
+    ]
+    if not selected:
+        observed = sorted({int(row["outer_iter"]) for row in raw_rows})
+        observed_text = (
+            f"{observed[0]}..{observed[-1]}" if observed else "none"
+        )
+        raise DiagnosticsError(
+            f"no diagnostic rows at or after outer_min={outer_min}; "
+            f"observed outer range={observed_text}"
+        )
+    return selected
+
+
+def per_seed_extrema(
+    raw_rows: Sequence[Mapping[str, Any]],
+    outer_min: int = 1,
+) -> List[Dict[str, Any]]:
+    outer_min = validate_outer_min(outer_min)
     grouped: Dict[Tuple[str, int], List[Mapping[str, Any]]] = defaultdict(list)
     for row in raw_rows:
         grouped[(str(row["group"]), int(row["seed"]))].append(row)
     output: List[Dict[str, Any]] = []
     for (group_hash, seed), rows in sorted(grouped.items()):
         rows = sorted(rows, key=lambda row: int(row["outer_iter"]))
-        first = rows[0]
+        eligible = [row for row in rows if int(row["outer_iter"]) >= outer_min]
+        if not eligible:
+            raise DiagnosticsError(
+                f"group={group_hash} seed={seed}: no diagnostic rows at or after "
+                f"outer_min={outer_min}; run ends at outer={int(rows[-1]['outer_iter'])}"
+            )
+        first = eligible[0]
         item: Dict[str, Any] = {
             key: first[key]
             for key in (
@@ -349,15 +412,25 @@ def per_seed_extrema(raw_rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, An
             n_outer=len(rows),
             outer_first=int(rows[0]["outer_iter"]),
             outer_last=int(rows[-1]["outer_iter"]),
+            outer_min=outer_min,
+            n_outer_used=len(eligible),
+            outer_used_first=int(eligible[0]["outer_iter"]),
+            outer_used_last=int(eligible[-1]["outer_iter"]),
         )
         for metric, direction in METRIC_REDUCTIONS.items():
-            values = [float(row[metric]) for row in rows if row.get(metric) is not None]
+            values = [float(row[metric]) for row in eligible if row.get(metric) is not None]
             item[metric] = reduce_values(values, direction) if values else None
-        item["all_elliptic"] = int(all(float(row["lambda_min_sigma"]) > 0 for row in rows))
-        item["all_concave_margin"] = int(all(float(row["m_ww"]) > 0 for row in rows))
-        item["guard_identically_zero"] = int(all(float(row["guard_frac_ev"]) == 0 for row in rows))
+        item["all_elliptic"] = int(
+            all(float(row["lambda_min_sigma"]) > 0 for row in eligible)
+        )
+        item["all_concave_margin"] = int(
+            all(float(row["m_ww"]) > 0 for row in eligible)
+        )
+        item["guard_identically_zero"] = int(
+            all(float(row["guard_frac_ev"]) == 0 for row in eligible)
+        )
         item["clip_identically_zero"] = (
-            int(all(float(row["clip_frac"]) == 0 for row in rows))
+            int(all(float(row["clip_frac"]) == 0 for row in eligible))
             if int(first["clipping_enabled"]) else None
         )
         output.append(item)
@@ -399,6 +472,11 @@ def setting_summaries(per_seed: Sequence[Mapping[str, Any]]) -> List[Dict[str, A
     for group_hash, rows in sorted(grouped.items()):
         rows = sorted(rows, key=lambda row: int(row["seed"]))
         first = rows[0]
+        outer_mins = {int(row["outer_min"]) for row in rows}
+        if len(outer_mins) != 1:
+            raise DiagnosticsError(
+                f"group={group_hash}: mixed outer_min values {sorted(outer_mins)}"
+            )
         seeds = ";".join(str(row["seed"]) for row in rows)
         for metric, reduction in METRIC_REDUCTIONS.items():
             present = [row[metric] for row in rows if row.get(metric) is not None]
@@ -412,6 +490,7 @@ def setting_summaries(per_seed: Sequence[Mapping[str, Any]]) -> List[Dict[str, A
                 "risk_premium_mode": first["risk_premium_mode"],
                 "nonaffine_eps": first["nonaffine_eps"],
                 "policy_kind": first["policy_kind"],
+                "outer_min": first["outer_min"],
                 "metric": metric,
                 "outer_reduction": reduction,
                 "applicability": (
@@ -439,6 +518,11 @@ def assumption_summaries(per_seed: Sequence[Mapping[str, Any]]) -> List[Dict[str
     for group_hash, rows in sorted(grouped.items()):
         rows = sorted(rows, key=lambda row: int(row["seed"]))
         first = rows[0]
+        outer_mins = {int(row["outer_min"]) for row in rows}
+        if len(outer_mins) != 1:
+            raise DiagnosticsError(
+                f"group={group_hash}: mixed outer_min values {sorted(outer_mins)}"
+            )
         for flag in flags:
             applicable = [int(row[flag]) for row in rows if row.get(flag) is not None]
             output.append({
@@ -448,6 +532,7 @@ def assumption_summaries(per_seed: Sequence[Mapping[str, Any]]) -> List[Dict[str
                 "m_states": first["m_states"],
                 "risk_premium_mode": first["risk_premium_mode"],
                 "nonaffine_eps": first["nonaffine_eps"],
+                "outer_min": first["outer_min"],
                 "assumption_check": flag,
                 "n_applicable": len(applicable),
                 "n_pass": sum(applicable),
@@ -590,6 +675,43 @@ def collect_diagnostics(
     return raw, run_index, groups
 
 
+def run_index_for_outer_window(
+    run_index: Sequence[Mapping[str, Any]],
+    raw_rows: Sequence[Mapping[str, Any]],
+    outer_min: int = 1,
+) -> List[Dict[str, Any]]:
+    """Attach source/used row counts for one post-hoc outer window."""
+    outer_min = validate_outer_min(outer_min)
+    by_run: Dict[str, List[int]] = defaultdict(list)
+    for row in raw_rows:
+        by_run[str(row["run_dir"])].append(int(row["outer_iter"]))
+
+    output: List[Dict[str, Any]] = []
+    for source in run_index:
+        item = dict(source)
+        run_dir = str(item["run_dir"])
+        observed = sorted(by_run.get(run_dir, []))
+        if not observed:
+            raise DiagnosticsError(f"{run_dir}: no normalized E1 rows")
+        used = [iteration for iteration in observed if iteration >= outer_min]
+        if not used:
+            raise DiagnosticsError(
+                f"{run_dir}: no diagnostic rows at or after outer_min={outer_min}; "
+                f"run ends at outer={observed[-1]}"
+            )
+        item.update(
+            outer_min=outer_min,
+            outer_rows_source=len(observed),
+            outer_source_first=observed[0],
+            outer_source_last=observed[-1],
+            outer_rows_used=len(used),
+            outer_used_first=used[0],
+            outer_used_last=used[-1],
+        )
+        output.append(item)
+    return output
+
+
 def _csv_value(value: Any) -> Any:
     if value is None:
         return ""
@@ -631,15 +753,47 @@ def write_outputs(
     groups: Mapping[str, Any],
     run_index: Sequence[Mapping[str, Any]],
     *,
+    outer_min: int = 1,
+    source_raw_row_count: Optional[int] = None,
     overwrite: bool = False,
 ) -> None:
+    outer_min = validate_outer_min(outer_min)
+    files = output_files(outer_min)
+    raw_with_window = []
+    for row in raw:
+        if int(row["outer_iter"]) < outer_min:
+            raise DiagnosticsError(
+                f"raw output contains outer={row['outer_iter']} below outer_min={outer_min}"
+            )
+        if row.get("outer_min") is not None and int(row["outer_min"]) != outer_min:
+            raise DiagnosticsError(
+                f"raw output mixes outer_min={row['outer_min']} with requested {outer_min}"
+            )
+        raw_with_window.append({**dict(row), "outer_min": outer_min})
+    for label, rows in (
+        ("per-seed", per_seed),
+        ("setting", setting),
+        ("assumption", assumptions),
+        ("run-index", run_index),
+    ):
+        mismatched = sorted({
+            int(row["outer_min"])
+            for row in rows
+            if row.get("outer_min") is not None and int(row["outer_min"]) != outer_min
+        })
+        missing = sum(1 for row in rows if row.get("outer_min") is None)
+        if mismatched or missing:
+            raise DiagnosticsError(
+                f"{label} output has invalid outer_min provenance: "
+                f"missing={missing}, mismatched={mismatched}, requested={outer_min}"
+            )
     output.mkdir(parents=True, exist_ok=True)
-    existing = [name for name in OUTPUT_FILES if (output / name).exists()]
+    existing = [name for name in files.values() if (output / name).exists()]
     if existing and not overwrite:
         raise DiagnosticsError(f"output files exist; pass --overwrite: {existing}")
 
     raw_fields = [
-        "group", "run_dir", "run_tag", "model_type", "n_assets", "m_states",
+        "group", "outer_min", "run_dir", "run_tag", "model_type", "n_assets", "m_states",
         "risk_premium_mode", "nonaffine_eps", "seed", "outer_iter", "outer_semantics",
         "policy_kind", "frozen_policy_iter", "improved_policy_iter", "lambda_policy_iter",
         "margin_policy_iter", "primary_eval_margin", "w_min", "market_hash",
@@ -647,36 +801,50 @@ def write_outputs(
         "concavity_margin_positive",
     ]
     seed_fields = [
-        "group", "model_type", "n_assets", "m_states", "risk_premium_mode",
+        "group", "outer_min", "model_type", "n_assets", "m_states", "risk_premium_mode",
         "nonaffine_eps", "seed", "run_tag", "run_dir", "market_hash", "policy_kind",
         "primary_eval_margin", "w_min", "clipping_enabled", "n_outer", "outer_first",
-        "outer_last", *METRIC_REDUCTIONS.keys(), "all_elliptic", "all_concave_margin",
+        "outer_last", "n_outer_used", "outer_used_first", "outer_used_last",
+        *METRIC_REDUCTIONS.keys(), "all_elliptic", "all_concave_margin",
         "guard_identically_zero", "clip_identically_zero",
     ]
     setting_fields = [
-        "group", "model_type", "n_assets", "m_states", "risk_premium_mode",
+        "group", "outer_min", "model_type", "n_assets", "m_states", "risk_premium_mode",
         "nonaffine_eps", "policy_kind", "metric", "outer_reduction", "applicability",
         "n", "finite_n", "mean", "std", "sem", "ci95_lo", "ci95_hi", "t_crit",
         "min", "max", "global_worst", "seeds",
     ]
     assumption_fields = [
-        "group", "model_type", "n_assets", "m_states", "risk_premium_mode",
+        "group", "outer_min", "model_type", "n_assets", "m_states", "risk_premium_mode",
         "nonaffine_eps", "assumption_check", "n_applicable", "n_pass",
         "fraction_pass", "seeds",
     ]
-    atomic_write_csv(output / "diagnostics_raw.csv", raw, raw_fields)
-    atomic_write_csv(output / "diagnostics_per_seed.csv", per_seed, seed_fields)
-    atomic_write_csv(output / "diagnostics_setting_summary.csv", setting, setting_fields)
-    atomic_write_csv(output / "diagnostics_assumption_summary.csv", assumptions, assumption_fields)
-    atomic_write_json(output / "diagnostic_groups.json", groups)
-    atomic_write_json(output / "diagnostics_manifest.json", {
+    atomic_write_csv(output / files["raw"], raw_with_window, raw_fields)
+    atomic_write_csv(output / files["per_seed"], per_seed, seed_fields)
+    atomic_write_csv(output / files["setting"], setting, setting_fields)
+    atomic_write_csv(output / files["assumptions"], assumptions, assumption_fields)
+    atomic_write_json(output / files["groups"], groups)
+    atomic_write_json(output / files["manifest"], {
         "schema_version": SCHEMA_VERSION,
         "manifest_kind": "liu_e1_diagnostics",
         "generated_at": utc_now(),
         "tool_path": str(Path(__file__).resolve()),
         "tool_file_sha256": sha256_file(Path(__file__).resolve()),
+        "outer_min": outer_min,
+        "outer_window": f"outer_iter >= {outer_min}",
+        "iteration_handling": (
+            f"reduce within each seed over outer iterations >= {outer_min}, "
+            "then compute statistics across seed-level extrema"
+        ),
+        "inference_unit": "training_seed",
+        "output_files": files,
         "run_count": len(run_index),
-        "raw_row_count": len(raw),
+        "source_raw_row_count": (
+            int(source_raw_row_count)
+            if source_raw_row_count is not None
+            else sum(int(row.get("outer_rows_source", 0)) for row in run_index)
+        ),
+        "raw_row_count": len(raw_with_window),
         "seed_row_count": len(per_seed),
         "setting_row_count": len(setting),
         "runs": list(run_index),
@@ -692,6 +860,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-n-assets", type=int)
     parser.add_argument("--expected-seeds", default="")
     parser.add_argument("--min-seeds", type=int, default=1)
+    parser.add_argument(
+        "--outer-min", type=int, default=1,
+        help=(
+            "First outer iteration included in within-seed extrema. "
+            "Use 1 for all iterations or 2 to exclude one burn-in outer."
+        ),
+    )
     parser.add_argument(
         "--allow-sparse-diagnostics", action="store_true",
         help="Exploratory mode: accept rows omitted according to diag_every.",
@@ -711,7 +886,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_root = args.out_root.resolve()
     output = (args.output or (out_root / "diagnostics_summary")).resolve()
     try:
-        raw, run_index, groups = collect_diagnostics(
+        outer_min = validate_outer_min(args.outer_min)
+        source_raw, run_index, groups = collect_diagnostics(
             out_root,
             models=models,
             m_states=m_values,
@@ -720,9 +896,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             min_seeds=args.min_seeds,
             allow_sparse=args.allow_sparse_diagnostics,
         )
-        per_seed = per_seed_extrema(raw)
+        raw = rows_in_outer_window(source_raw, outer_min)
+        per_seed = per_seed_extrema(source_raw, outer_min)
         setting = setting_summaries(per_seed)
         assumptions = assumption_summaries(per_seed)
+        run_index = run_index_for_outer_window(run_index, source_raw, outer_min)
         for run in run_index:
             run_dir = Path(str(run["run_dir"])).resolve()
             try:
@@ -734,6 +912,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         write_outputs(
             output, raw, per_seed, setting, assumptions, groups, run_index,
+            outer_min=outer_min,
+            source_raw_row_count=len(source_raw),
             overwrite=args.overwrite,
         )
     except (AuditError, DiagnosticsError, ValueError) as exc:
@@ -741,7 +921,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     print(
         f"[diagnostics] wrote {output}: {len(run_index)} runs, "
-        f"{len(raw)} outer rows, {len(per_seed)} seed summaries"
+        f"{len(raw)} outer rows in outer_iter >= {outer_min}, "
+        f"{len(per_seed)} seed summaries"
     )
     return 0
 

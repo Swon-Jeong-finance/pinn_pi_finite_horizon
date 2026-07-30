@@ -70,6 +70,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from aggregate_seeds import GROUP_IGNORE_KEYS, canonical_market_hash, parse_seed_spec, run_status
 from joint_market_setup_dirichlet import validate_market_snapshot
@@ -604,49 +605,224 @@ def _match_requested_eps(available: Iterable[float], requested: Sequence[float])
     return sorted(set(matched))
 
 
-def _plot_curves(summary_rows: Sequence[Mapping[str, Any]], output_dir: Path, args: argparse.Namespace) -> List[Path]:
+def _create_curve_figure(
+    summary_rows: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+):
+    """Build the paper-facing two-panel non-affine figure.
+
+    Value and policy panels reuse exactly the same epsilon colors.  A single
+    figure-level legend is placed to the right of both axes, matching the
+    manuscript layout without duplicating epsilon entries in each panel.
+    """
     eps_values = sorted({float(row["epsilon"]) for row in summary_rows if not _is_zero_eps(float(row["epsilon"]))})
     if not eps_values:
         raise ValueError("at least one epsilon>0 curve is required")
     cmap = plt.get_cmap(args.cmap)
     denom = max(max(eps_values) - min(eps_values), EPS_TOL)
-    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.0))
-    for epsilon in eps_values:
-        rows = sorted(
-            (row for row in summary_rows if _eps_key(row["epsilon"]) == _eps_key(epsilon)),
-            key=lambda row: float(row["tau"]),
+    with plt.rc_context({"font.size": float(args.font_size)}):
+        fig, axes = plt.subplots(
+            1, 2, figsize=(float(args.fig_width), float(args.fig_height))
         )
-        tau = np.asarray([float(row["tau"]) for row in rows])
-        delta_v = np.asarray([float(row["delta_V_mean"]) for row in rows])
-        delta_v_std = np.asarray([float(row["delta_V_std"]) for row in rows])
-        delta_theta = np.asarray([float(row["delta_theta_l2_mean"]) for row in rows])
-        delta_theta_std = np.asarray([float(row["delta_theta_l2_std"]) for row in rows])
-        color = cmap((epsilon - min(eps_values)) / denom if len(eps_values) > 1 else 0.55)
-        label = rf"$\varepsilon={epsilon:g}$"
-        axes[0].plot(tau, delta_v, color=color, label=label)
-        axes[0].fill_between(tau, delta_v - delta_v_std, delta_v + delta_v_std, color=color, alpha=0.16, linewidth=0)
-        axes[1].plot(tau, delta_theta, color=color, label=label)
-        axes[1].fill_between(
-            tau, np.maximum(delta_theta - delta_theta_std, 0.0), delta_theta + delta_theta_std,
-            color=color, alpha=0.16, linewidth=0,
+        for epsilon in eps_values:
+            rows = sorted(
+                (row for row in summary_rows if _eps_key(row["epsilon"]) == _eps_key(epsilon)),
+                key=lambda row: float(row["tau"]),
+            )
+            tau = np.asarray([float(row["tau"]) for row in rows])
+            delta_v = np.asarray([float(row["delta_V_mean"]) for row in rows])
+            delta_v_std = np.asarray([float(row["delta_V_std"]) for row in rows])
+            delta_theta = np.asarray([float(row["delta_theta_l2_mean"]) for row in rows])
+            delta_theta_std = np.asarray([float(row["delta_theta_l2_std"]) for row in rows])
+            color = cmap((epsilon - min(eps_values)) / denom if len(eps_values) > 1 else 0.55)
+            label = rf"$\varepsilon={epsilon:.2f}$"
+            axes[0].plot(tau, delta_v, label=label, color=color, linewidth=1.5)
+            axes[0].fill_between(
+                tau, delta_v - delta_v_std, delta_v + delta_v_std,
+                color=color, alpha=0.16, linewidth=0,
+            )
+            axes[1].plot(tau, delta_theta, label=label, color=color, linewidth=1.5)
+            axes[1].fill_between(
+                tau, np.maximum(delta_theta - delta_theta_std, 0.0),
+                delta_theta + delta_theta_std,
+                color=color, alpha=0.16, linewidth=0,
+            )
+
+        axes[0].axhline(0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5)
+        axes[0].set_xlabel("Time to horizon")
+        axes[1].set_xlabel("Time to horizon")
+        for axis in axes:
+            axis.xaxis.set_major_locator(
+                MaxNLocator(
+                    nbins=int(args.x_max_ticks),
+                    min_n_ticks=3,
+                    steps=(1, 2, 2.5, 5, 10),
+                )
+            )
+            axis.yaxis.set_major_locator(
+                MaxNLocator(
+                    nbins=int(args.y_max_ticks),
+                    min_n_ticks=3,
+                    steps=(1, 2, 2.5, 5, 10),
+                )
+            )
+            axis.grid(True, alpha=0.3)
+
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.84, 0.5),
+            frameon=False,
+        )
+        # Reserve the rightmost part of the canvas for the one shared legend.
+        fig.tight_layout(rect=(0.0, 0.0, 0.82, 1.0))
+    return fig
+
+
+def _create_separate_curve_figures(
+    summary_rows: Sequence[Mapping[str, Any]],
+    args: argparse.Namespace,
+):
+    """Build standalone Value and Policy figures from the same curve data.
+
+    The Value file intentionally has no legend.  The Policy file carries the
+    one shared epsilon legend on the right so the two exported files can be
+    placed side by side without repeating legend entries.
+    """
+    eps_values = sorted({
+        float(row["epsilon"])
+        for row in summary_rows
+        if not _is_zero_eps(float(row["epsilon"]))
+    })
+    if not eps_values:
+        raise ValueError("at least one epsilon>0 curve is required")
+    cmap = plt.get_cmap(args.cmap)
+    denom = max(max(eps_values) - min(eps_values), EPS_TOL)
+    shared_height = float(getattr(args, "single_fig_height", 4.0))
+    value_height_arg = getattr(args, "value_fig_height", None)
+    policy_height_arg = getattr(args, "policy_fig_height", None)
+    value_height = (
+        shared_height if value_height_arg is None else float(value_height_arg)
+    )
+    policy_height = (
+        shared_height if policy_height_arg is None else float(policy_height_arg)
+    )
+
+    with plt.rc_context({"font.size": float(args.font_size)}):
+        value_fig, value_axis = plt.subplots(
+            figsize=(float(args.value_fig_width), value_height)
+        )
+        policy_fig, policy_axis = plt.subplots(
+            figsize=(float(args.policy_fig_width), policy_height)
         )
 
-    axes[0].axhline(0.0, color="0.45", linewidth=0.8, linestyle="--")
-    axes[0].set_xlabel(r"$\tau$")
-    axes[0].set_ylabel(r"$V_{\varepsilon}-V_0$")
-    axes[1].set_xlabel(r"$\tau$")
-    axes[1].set_ylabel(r"$\|\theta_{\varepsilon}/w_0-\theta_0/w_0\|_2$")
-    for axis in axes:
-        axis.grid(True, alpha=0.2)
-        axis.legend(frameon=False)
-    fig.tight_layout()
+        for epsilon in eps_values:
+            rows = sorted(
+                (
+                    row
+                    for row in summary_rows
+                    if _eps_key(row["epsilon"]) == _eps_key(epsilon)
+                ),
+                key=lambda row: float(row["tau"]),
+            )
+            tau = np.asarray([float(row["tau"]) for row in rows])
+            delta_v = np.asarray([float(row["delta_V_mean"]) for row in rows])
+            delta_v_std = np.asarray([float(row["delta_V_std"]) for row in rows])
+            delta_theta = np.asarray([
+                float(row["delta_theta_l2_mean"]) for row in rows
+            ])
+            delta_theta_std = np.asarray([
+                float(row["delta_theta_l2_std"]) for row in rows
+            ])
+            color = cmap(
+                (epsilon - min(eps_values)) / denom
+                if len(eps_values) > 1 else 0.55
+            )
+            label = rf"$\varepsilon={epsilon:.2f}$"
+
+            value_axis.plot(
+                tau, delta_v, label=label, color=color, linewidth=1.5
+            )
+            value_axis.fill_between(
+                tau,
+                delta_v - delta_v_std,
+                delta_v + delta_v_std,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
+            policy_axis.plot(
+                tau, delta_theta, label=label, color=color, linewidth=1.5
+            )
+            policy_axis.fill_between(
+                tau,
+                np.maximum(delta_theta - delta_theta_std, 0.0),
+                delta_theta + delta_theta_std,
+                color=color,
+                alpha=0.16,
+                linewidth=0,
+            )
+
+        value_axis.axhline(
+            0.0, color="k", linewidth=0.8, linestyle="--", alpha=0.5
+        )
+        for axis in (value_axis, policy_axis):
+            axis.set_xlabel("Time to horizon")
+            axis.xaxis.set_major_locator(
+                MaxNLocator(
+                    nbins=int(args.x_max_ticks),
+                    min_n_ticks=3,
+                    steps=(1, 2, 2.5, 5, 10),
+                )
+            )
+            axis.yaxis.set_major_locator(
+                MaxNLocator(
+                    nbins=int(args.y_max_ticks),
+                    min_n_ticks=3,
+                    steps=(1, 2, 2.5, 5, 10),
+                )
+            )
+            axis.grid(True, alpha=0.3)
+
+        handles, labels = policy_axis.get_legend_handles_labels()
+        policy_fig.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.55, 0.6),
+            frameon=False,
+        )
+        value_fig.tight_layout()
+        policy_fig.tight_layout(rect=(0.0, 0.0, 0.61, 1.0))
+
+    return value_fig, policy_fig
+
+
+def _plot_curves(summary_rows: Sequence[Mapping[str, Any]], output_dir: Path, args: argparse.Namespace) -> List[Path]:
+    combined_fig = _create_curve_figure(summary_rows, args)
+    value_fig, policy_fig = _create_separate_curve_figures(summary_rows, args)
 
     paths: List[Path] = []
-    for fmt in [part.strip().lower().lstrip(".") for part in args.formats.split(",") if part.strip()]:
-        path = output_dir / f"nonaffine_figure4.{fmt}"
-        fig.savefig(path, dpi=args.dpi, bbox_inches="tight")
-        paths.append(path)
-    plt.close(fig)
+    try:
+        for fmt in [
+            part.strip().lower().lstrip(".")
+            for part in args.formats.split(",")
+            if part.strip()
+        ]:
+            for filename, fig in (
+                (f"nonaffine_figure4.{fmt}", combined_fig),
+                (f"V_diff_from_base.{fmt}", value_fig),
+                (f"pi_diff_from_base.{fmt}", policy_fig),
+            ):
+                path = output_dir / filename
+                fig.savefig(path, dpi=args.dpi, bbox_inches="tight")
+                paths.append(path)
+    finally:
+        plt.close(combined_fig)
+        plt.close(value_fig)
+        plt.close(policy_fig)
     return paths
 
 
@@ -937,6 +1113,49 @@ def process_group(
                 "sample SD is undefined (NaN) for n=1"
             ),
         },
+        "figure_style": {
+            "layout": "combined_one_by_two_plus_standalone_value_and_policy",
+            "fig_width_inches": float(args.fig_width),
+            "fig_height_inches": float(args.fig_height),
+            "standalone_value_width_inches": float(args.value_fig_width),
+            "standalone_policy_width_inches": float(args.policy_fig_width),
+            "standalone_value_height_inches": (
+                float(args.single_fig_height)
+                if args.value_fig_height is None
+                else float(args.value_fig_height)
+            ),
+            "standalone_policy_height_inches": (
+                float(args.single_fig_height)
+                if args.policy_fig_height is None
+                else float(args.policy_fig_height)
+            ),
+            "standalone_shared_height_fallback_inches": float(
+                args.single_fig_height
+            ),
+            "font_size_pt": float(args.font_size),
+            "dpi": int(args.dpi),
+            "formats": [
+                part.strip().lower().lstrip(".")
+                for part in args.formats.split(",") if part.strip()
+            ],
+            "cmap": str(args.cmap),
+            "line_width": 1.5,
+            "uncertainty_band": "pointwise mean plus/minus one sample SD",
+            "legend": (
+                "combined: one shared legend on the right; standalone Value: "
+                "none; standalone Policy: one external legend on the right "
+                "at bbox_to_anchor=(0.63, 0.6)"
+            ),
+            "output_stems": [
+                "nonaffine_figure4",
+                "V_diff_from_base",
+                "pi_diff_from_base",
+            ],
+            "epsilon_label_decimals": 2,
+            "y_axis_labels": "omitted; definitions supplied in the manuscript caption",
+            "x_max_major_intervals": int(args.x_max_ticks),
+            "y_max_major_intervals": int(args.y_max_ticks),
+        },
         "group_config": sample.group_config,
         "figures": [str(path) for path in figure_paths],
     }
@@ -999,6 +1218,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--formats", default="png,pdf", help="Comma-separated figure formats.")
     parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument(
+        "--fig-width", type=float, default=13.2,
+        help="Combined two-panel figure width in inches (default: 13.2).",
+    )
+    parser.add_argument(
+        "--fig-height", type=float, default=4.0,
+        help="Combined two-panel figure height in inches (default: 4.0).",
+    )
+    parser.add_argument(
+        "--value-fig-width", type=float, default=5.3,
+        help="Standalone Value figure width in inches (default: 6.0).",
+    )
+    parser.add_argument(
+        "--policy-fig-width", type=float, default=9.0,
+        help="Standalone Policy figure width including its legend (default: 7.2).",
+    )
+    parser.add_argument(
+        "--single-fig-height", type=float, default=4.5,
+        help=(
+            "Shared fallback height for standalone Value/Policy figures in "
+            "inches (default: 4.0)."
+        ),
+    )
+    parser.add_argument(
+        "--value-fig-height", type=float, default=None,
+        help=(
+            "Standalone Value figure height in inches; overrides "
+            "--single-fig-height for Value."
+        ),
+    )
+    parser.add_argument(
+        "--policy-fig-height", type=float, default=None,
+        help=(
+            "Standalone Policy figure height in inches; overrides "
+            "--single-fig-height for Policy."
+        ),
+    )
+    parser.add_argument(
+        "--font-size", type=float, default=22.0,
+        help="Base axis, tick, and shared-legend font size in points (default: 22).",
+    )
+    parser.add_argument(
+        "--x-max-ticks", type=int, default=4,
+        help="Approximate maximum number of major x-axis intervals per panel (default: 4).",
+    )
+    parser.add_argument(
+        "--y-max-ticks", type=int, default=4,
+        help="Approximate maximum number of major y-axis intervals per panel (default: 4).",
+    )
     parser.add_argument("--cmap", default="viridis")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--self-test", action="store_true", help="Run a synthetic end-to-end smoke test and exit.")
@@ -1078,6 +1346,29 @@ def run(args: argparse.Namespace) -> List[Dict[str, Any]]:
         raise ValueError("--min-seeds must be >= 1")
     if args.w0 <= 0:
         raise ValueError("--w0 must be positive")
+    for name in (
+        "fig_width",
+        "fig_height",
+        "value_fig_width",
+        "policy_fig_width",
+        "single_fig_height",
+        "font_size",
+    ):
+        value = float(getattr(args, name))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
+    for name in ("value_fig_height", "policy_fig_height"):
+        value = getattr(args, name)
+        if value is not None and (
+            not math.isfinite(float(value)) or float(value) <= 0.0
+        ):
+            raise ValueError(
+                f"--{name.replace('_', '-')} must be finite and positive"
+            )
+    if args.x_max_ticks < 2 or args.y_max_ticks < 2:
+        raise ValueError("--x-max-ticks and --y-max-ticks must be >= 2")
+    if args.dpi <= 0:
+        raise ValueError("--dpi must be positive")
     out_root = args.out_root.expanduser().resolve()
     if not out_root.is_dir():
         raise FileNotFoundError(f"--out-root is not a directory: {out_root}")

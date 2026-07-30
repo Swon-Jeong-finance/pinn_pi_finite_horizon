@@ -40,6 +40,9 @@ import math
 import argparse
 import copy
 import csv
+import hashlib
+import json
+import random
 import numpy as np
 from datetime import datetime
 from scipy.integrate import solve_ivp
@@ -147,10 +150,491 @@ def build_arg_parser():
                              "analytic init). 0 = single fixed batch per policy evaluation.")
     parser.add_argument("--e3b-checkpoints", action="store_true",
                         help="FD-reference schedule: save every completed outer iterate.")
+    # E6 common-warm-start protocol.  A seed-specific warm-up solves exactly
+    # one frozen-policy PDE at p_res target 1.  Every target branch then
+    # restores that identical value-network + Adam + LR + RNG state and starts
+    # from the greedy policy induced by the restored value iterate.
+    parser.add_argument(
+        "--e6-role",
+        choices=["standard", "warmup", "target_branch"],
+        default="standard",
+    )
+    parser.add_argument(
+        "--e6-warm-start",
+        type=str,
+        default=None,
+        help="Common warm-up bundle restored by --e6-role target_branch.",
+    )
+    parser.add_argument(
+        "--e6-warmup-bundle",
+        type=str,
+        default=None,
+        help="Bundle written by --e6-role warmup.",
+    )
+    parser.add_argument(
+        "--e6-reset-lr-each-outer",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "E6 target_branch only: start every target-phase outer solve at "
+            "--carry-lr-max while retaining the restored/current Adam moments. "
+            "The within-outer plateau scheduler is still recreated normally."
+        ),
+    )
     return parser
 
 
 ARGS = build_arg_parser().parse_args()
+
+if ARGS.e6_warm_start:
+    ARGS.e6_warm_start = os.path.abspath(ARGS.e6_warm_start)
+if ARGS.e6_warmup_bundle:
+    ARGS.e6_warmup_bundle = os.path.abspath(ARGS.e6_warmup_bundle)
+ARGS.e6_phase = "target" if ARGS.e6_role == "target_branch" else ARGS.e6_role
+if ARGS.e6_role != "target_branch" and int(ARGS.e6_reset_lr_each_outer) != 0:
+    raise SystemExit(
+        "[config error] --e6-reset-lr-each-outer=1 is valid only with "
+        "--e6-role target_branch."
+    )
+
+if ARGS.e6_role == "standard":
+    if ARGS.e6_warm_start or ARGS.e6_warmup_bundle:
+        raise SystemExit(
+            "[config error] --e6-warm-start/--e6-warmup-bundle require "
+            "--e6-role warmup or target_branch."
+        )
+elif ARGS.e6_role == "warmup":
+    if ARGS.e6_warm_start:
+        raise SystemExit("[config error] E6 warmup cannot use --e6-warm-start.")
+    if not ARGS.e6_warmup_bundle:
+        raise SystemExit("[config error] E6 warmup requires --e6-warmup-bundle.")
+    if ARGS.pres_target is None or not math.isclose(
+        float(ARGS.pres_target), 1.0, rel_tol=0.0, abs_tol=0.0
+    ):
+        raise SystemExit("[config error] E6 warmup requires --pres-target 1.")
+    if int(ARGS.outer_iters) != 1:
+        raise SystemExit("[config error] E6 warmup requires --outer-iters 1.")
+    if ARGS.eval_only or ARGS.timing_mode:
+        raise SystemExit("[config error] E6 warmup is incompatible with eval/timing mode.")
+else:
+    if not ARGS.e6_warm_start:
+        raise SystemExit("[config error] E6 target_branch requires --e6-warm-start.")
+    if ARGS.e6_warmup_bundle:
+        raise SystemExit(
+            "[config error] E6 target_branch cannot write --e6-warmup-bundle."
+        )
+    if ARGS.pres_target is None:
+        raise SystemExit("[config error] E6 target_branch requires --pres-target.")
+    if ARGS.eval_only or ARGS.timing_mode:
+        raise SystemExit(
+            "[config error] E6 target_branch is incompatible with eval/timing mode."
+        )
+
+if ARGS.e6_role != "standard":
+    if str(ARGS.lr_schedule) != "carry_plateau" or str(ARGS.adam_reset) != "keep":
+        raise SystemExit(
+            "[config error] E6 common warm starts require "
+            "--lr-schedule carry_plateau --adam-reset keep."
+        )
+    if not bool(ARGS.inner_best_restore) or int(ARGS.sel_points) <= 0:
+        raise SystemExit(
+            "[config error] E6 common warm starts require "
+            "--inner-best-restore 1 and --sel-points > 0."
+        )
+    if (
+        ARGS.pres_target is None
+        or not math.isfinite(float(ARGS.pres_target))
+        or float(ARGS.pres_target) <= 0.0
+    ):
+        raise SystemExit("[config error] E6 p_res targets must be finite and positive.")
+if int(ARGS.e6_reset_lr_each_outer) == 1:
+    _e6_lr_floor = max(
+        float(ARGS.carry_lr_min), float(ARGS.scheduler_min_lr)
+    )
+    if (
+        not math.isfinite(float(ARGS.carry_lr_max))
+        or float(ARGS.carry_lr_max) <= 0.0
+        or not math.isfinite(_e6_lr_floor)
+        or _e6_lr_floor <= 0.0
+        or float(ARGS.carry_lr_max) < _e6_lr_floor
+    ):
+        raise SystemExit(
+            "[config error] E6 outer LR reset requires finite positive "
+            "carry/scheduler LR bounds with --carry-lr-max >= "
+            "max(--carry-lr-min, --scheduler-min-lr)."
+        )
+
+
+E6_WARMUP_BUNDLE_SCHEMA_VERSION = 1
+E6_WARMUP_BUNDLE_KIND = "liu-pipinn-e6-common-warmup-v1"
+E6_WARM_START_PROTOCOL = "liu-e6-common-warm-start-v1"
+E6_WARM_START_POLICY_SOURCE = "warm_start_value_net"
+E6_TARGET_RESIDUAL_SEMANTICS = (
+    "max_target_phase_outer_post_restore_fixed_qres_excluding_warmup"
+)
+E6_TARGET_REACHED_SEMANTICS = (
+    "all_target_phase_outer_post_restore_fixed_qres_at_or_below_target_"
+    "excluding_warmup"
+)
+
+# Only state-transition settings belong to the compatibility contract.
+# Target, branch length, target-only LR-reset policy, persistence, plotting,
+# diagnostics, paths, and CUDA device index may differ without changing the
+# restored optimization state.  All e6_* keys are therefore intentionally
+# excluded below; config.json and the E6 aggregate group key still retain the
+# reset flag so reset and carry experiments cannot be pooled.
+_E6_COMPAT_IGNORE = {
+    "pres_target",
+    "outer_iters",
+    # The warm-up and target branches may use different safety caps.  The
+    # realized warm-start bundle already fixes the state handed to every
+    # branch, so a later inner-epoch budget is not part of bundle
+    # compatibility (it still remains in each branch's config/provenance).
+    "eval_epochs",
+    "run_tag",
+    "device",
+    "output_root",
+    "weight_root",
+    "eval_only",
+    "timing_mode",
+    "skip_figures",
+    "skip_eval",
+    "skip_plots",
+    "print_every",
+    "print_every_outer",
+    "print_every_eval",
+    "verbose_detail",
+    "save_iterate_every",
+    "e3b_checkpoints",
+    "diag_points",
+    "diag_every",
+    "eval_margin",
+    "test_points",
+    "n_tau",
+    "n_x",
+    "w_levels",
+    "stop_flag_path",
+    "pde_stop_threshold",
+    "pde_stop_start_outer",
+    "pde_stop_patience",
+}
+
+
+def _e6_compatibility_payload(args):
+    payload = {}
+    for key, value in vars(args).items():
+        if key in _E6_COMPAT_IGNORE or key.startswith("e6_"):
+            continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        payload[key] = value
+    for filename in (
+        "joint_market_setup_dirichlet.py",
+        "experiment_utils.py",
+        "liu_risk_premium.py",
+    ):
+        dependency = os.path.join(SCRIPT_DIR, filename)
+        payload[f"_source_sha256_{filename}"] = _sha256_file(dependency)
+    return {key: payload[key] for key in sorted(payload)}
+
+
+def _canonical_json_sha256(payload):
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_tree_sha256(value):
+    """Hash nested model/optimizer/RNG state independently of torch.save."""
+    digest = hashlib.sha256()
+
+    def emit(data):
+        digest.update(len(data).to_bytes(8, byteorder="big", signed=False))
+        digest.update(data)
+
+    def visit(item):
+        if isinstance(item, torch.Tensor):
+            tensor = item.detach().cpu().contiguous()
+            emit(b"torch.Tensor")
+            emit(str(tensor.dtype).encode("utf-8"))
+            emit(json.dumps(list(tensor.shape)).encode("ascii"))
+            emit(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif isinstance(item, np.ndarray):
+            array = np.ascontiguousarray(item)
+            emit(b"numpy.ndarray")
+            emit(array.dtype.str.encode("ascii"))
+            emit(json.dumps(list(array.shape)).encode("ascii"))
+            emit(array.tobytes(order="C"))
+        elif isinstance(item, np.generic):
+            visit(item.item())
+        elif isinstance(item, dict):
+            emit(b"dict")
+            ordered = sorted(
+                item.items(),
+                key=lambda pair: (
+                    type(pair[0]).__module__,
+                    type(pair[0]).__qualname__,
+                    repr(pair[0]),
+                ),
+            )
+            emit(str(len(ordered)).encode("ascii"))
+            for key, child in ordered:
+                visit(key)
+                visit(child)
+        elif isinstance(item, list):
+            emit(b"list")
+            emit(str(len(item)).encode("ascii"))
+            for child in item:
+                visit(child)
+        elif isinstance(item, tuple):
+            emit(b"tuple")
+            emit(str(len(item)).encode("ascii"))
+            for child in item:
+                visit(child)
+        elif isinstance(item, bytes):
+            emit(b"bytes")
+            emit(item)
+        elif item is None:
+            emit(b"none")
+        elif isinstance(item, (bool, int, float, str)):
+            emit(
+                (
+                    f"{type(item).__module__}.{type(item).__qualname__}:"
+                    f"{repr(item)}"
+                ).encode("utf-8")
+            )
+        else:
+            raise TypeError(
+                "unsupported value in canonical state hash: "
+                f"{type(item).__module__}.{type(item).__qualname__}"
+            )
+
+    visit(value)
+    return digest.hexdigest()
+
+
+def _cpu_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _torch_save_atomic(payload, path):
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
+    try:
+        torch.save(payload, tmp_path)
+        with open(tmp_path, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        try:
+            directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _archive_e6_warmup_bundle(path):
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return None
+    archived = f"{path}.old.{time.time_ns()}.{os.getpid()}"
+    os.replace(path, archived)
+    print(f"[E6] previous warm-up bundle archived: {archived}")
+    return archived
+
+
+TRAINER_SOURCE_SHA256 = _sha256_file(os.path.abspath(__file__))
+
+
+def _load_e6_warmup_bundle(path, current_device):
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"E6 warm-up bundle not found: {path}")
+    try:
+        bundle = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        bundle = torch.load(path, map_location="cpu")
+    if not isinstance(bundle, dict):
+        raise TypeError("E6 warm-up bundle must be a mapping")
+    if int(bundle.get("schema_version", -1)) != E6_WARMUP_BUNDLE_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported E6 warm-up schema: {bundle.get('schema_version')!r}"
+        )
+    if bundle.get("kind") != E6_WARMUP_BUNDLE_KIND:
+        raise ValueError(f"unexpected E6 warm-up bundle kind: {bundle.get('kind')!r}")
+    if bundle.get("warm_start_protocol") != E6_WARM_START_PROTOCOL:
+        raise ValueError(
+            "unexpected E6 warm-start protocol: "
+            f"{bundle.get('warm_start_protocol')!r}"
+        )
+    if not str(bundle.get("warm_start_source", "")).strip():
+        raise ValueError("E6 warm-up bundle is missing warm_start_source")
+    if not isinstance(bundle.get("model_state"), dict):
+        raise ValueError("E6 warm-up bundle is missing model_state")
+    if not isinstance(bundle.get("optimizer_state"), dict):
+        raise ValueError("E6 warm-up bundle is missing optimizer_state")
+    if int(bundle.get("outer_count", -1)) != 1:
+        raise ValueError("E6 warm-up bundle must end after exactly one outer solve")
+    warmup_target = float(bundle.get("warmup_pres_target", float("nan")))
+    if not math.isclose(warmup_target, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "E6 warm-up bundle must use warmup_pres_target=1.0, got "
+            f"{warmup_target!r}"
+        )
+    achieved = float(bundle.get("warmup_achieved_pres", float("inf")))
+    if (
+        not math.isfinite(achieved)
+        or achieved <= 0.0
+        or achieved > 1.0 * (1.0 + 1e-9)
+    ):
+        raise ValueError(
+            "E6 warm-up bundle is not admissible: "
+            f"post-restore p_res={achieved!r} must lie in (0,1]"
+        )
+    current_lrs = bundle.get("current_lrs")
+    if (
+        not isinstance(current_lrs, (list, tuple))
+        or not current_lrs
+        or any(
+            not math.isfinite(float(value)) or float(value) <= 0.0
+            for value in current_lrs
+        )
+    ):
+        raise ValueError("E6 warm-up bundle has invalid optimizer LR state")
+    optimizer_param_groups = bundle["optimizer_state"].get("param_groups")
+    if (
+        not isinstance(optimizer_param_groups, list)
+        or len(optimizer_param_groups) != len(current_lrs)
+    ):
+        raise ValueError(
+            "E6 warm-up optimizer param-group count does not match current_lrs"
+        )
+    optimizer_lrs = []
+    for index, group in enumerate(optimizer_param_groups):
+        if not isinstance(group, dict) or "lr" not in group:
+            raise ValueError(
+                f"E6 warm-up optimizer param group {index} is missing its LR"
+            )
+        lr_value = float(group["lr"])
+        if not math.isfinite(lr_value) or lr_value <= 0.0:
+            raise ValueError(
+                f"E6 warm-up optimizer param group {index} has invalid LR"
+            )
+        optimizer_lrs.append(lr_value)
+    if any(
+        float(recorded) != optimizer_lr
+        for recorded, optimizer_lr in zip(current_lrs, optimizer_lrs)
+    ):
+        raise ValueError(
+            "E6 warm-up current_lrs do not match the hashed optimizer state"
+        )
+    expected_compat = _e6_compatibility_payload(ARGS)
+    expected_hash = _canonical_json_sha256(expected_compat)
+    if bundle.get("compatibility_sha256") != expected_hash:
+        stored = bundle.get("compatibility", {})
+        differing = sorted(
+            key
+            for key in set(stored) | set(expected_compat)
+            if stored.get(key) != expected_compat.get(key)
+        )
+        raise ValueError(
+            "E6 warm-up bundle is incompatible with this target branch; "
+            f"differing settings={differing}"
+        )
+    actual_model_hash = _canonical_tree_sha256(bundle["model_state"])
+    if bundle.get("model_state_sha256") != actual_model_hash:
+        raise ValueError("E6 warm-up model-state hash mismatch")
+    actual_optimizer_hash = _canonical_tree_sha256(bundle["optimizer_state"])
+    if bundle.get("optimizer_state_sha256") != actual_optimizer_hash:
+        raise ValueError("E6 warm-up optimizer-state hash mismatch")
+    scheduler_state = bundle.get("scheduler_state")
+    actual_scheduler_hash = _canonical_tree_sha256(scheduler_state)
+    if bundle.get("scheduler_state_sha256") != actual_scheduler_hash:
+        raise ValueError("E6 warm-up scheduler-state hash mismatch")
+    rng_payload = {
+        "torch_cpu_rng_state": bundle.get("torch_cpu_rng_state"),
+        "torch_cuda_rng_state": bundle.get("torch_cuda_rng_state"),
+        "numpy_rng_state": bundle.get("numpy_rng_state"),
+        "python_rng_state": bundle.get("python_rng_state"),
+        "rng_device_type": bundle.get("rng_device_type"),
+    }
+    actual_rng_hash = _canonical_tree_sha256(rng_payload)
+    if bundle.get("rng_state_sha256") != actual_rng_hash:
+        raise ValueError("E6 warm-up RNG-state hash mismatch")
+    expected_warm_start_id = _canonical_json_sha256(
+        {
+            "protocol": E6_WARM_START_PROTOCOL,
+            "compatibility_sha256": bundle["compatibility_sha256"],
+            "seed": int(bundle["seed"]),
+            "market_seed": int(bundle["market_seed"]),
+            "model_sha256": actual_model_hash,
+            "optimizer_sha256": actual_optimizer_hash,
+            "scheduler_sha256": actual_scheduler_hash,
+            "rng_sha256": actual_rng_hash,
+        }
+    )
+    if bundle.get("warm_start_id") != expected_warm_start_id:
+        raise ValueError("E6 warm-up ID does not match the bundled state")
+    if bundle.get("trainer_source_sha256") != TRAINER_SOURCE_SHA256:
+        raise ValueError(
+            "E6 warm-up trainer source differs from the target-branch trainer"
+        )
+    stored_device_type = str(bundle.get("rng_device_type", ""))
+    if stored_device_type != current_device.type:
+        raise ValueError(
+            "E6 warm-up and target branch must use the same device type for "
+            f"exact RNG continuation: stored={stored_device_type!r}, "
+            f"current={current_device.type!r}"
+        )
+    return bundle
+
+
+# Q_res is fixed for the whole run.  E6 Q_sel is outer-specific but fixed
+# within one frozen PDE; outer 1 preserves the historical seed stream.
+PI_PINN_QSEL_MARKET_MULTIPLIER = 7_919
+PI_PINN_QSEL_SEED_OFFSET = 101
+PI_PINN_QSEL_OUTER_STRIDE = 104_729
+PI_PINN_QSEL_SEED_MODULUS = 2**63 - 1
+
+
+def qsel_seed_for_outer(market_seed, outer_iter):
+    outer_iter = int(outer_iter)
+    if outer_iter < 1:
+        raise ValueError("outer_iter must use one-based indexing")
+    return int(
+        (
+            int(market_seed) * PI_PINN_QSEL_MARKET_MULTIPLIER
+            + PI_PINN_QSEL_SEED_OFFSET
+            + (outer_iter - 1) * PI_PINN_QSEL_OUTER_STRIDE
+        )
+        % PI_PINN_QSEL_SEED_MODULUS
+    )
 RISK_PREMIUM_MODE = str(ARGS.risk_premium_mode)
 NONAFFINE_EPS = float(ARGS.nonaffine_eps)
 NONAFFINE_LOADING_SCALE = float(ARGS.nonaffine_loading_scale)
@@ -174,9 +658,20 @@ SEED = ARGS.seed
 MARKET_SEED = ARGS.market_seed if ARGS.market_seed is not None else ARGS.seed
 device = resolve_device(ARGS.device)
 set_reproducibility(SEED, device)
+random.seed(SEED)
 if torch.cuda.is_available() and str(device).startswith("cuda"):
     torch.cuda.reset_peak_memory_stats(device)
 print(f"Device: {device}")
+
+# Validate a target-branch bundle before recorder rotation.  A typo,
+# incompatible configuration, or corrupted bundle must not quarantine a
+# previously successful run that happens to share the same output tag.
+E6_LOADED_BUNDLE = None
+if ARGS.e6_role == "target_branch":
+    try:
+        E6_LOADED_BUNDLE = _load_e6_warmup_bundle(ARGS.e6_warm_start, device)
+    except Exception as exc:
+        raise SystemExit(f"[E6 warm-start error] {exc}") from exc
 
 
 def print_joint_market_report(params, gamma=2.0, Y_ref=None):
@@ -279,6 +774,30 @@ if (
     raise SystemExit(0)
 
 recorder = ExperimentRecorder(output_dir, weight_dir, ARGS)
+E6_RUNTIME_PROVENANCE = {}
+
+
+def _record_unhandled_training_failure(exc_type, exc_value, exc_traceback):
+    """Ensure an uncaught training/evaluation exception leaves failed status."""
+    if not ARGS.eval_only:
+        try:
+            recorder.mark_failed(
+                reason=f"{exc_type.__name__}: {exc_value}",
+                e6_role=ARGS.e6_role,
+                e6_phase=ARGS.e6_phase,
+                e6_reset_lr_each_outer=int(ARGS.e6_reset_lr_each_outer),
+                e6_target_outer_start_lr=(
+                    float(ARGS.carry_lr_max)
+                    if bool(ARGS.e6_reset_lr_each_outer) else None
+                ),
+                **E6_RUNTIME_PROVENANCE,
+            )
+        except Exception:
+            pass
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+
+sys.excepthook = _record_unhandled_training_failure
 if ARGS.eval_only:
     # Delay writing config_eval.json until the immutable training config and
     # complete market snapshot have both passed provenance validation.
@@ -287,7 +806,16 @@ else:
     # Quarantine the complete previous attempt before creating the new
     # canonical config/checkpoint namespace.
     recorder.rotate_training_logs()
-    recorder.save_config()
+    recorder.save_config(
+        extra={
+            "trainer_source_sha256": TRAINER_SOURCE_SHA256,
+            "e6_warm_start_protocol": E6_WARM_START_PROTOCOL,
+        }
+    )
+    if ARGS.e6_role == "warmup":
+        # A forced rerun cannot leave an older valid bundle at the canonical
+        # path if this replacement warm-up later fails.
+        _archive_e6_warmup_bundle(ARGS.e6_warmup_bundle)
 
 # Time domain (τ = remaining horizon = T - t)
 tau_max = ARGS.tau_max
@@ -1024,7 +1552,7 @@ class PIPINN_KimOmbergND:
             min_lr=self._effective_min_lr()
         )
 
-    def prepare_optimizer_for_outer(self):
+    def prepare_optimizer_for_outer(self, reset_lr_to_max=False):
         """Called at the START of every outer iteration.
 
         inner_plateau: restart the LR protocol so every policy evaluation
@@ -1040,10 +1568,23 @@ class PIPINN_KimOmbergND:
         inheriting a dead LR (e.g. min_lr) from a previous evaluation.
         outer_plateau / fixed: no per-outer action (legacy persistent
         scheduler / constant LR).
+
+        reset_lr_to_max is the E6 target-branch protocol: keep the current
+        model and Adam moments, but restore every target-phase outer-start LR
+        to carry_lr_max before creating the fresh within-outer scheduler.
         """
+        reset_lr_to_max = bool(reset_lr_to_max)
+        if reset_lr_to_max and (
+            self.lr_schedule != "carry_plateau" or self.adam_reset != "keep"
+        ):
+            raise ValueError(
+                "outer LR reset requires carry_plateau with adam_reset=keep"
+            )
         self._outer_count += 1
         if self.lr_schedule == "carry_plateau":
-            if self._outer_count <= 1:
+            if reset_lr_to_max:
+                outer_lr = float(self.carry_lr_max)
+            elif self._outer_count <= 1:
                 outer_lr = self.initial_lr
                 if self.adam_reset == "full":
                     print("[warn] carry_plateau is designed for adam_reset=keep; "
@@ -1063,22 +1604,30 @@ class PIPINN_KimOmbergND:
                 for g in self.optimizer.param_groups:
                     g["lr"] = outer_lr
             self.scheduler = self._make_scheduler()
-            return
+            return float(outer_lr)
         if self.lr_schedule != "inner_plateau":
-            return
+            return float(self.optimizer.param_groups[0]["lr"])
         if self.adam_reset == "full":
             self.optimizer = torch.optim.Adam(self.value_net.parameters(), lr=self.initial_lr)
         else:
             for g in self.optimizer.param_groups:
                 g["lr"] = self.initial_lr
         self.scheduler = self._make_scheduler()
+        return float(self.optimizer.param_groups[0]["lr"])
 
-    def policy_improvement_chunked(self, w, x, tau, chunk=4096):
+    def policy_improvement_chunked(self, w, x, tau, chunk=4096, net=None):
         """policy_improvement in chunks (for large held-out sets)."""
         outs = []
         n = w.shape[0]
         for i in range(0, n, chunk):
-            outs.append(self.policy_improvement(w[i:i + chunk], x[i:i + chunk], tau[i:i + chunk]))
+            outs.append(
+                self.policy_improvement(
+                    w[i:i + chunk],
+                    x[i:i + chunk],
+                    tau[i:i + chunk],
+                    net=net,
+                )
+            )
         return torch.cat(outs, dim=0)
 
     def evaluate_heldout_pres(self, theta_val, val_set, chunk=4096):
@@ -1173,6 +1722,7 @@ class PIPINN_KimOmbergND:
         restore_best=False,
         resample_every=0,
         resample_fn=None,
+        reset_lr_next_outer=False,
     ):
         """Train V_n by solving the LINEAR PDE with fixed θ_n.
 
@@ -1182,6 +1732,12 @@ class PIPINN_KimOmbergND:
         In inner_plateau mode the (freshly reset) scheduler steps on every
         inner epoch. Returns an extra eval_info dict with the end-of-
         evaluation held-out measurement (the reported p_res,n)."""
+        if pres_target is not None and val_fn is None:
+            raise ValueError("pres_target requires a fixed Q_res validation function")
+        if pres_target is not None and restore_best and sel_fn is None:
+            raise ValueError(
+                "target-eligible held-out restore requires a fixed Q_sel function"
+            )
         loss_hist = []
         best_loss = float("inf")
         best_state = None
@@ -1191,10 +1747,15 @@ class PIPINN_KimOmbergND:
 
         theta_n_fixed = theta_n.detach()
 
-        target_reached = False
+        # The training-time crossing controls early stopping.  The official
+        # target outcome is recomputed only after the selected model+Adam state
+        # has been restored and Q_res has been re-evaluated on that exact state.
+        training_target_crossed = False
         epochs_used = 0
         last_val = None          # (pde_rms, term_rms, pres)
         last_val_epoch = -1
+        val_pres_at_stop = ""
+        val_pres_at_stop_epoch = ""
 
         # Inner held-out BEST selection on a small dedicated selection set.
         # POST-update state copies are matched with the POST-update validation
@@ -1205,11 +1766,15 @@ class PIPINN_KimOmbergND:
         best_sel_epoch = -1
         sel_no_improve = 0
         sel_checks = 0
+        sel_eligible_checks = 0
+        sel_ineligible_checks = 0
         sel_stopped = False
+        selection_requires_target = bool(restore_best and pres_target is not None)
 
         def _run_sel_check(epoch_idx):
             nonlocal best_sel_pres, best_sel_state, best_sel_epoch
             nonlocal sel_no_improve, sel_checks, sel_stopped
+            nonlocal sel_eligible_checks, sel_ineligible_checks
             v = sel_fn()
             sel_checks += 1
             # carry_plateau: the scheduler is driven by THIS held-out
@@ -1217,6 +1782,25 @@ class PIPINN_KimOmbergND:
             # never by the per-epoch noisy training loss.
             if self.lr_schedule == "carry_plateau" and self.scheduler is not None:
                 self.scheduler.step(float(v[2]))
+            # Q_sel is the ranking score, but a restorable checkpoint in an
+            # E6 target solve must satisfy the SAME fixed Q_res target on this
+            # exact network state.  An ineligible candidate neither replaces
+            # the best checkpoint nor advances selection patience.
+            qres_v = None
+            eligible = True
+            if selection_requires_target:
+                if last_val_epoch == int(epoch_idx) and last_val is not None:
+                    qres_v = last_val
+                else:
+                    qres_v = _run_val_check(
+                        epoch_idx, detect_training_crossing=True
+                    )
+                eligible = bool(qres_v[2] <= float(pres_target))
+            if not eligible:
+                sel_ineligible_checks += 1
+                return v
+
+            sel_eligible_checks += 1
             if v[2] < best_sel_pres:
                 best_sel_pres = v[2]
                 best_sel_epoch = epoch_idx
@@ -1231,6 +1815,7 @@ class PIPINN_KimOmbergND:
                     "lr": float(self.optimizer.param_groups[0]["lr"]),
                     "epoch": int(epoch_idx),
                     "pres": float(v[2]),
+                    "qres_pres": float(qres_v[2]) if qres_v is not None else "",
                 }
                 sel_no_improve = 0
             else:
@@ -1239,19 +1824,27 @@ class PIPINN_KimOmbergND:
                     sel_stopped = True
             return v
 
-        def _run_val_check(epoch_idx):
-            nonlocal last_val, last_val_epoch, target_reached
+        def _run_val_check(epoch_idx, detect_training_crossing=True):
+            nonlocal last_val, last_val_epoch, training_target_crossed
+            nonlocal val_pres_at_stop, val_pres_at_stop_epoch
             v = val_fn()
             last_val, last_val_epoch = v, epoch_idx
-            if pres_target is not None and v[2] <= float(pres_target):
-                target_reached = True
+            if (
+                detect_training_crossing
+                and not training_target_crossed
+                and pres_target is not None
+                and v[2] <= float(pres_target)
+            ):
+                training_target_crossed = True
+                val_pres_at_stop = float(v[2])
+                val_pres_at_stop_epoch = int(epoch_idx)
             return v
 
         # Epoch-0 pre-check: a warm-started iterate may already satisfy the
         # target; stop before any (freshly reset, large-LR) step perturbs it.
         if val_fn is not None and pres_target is not None:
             _run_val_check(0)
-            if target_reached and print_every and print_every > 0:
+            if training_target_crossed and print_every and print_every > 0:
                 print(f"      [Eval] pres target already satisfied at inner epoch 0 "
                       f"(p_res={last_val[2]:.3e} <= {float(pres_target):g}); skipping this evaluation.")
 
@@ -1276,7 +1869,7 @@ class PIPINN_KimOmbergND:
                 if print_every and print_every > 0:
                     print(f"      [Eval {epoch:4d}] resampled collocation batch "
                           f"(#{n_resamples}) under the frozen policy")
-            if target_reached:
+            if training_target_crossed or sel_stopped:
                 break
             self.optimizer.zero_grad()
 
@@ -1361,7 +1954,7 @@ class PIPINN_KimOmbergND:
                       f"Term={row['terminal']:.3e} | Mono={row['mono']:.3e} | Conc={row['conc']:.3e} | "
                       f"RRA(η-γ)²={row['rra']:.3e}{extra} | LR={lr_now:.2e}")
 
-            if target_reached:
+            if training_target_crossed:
                 if print_every and print_every > 0:
                     print(f"      [Eval] pres target reached at inner epoch {epoch} "
                           f"(p_res={last_val[2]:.3e} <= {float(pres_target):g}); stopping this evaluation.")
@@ -1414,6 +2007,18 @@ class PIPINN_KimOmbergND:
                 "synthetic": True,  # epoch-0 diagnostic row: no optimizer step
             })
 
+        # If a target/cap stopped between regular selection checks, make the
+        # actual terminal inner state eligible.  Otherwise epoch zero can be
+        # restored merely because the stopping epoch was off the Q_sel cadence.
+        if (
+            sel_fn is not None
+            and epochs_used > 0
+            and epochs_used % max(1, int(sel_every)) != 0
+            and not sel_stopped
+        ):
+            sv = _run_sel_check(epochs_used)
+            loss_hist[-1]["sel_pres"] = sv[2]
+
         # End-of-evaluation held-out measurement: this is the reported
         # p_res,n. If the last check already happened at the final state
         # (stop epoch or cap epoch divisible by val_every), reuse it.
@@ -1425,16 +2030,20 @@ class PIPINN_KimOmbergND:
         lr_best_checkpoint = ""
         lr_after_restore = ""
         lr_carried_next = ""
+        end_lrs = [float(g["lr"]) for g in self.optimizer.param_groups]
         if restore_best and best_sel_state is not None:
-            # Restore model weights + Adam moments from the inner best. The LR
-            # handed to the next outer is NOT the raw best-checkpoint LR:
+            # Restore model weights + Adam moments from the inner best. Under
+            # the ordinary carry rule, the LR handed to the next outer is NOT
+            # the raw best-checkpoint LR:
             #     LR_{n+1} = max(scheduler_min_lr, min(LR_best, LR_end)).
             # If the schedule already decayed past the best checkpoint, keep
             # the LOWER end-of-inner LR (so an epoch-0 best still retries at a
             # lower LR, and the LR is non-increasing across outer boundaries,
             # true to the carry_plateau name). LR is not part of the Adam
             # moments, so pairing best moments with a lower LR is consistent.
-            end_lrs = [float(g["lr"]) for g in self.optimizer.param_groups]
+            # The E6 target-reset rule keeps this internally restored state but
+            # explicitly replaces its LR with carry_lr_max at the next outer
+            # start; model parameters and moments are not recreated.
             self.value_net.load_state_dict(best_sel_state["model"])
             self.optimizer.load_state_dict(best_sel_state["opt"])
             floor_lr = self._effective_min_lr()
@@ -1451,21 +2060,61 @@ class PIPINN_KimOmbergND:
             # reset the LR at the next outer anyway.
             lr_after_restore = carried[0]
             if self.lr_schedule == "carry_plateau":
-                lr_carried_next = min(float(self.carry_lr_max), carried[0])
+                lr_carried_next = (
+                    float(self.carry_lr_max)
+                    if reset_lr_next_outer
+                    else min(float(self.carry_lr_max), carried[0])
+                )
             else:
                 lr_carried_next = ""
             last_val_epoch = -1  # force the audit re-measurement below
 
+        # lr_carried_next means the actual next-outer start LR.  Under the E6
+        # target reset protocol this is carry_lr_max even when no inner-best
+        # checkpoint was restored (for example, an epoch-0 target crossing).
+        if self.lr_schedule == "carry_plateau" and reset_lr_next_outer:
+            lr_carried_next = float(self.carry_lr_max)
+
         if val_fn is not None and last_val_epoch != epochs_used:
-            _run_val_check(epochs_used)
+            # Explicitly post-restore.  Do not alter the sticky training-time
+            # crossing used to terminate optimizer steps.
+            _run_val_check(epochs_used, detect_training_crossing=False)
+
+        if (
+            selection_requires_target
+            and best_sel_state is not None
+            and last_val is not None
+            and float(last_val[2]) > float(pres_target) * (1.0 + 1e-6)
+        ):
+            raise RuntimeError(
+                "target-eligible Q_sel checkpoint failed deterministic "
+                "post-restore Q_res remeasurement: "
+                f"selected={best_sel_state['qres_pres']}, "
+                f"restored={float(last_val[2]):.6e}, "
+                f"target={float(pres_target):.6e}"
+            )
+
+        official_target_reached = bool(
+            pres_target is not None
+            and last_val is not None
+            and float(last_val[2]) <= float(pres_target)
+        )
 
         last_loss = float(loss_hist[-1]["total"]) if loss_hist else float("inf")
 
         eval_info = {
             "n_resamples": n_resamples,
             "epochs_used": int(epochs_used),
-            "target_reached": bool(target_reached),
+            # Back-compatible field now has the official post-restore meaning.
+            "target_reached": official_target_reached,
+            "target_reached_post_restore": official_target_reached,
+            "training_target_crossed": bool(training_target_crossed),
+            "val_pres_at_stop": val_pres_at_stop,
+            "val_pres_at_stop_epoch": val_pres_at_stop_epoch,
             "sel_best_pres": best_sel_state["pres"] if best_sel_state is not None else "",
+            "sel_best_qres_pres": (
+                best_sel_state["qres_pres"] if best_sel_state is not None else ""
+            ),
             "sel_best_epoch": best_sel_state["epoch"] if best_sel_state is not None else "",
             "sel_best_lr": best_sel_state["lr"] if best_sel_state is not None else "",
             "lr_end_before_restore": lr_end_before_restore,
@@ -1473,11 +2122,16 @@ class PIPINN_KimOmbergND:
             "lr_after_restore": lr_after_restore,
             "lr_carried_next": lr_carried_next,
             "sel_checks": int(sel_checks),
+            "sel_eligible_checks": int(sel_eligible_checks),
+            "sel_ineligible_checks": int(sel_ineligible_checks),
             "sel_stopped": int(bool(sel_stopped)),
             "sel_restored": int(bool(restore_best and best_sel_state is not None)),
             "val_pde_rms": last_val[0] if last_val is not None else "",
             "val_terminal_rms": last_val[1] if last_val is not None else "",
             "val_pres": last_val[2] if last_val is not None else "",
+            "val_pde_rms_post_restore": last_val[0] if last_val is not None else "",
+            "val_terminal_rms_post_restore": last_val[1] if last_val is not None else "",
+            "val_pres_post_restore": last_val[2] if last_val is not None else "",
             "train_pres": loss_hist[-1].get("train_pres", "") if loss_hist else "",
         }
 
@@ -1572,9 +2226,22 @@ class PIPINN_KimOmbergND:
         diag_margin=0.0,
         diag_every=1,
         timing_mode=False,
+        e6_role="standard",
+        e6_reset_lr_each_outer=False,
+        e6_warm_start_provenance=None,
         recorder=None,
         stopper=None
     ):
+        e6_role = str(e6_role)
+        if e6_role not in {"standard", "warmup", "target_branch"}:
+            raise ValueError(f"unsupported E6 role: {e6_role!r}")
+        is_target_branch = e6_role == "target_branch"
+        e6_reset_lr_each_outer = bool(e6_reset_lr_each_outer)
+        if e6_reset_lr_each_outer and not is_target_branch:
+            raise ValueError(
+                "e6_reset_lr_each_outer is valid only for target_branch"
+            )
+        algorithm_outer_offset = 1 if is_target_branch else 0
         print(f"\n{'='*70}")
         print(f"PI-PINN ND (No Policy Net): N={self.N}, M={self.M}")
         print(f"  outer_iters   : {outer_iters}")
@@ -1587,6 +2254,15 @@ class PIPINN_KimOmbergND:
         print(f"  init LR       : {self.initial_lr:.2e}")
         print(f"  lr schedule   : {self.lr_schedule} (adam_reset={self.adam_reset}, patience={self.scheduler_patience})")
         print(f"  pres target   : {pres_target}  (val: {val_points} int + {val_terminal_points} term pts, check every {val_every} inner epochs)")
+        print(f"  E6 role       : {e6_role}")
+        print(
+            "  E6 outer LR reset: "
+            f"{int(e6_reset_lr_each_outer)}"
+            + (
+                f" (target outer-start LR={self.carry_lr_max:.2e})"
+                if e6_reset_lr_each_outer else ""
+            )
+        )
         print(f"{'='*70}\n")
 
         results = {
@@ -1600,8 +2276,12 @@ class PIPINN_KimOmbergND:
             "inner_epochs_used": [],
             "lr": [],
             "loss_history": [],
+            "outer_rows": [],
             "stopped_early": False,
             "stop_info": {},
+            "target_flags": [],
+            "training_target_flags": [],
+            "warm_start_provenance": dict(e6_warm_start_provenance or {}),
         }
 
         # Held-out validation set: sampled ONCE per run with a dedicated RNG
@@ -1615,18 +2295,25 @@ class PIPINN_KimOmbergND:
                 self.M, X_min, X_max, W_min, W_max, tau_max, seed=val_seed,
             )
 
-        # Small dedicated SELECTION set for the inner held-out best (distinct
-        # RNG stream from the big audit set so selection never sees the audit
-        # points). Part of the training protocol, so NOT gated by timing_mode.
-        sel_set = None
-        if inner_best_restore and sel_points and sel_points > 0:
-            sel_set = build_validation_set(
+        # Standard runs keep the historical run-fixed Q_sel design.  E6 uses
+        # an outer-specific (but inner-fixed) Q_sel keyed by the full
+        # algorithmic iteration; warm-up outer 1 retains this same base seed.
+        sel_set_standard = None
+        if (
+            e6_role == "standard"
+            and inner_best_restore
+            and sel_points
+            and sel_points > 0
+        ):
+            sel_set_standard = build_validation_set(
                 int(sel_points), max(1, int(sel_terminal_points)), self.device,
                 self.M, X_min, X_max, W_min, W_max, tau_max,
-                seed=int(val_seed) * 7919 + 101,
+                seed=qsel_seed_for_outer(int(val_seed), 1),
             )
+        if inner_best_restore and sel_points and sel_points > 0:
             print(f"  selection set : {sel_points} interior / {sel_terminal_points} terminal "
-                  f"(check every {sel_every} epochs, patience {sel_patience}, restore ON)")
+                  f"(check every {sel_every} epochs, patience {sel_patience}, restore ON; "
+                  f"{'outer-specific' if e6_role != 'standard' else 'run-fixed'})")
 
         # Fixed Q_ev diagnostics plus a dedicated full-window Q_col design for
         # frozen-policy ellipticity.  Both use the MARKET seed so all training
@@ -1686,13 +2373,21 @@ class PIPINN_KimOmbergND:
             "theta_diff", "eval_loss", "lr", "best_loss", "elapsed_sec", "stopped", "stop_reason",
         ]
         outer_fields = [
-            "timestamp", "model_type", "run_tag", "outer_iter", "total_loss", "pde_loss",
+            "timestamp", "model_type", "run_tag", "outer_iter",
+            "algorithm_outer_iter", "e6_phase",
+            "warmup_excluded_from_achieved_pres",
+            "e6_reset_lr_each_outer", "outer_start_lr",
+            "total_loss", "pde_loss",
             "terminal_loss", "monotonicity_loss", "concavity_loss", "rra_loss", "theta_diff", "theta_cf_diff", "eval_loss",
             "train_pres", "val_pde_rms", "val_terminal_rms", "val_pres",
-            "inner_epochs_used", "target_reached",
-            "sel_best_pres", "sel_best_epoch", "sel_best_lr",
+            "val_pres_at_stop", "val_pres_at_stop_epoch",
+            "val_pres_post_restore", "achieved_pres",
+            "inner_epochs_used", "n_resamples", "target_reached",
+            "target_reached_post_restore", "training_target_crossed",
+            "sel_best_pres", "sel_best_qres_pres", "sel_best_epoch", "sel_best_lr",
             "lr_end_before_restore", "lr_best_checkpoint", "lr_after_restore", "lr_carried_next",
-            "sel_checks", "sel_stopped", "sel_restored",
+            "sel_checks", "sel_eligible_checks", "sel_ineligible_checks",
+            "sel_stopped", "sel_restored", "q_sel_seed",
             "e_V_sup", "e_bundle_sup", "e_Xev",
             "e_Vw_sup", "e_Vww_sup", "e_Vwx_sup",
             "diag_RelL2_V", "diag_RelL2_theta", "diag_RelL2_vartheta",
@@ -1718,16 +2413,31 @@ class PIPINN_KimOmbergND:
                 torch.cuda.synchronize(self.device)
             return float(time.perf_counter() - core_train_start)
 
-        # initial collocation points + theta_0
-        w_colloc, x_colloc, tau_colloc = sample_interior(batch_size, self.device, self.M, X_min, X_max, W_min, W_max, tau_max)
-        # w_term, x_term, tau_term = sample_terminal(batch_size // 2, self.device, self.M, X_min, X_max, W_min, W_max)
-        w_term, x_term, tau_term = sample_terminal(max(1, int(batch_size * terminal_frac)), self.device, self.M, X_min, X_max, W_min, W_max)
-        V_T_target = V_terminal(w_term, self.gamma).detach()
-
-        theta_n = self.initialize_theta(w_colloc, x_colloc, tau_colloc, method=theta_init_method)
-        print(f"Initial θ stats: mean={theta_n.mean().item():.4f}, std={theta_n.std().item():.4f}")
+        # The historical initial-policy print consumes global training RNG.
+        # A target branch must begin at the exact RNG state captured after the
+        # warm-up, so it intentionally skips this unused diagnostic draw.
+        if is_target_branch:
+            print("Initial value iterate: restored common E6 warm-up v~_0")
+        else:
+            w_colloc, x_colloc, tau_colloc = sample_interior(
+                batch_size, self.device, self.M,
+                X_min, X_max, W_min, W_max, tau_max,
+            )
+            w_term, x_term, tau_term = sample_terminal(
+                max(1, int(batch_size * terminal_frac)), self.device, self.M,
+                X_min, X_max, W_min, W_max,
+            )
+            V_T_target = V_terminal(w_term, self.gamma).detach()
+            theta_n = self.initialize_theta(
+                w_colloc, x_colloc, tau_colloc, method=theta_init_method
+            )
+            print(
+                f"Initial θ stats: mean={theta_n.mean().item():.4f}, "
+                f"std={theta_n.std().item():.4f}"
+            )
 
         for it in range(1, outer_iters + 1):
+            algorithm_outer_iter = int(it + algorithm_outer_offset)
             if stopper is not None and stopper.shared_stop_exists():
                 info = stopper.mark_from_existing_flag(outer_iter=it, pde_loss=None)
                 results["stopped_early"] = True
@@ -1743,11 +2453,21 @@ class PIPINN_KimOmbergND:
             w_term, x_term, tau_term = sample_terminal(max(1, int(batch_size * terminal_frac)), self.device, self.M, X_min, X_max, W_min, W_max)
             V_T_target = V_terminal(w_term, self.gamma).detach()
 
-            # θ_n from previous V (policy improvement), except first iter
-            if it > 1:
-                theta_n = self.policy_improvement(w_colloc, x_colloc, tau_colloc)
+            # Freeze one OUTER-start policy source.  Target-branch local outer
+            # 1 is algorithmic outer 2 and must use the greedy policy induced
+            # by restored v~_0, never the analytic initialization.
+            policy_source = None
+            if is_target_branch or it > 1:
+                policy_source = copy.deepcopy(self.value_net).eval()
+                for _p in policy_source.parameters():
+                    _p.requires_grad_(False)
+                theta_n = self.policy_improvement(
+                    w_colloc, x_colloc, tau_colloc, net=policy_source
+                )
             else:
-                theta_n = self.initialize_theta(w_colloc, x_colloc, tau_colloc, method=theta_init_method)
+                theta_n = self.initialize_theta(
+                    w_colloc, x_colloc, tau_colloc, method=theta_init_method
+                )
                 with torch.no_grad():
                     _t0 = torch.norm(theta_n / torch.clamp(w_colloc, min=1e-8), dim=1)
                     results["theta0_norm_max"] = float(_t0.max().item())
@@ -1761,12 +2481,6 @@ class PIPINN_KimOmbergND:
             # collocation points during this policy evaluation.
             resample_fn = None
             if pe_resample_every and pe_resample_every > 0:
-                policy_source = None
-                if it > 1:
-                    policy_source = copy.deepcopy(self.value_net).eval()
-                    for _p in policy_source.parameters():
-                        _p.requires_grad_(False)
-
                 def _resample(_src=policy_source):
                     w_c, x_c, t_c = sample_interior(
                         batch_size, self.device, self.M, X_min, X_max, W_min, W_max, tau_max)
@@ -1792,9 +2506,11 @@ class PIPINN_KimOmbergND:
             frozen_lam_max = ""
             frozen_clip_frac = ""
             if val_set is not None:
-                if it > 1:
+                if policy_source is not None:
                     theta_val = self.policy_improvement_chunked(
-                        val_set["w_int"], val_set["x_int"], val_set["tau_int"])
+                        val_set["w_int"], val_set["x_int"], val_set["tau_int"],
+                        net=policy_source,
+                    )
                 else:
                     theta_val = self.initialize_theta(
                         val_set["w_int"], val_set["x_int"], val_set["tau_int"],
@@ -1810,9 +2526,10 @@ class PIPINN_KimOmbergND:
                 and (it == 1 or diag_every <= 1 or it % diag_every == 0 or it == outer_iters)
             )
             if _do_frozen_diag:
-                if it > 1:
+                if policy_source is not None:
                     _theta_diag = self.policy_improvement_chunked(
-                        diag_col["w_int"], diag_col["x_int"], diag_col["tau_int"]
+                        diag_col["w_int"], diag_col["x_int"], diag_col["tau_int"],
+                        net=policy_source,
                     )
                 else:
                     _theta_diag = self.initialize_theta(
@@ -1829,20 +2546,41 @@ class PIPINN_KimOmbergND:
                     frozen_clip_frac = float(
                         np.mean(np.any(np.abs(_tv) >= _c - 1e-12, axis=1))
                     )
-                if it == 1:
+                if algorithm_outer_iter == 1:
                     results["theta0_lam_min_sigma"] = frozen_lam_min
                     results["theta0_lam_max_sigma"] = frozen_lam_max
                     print(f"  [init policy] lam(Sigma^theta0) on Q_col subsample: "
                           f"min = {frozen_lam_min:.4e}, max = {frozen_lam_max:.4e}")
+
+            q_sel_seed = ""
+            sel_set = sel_set_standard
+            if (
+                e6_role != "standard"
+                and inner_best_restore
+                and sel_points
+                and sel_points > 0
+            ):
+                q_sel_seed = qsel_seed_for_outer(
+                    int(val_seed), algorithm_outer_iter
+                )
+                sel_set = build_validation_set(
+                    int(sel_points), max(1, int(sel_terminal_points)), self.device,
+                    self.M, X_min, X_max, W_min, W_max, tau_max,
+                    seed=q_sel_seed,
+                )
+            elif sel_set is not None:
+                q_sel_seed = qsel_seed_for_outer(int(val_seed), 1)
 
             sel_fn = None
             if sel_set is None and self.lr_schedule == "carry_plateau" and it == 1:
                 print("[warn] carry_plateau without a selection set: the scheduler "
                       "never steps (constant carried LR). Enable inner_best/sel_points.")
             if sel_set is not None:
-                if it > 1:
+                if policy_source is not None:
                     theta_sel = self.policy_improvement_chunked(
-                        sel_set["w_int"], sel_set["x_int"], sel_set["tau_int"])
+                        sel_set["w_int"], sel_set["x_int"], sel_set["tau_int"],
+                        net=policy_source,
+                    )
                 else:
                     theta_sel = self.initialize_theta(
                         sel_set["w_int"], sel_set["x_int"], sel_set["tau_int"],
@@ -1850,8 +2588,14 @@ class PIPINN_KimOmbergND:
                 theta_sel = theta_sel.detach()
                 sel_fn = lambda: self.evaluate_heldout_pres(theta_sel, sel_set)
 
-            # LR protocol for this outer iteration (inner_plateau: reset).
-            self.prepare_optimizer_for_outer()
+            # LR protocol for this outer iteration.  Only an E6 target branch
+            # may restart at carry_lr_max; standard PI-PINN and the common
+            # warm-up preserve the historical carry behavior.
+            outer_start_lr = self.prepare_optimizer_for_outer(
+                reset_lr_to_max=(
+                    is_target_branch and e6_reset_lr_each_outer
+                )
+            )
 
             # === Policy Evaluation ===
             eval_hist, inner_best_eval_loss, inner_best_state, inner_best_epoch, last_eval_loss, eval_info = self.policy_evaluation(
@@ -1873,14 +2617,24 @@ class PIPINN_KimOmbergND:
                 restore_best=bool(inner_best_restore),
                 resample_every=pe_resample_every,
                 resample_fn=resample_fn,
+                reset_lr_next_outer=(
+                    is_target_branch and e6_reset_lr_each_outer
+                ),
             )
 
             results["loss_history"].extend(eval_hist)
             results["eval_loss"].append(last_eval_loss)
             results["val_pde_rms"].append(eval_info.get("val_pde_rms", ""))
             results["val_terminal_rms"].append(eval_info.get("val_terminal_rms", ""))
-            results["val_pres"].append(eval_info.get("val_pres", ""))
+            achieved_pres = eval_info.get("val_pres_post_restore", "")
+            results["val_pres"].append(achieved_pres)
             results["inner_epochs_used"].append(eval_info.get("epochs_used", 0))
+            results["target_flags"].append(
+                bool(eval_info.get("target_reached_post_restore", False))
+            )
+            results["training_target_flags"].append(
+                bool(eval_info.get("training_target_crossed", False))
+            )
 
             # Fixed-set diagnostics for iterate v~_it: e_n components (E3-a)
             # and the stability margins (E1-b/c analogues).
@@ -1974,7 +2728,9 @@ class PIPINN_KimOmbergND:
             stop_triggered = False
             stop_meta = {"active": False, "is_bad": False, "bad_count": 0}
             if stopper is not None:
-                stop_triggered, stop_meta = stopper.update(it, float(last["pde"]))
+                stop_triggered, stop_meta = stopper.update(
+                    algorithm_outer_iter, float(last["pde"])
+                )
 
             # CSV: inner training rows for this outer iteration
             # (skipped entirely in timing mode: per-epoch appends are not
@@ -2021,6 +2777,14 @@ class PIPINN_KimOmbergND:
                     "model_type": ARGS.model_type,
                     "run_tag": ARGS.run_tag,
                     "outer_iter": it,
+                    "algorithm_outer_iter": algorithm_outer_iter,
+                    "e6_phase": (
+                        "target" if is_target_branch
+                        else ("warmup" if e6_role == "warmup" else "standard")
+                    ),
+                    "warmup_excluded_from_achieved_pres": int(is_target_branch),
+                    "e6_reset_lr_each_outer": int(e6_reset_lr_each_outer),
+                    "outer_start_lr": outer_start_lr,
                     "total_loss": last.get("total", ""),
                     "pde_loss": last.get("pde", ""),
                     "terminal_loss": last.get("terminal", ""),
@@ -2033,10 +2797,24 @@ class PIPINN_KimOmbergND:
                     "train_pres": eval_info.get("train_pres", ""),
                     "val_pde_rms": eval_info.get("val_pde_rms", ""),
                     "val_terminal_rms": eval_info.get("val_terminal_rms", ""),
-                    "val_pres": eval_info.get("val_pres", ""),
+                    "val_pres": achieved_pres,
+                    "val_pres_at_stop": eval_info.get("val_pres_at_stop", ""),
+                    "val_pres_at_stop_epoch": eval_info.get(
+                        "val_pres_at_stop_epoch", ""
+                    ),
+                    "val_pres_post_restore": achieved_pres,
+                    "achieved_pres": achieved_pres,
                     "inner_epochs_used": eval_info.get("epochs_used", ""),
+                    "n_resamples": eval_info.get("n_resamples", ""),
                     "target_reached": int(bool(eval_info.get("target_reached", False))),
+                    "target_reached_post_restore": int(
+                        bool(eval_info.get("target_reached_post_restore", False))
+                    ),
+                    "training_target_crossed": int(
+                        bool(eval_info.get("training_target_crossed", False))
+                    ),
                     "sel_best_pres": eval_info.get("sel_best_pres", ""),
+                    "sel_best_qres_pres": eval_info.get("sel_best_qres_pres", ""),
                     "sel_best_epoch": eval_info.get("sel_best_epoch", ""),
                     "sel_best_lr": eval_info.get("sel_best_lr", ""),
                     "lr_end_before_restore": eval_info.get("lr_end_before_restore", ""),
@@ -2044,8 +2822,15 @@ class PIPINN_KimOmbergND:
                     "lr_after_restore": eval_info.get("lr_after_restore", ""),
                     "lr_carried_next": eval_info.get("lr_carried_next", ""),
                     "sel_checks": eval_info.get("sel_checks", ""),
+                    "sel_eligible_checks": eval_info.get(
+                        "sel_eligible_checks", ""
+                    ),
+                    "sel_ineligible_checks": eval_info.get(
+                        "sel_ineligible_checks", ""
+                    ),
                     "sel_stopped": eval_info.get("sel_stopped", ""),
                     "sel_restored": eval_info.get("sel_restored", ""),
+                    "q_sel_seed": q_sel_seed,
                     "e_V_sup": diag_res.get("e_V_sup", ""),
                     "e_bundle_sup": diag_res.get("e_bundle_sup", ""),
                     "e_Vw_sup": diag_res.get("e_Vw_sup", ""),
@@ -2058,8 +2843,8 @@ class PIPINN_KimOmbergND:
                     "m_ww": diag_res.get("m_ww", ""),
                     "M_num": diag_res.get("M_num", ""),
                     "guard_frac_ev": diag_res.get("guard_frac_ev", ""),
-                    "frozen_policy_iter": it - 1,
-                    "improved_policy_iter": it,
+                    "frozen_policy_iter": algorithm_outer_iter - 1,
+                    "improved_policy_iter": algorithm_outer_iter,
                     "lam_min_sigma_frozen": frozen_lam_min,
                     "lam_max_sigma_frozen": frozen_lam_max,
                     "clip_frac_frozen": frozen_clip_frac,
@@ -2077,6 +2862,7 @@ class PIPINN_KimOmbergND:
                     "stop_reason": stop_meta.get("reason", ""),
                     "elapsed_sec": elapsed,
                 }
+                results["outer_rows"].append(copy.deepcopy(outer_row))
                 append_csv_rows(recorder.outer_csv, [outer_row], outer_fields)
 
             if stop_triggered:
@@ -2098,10 +2884,22 @@ class PIPINN_KimOmbergND:
         if "core_train_wall_sec" not in results:
             results["core_train_wall_sec"] = _core_train_elapsed()
 
-        # p_res = max_n p_res,n over completed outer iterations.
+        # Official achieved residual: target branches contain target-phase rows
+        # only, so the common warm-up is structurally excluded.
         _vals = [v for v in results["val_pres"] if isinstance(v, float)]
         results["pres_max"] = max(_vals) if _vals else None
         results["total_inner_steps"] = int(sum(results["inner_epochs_used"]))
+        results["target_reached"] = any(results["target_flags"])
+        results["all_targets_reached"] = bool(
+            results["target_flags"] and all(results["target_flags"])
+        )
+        results["training_target_crossed"] = any(
+            results["training_target_flags"]
+        )
+        results["all_training_targets_crossed"] = bool(
+            results["training_target_flags"]
+            and all(results["training_target_flags"])
+        )
 
         # FINAL-ITERATE POLICY: the reported model is the final PI iterate.
         # We deliberately do NOT restore the best checkpoint here; the best
@@ -2127,6 +2925,211 @@ class PIPINN_KimOmbergND:
         print(f"{'='*70}")
 
         return results
+
+
+def _save_e6_warmup_state(solver, results, path):
+    """Persist the exact seed-specific v~_0 state used by every E6 target."""
+    rows = list(results.get("outer_rows", []))
+    if len(rows) != 1:
+        raise RuntimeError(
+            f"E6 warm-up must complete exactly one outer solve, got {len(rows)}"
+        )
+    achieved = rows[0].get("val_pres_post_restore")
+    if not isinstance(achieved, (int, float)) or not math.isfinite(float(achieved)):
+        raise RuntimeError("E6 warm-up has no finite post-restore p_res")
+    achieved = float(achieved)
+    if achieved <= 0.0 or achieved > 1.0 * (1.0 + 1e-9):
+        raise RuntimeError(
+            "E6 warm-up failed its admissibility target: "
+            f"post-restore p_res={achieved:.6e} must lie in (0,1]"
+        )
+    if not bool(rows[0].get("target_reached_post_restore", False)):
+        raise RuntimeError(
+            "E6 warm-up checkpoint is not target-reached after inner restore"
+        )
+
+    model_state = {
+        key: tensor.detach().cpu().clone()
+        for key, tensor in solver.value_net.state_dict().items()
+    }
+    optimizer_state = _cpu_tree(solver.optimizer.state_dict())
+    scheduler_state = _cpu_tree(
+        solver.scheduler.state_dict() if solver.scheduler is not None else None
+    )
+    model_hash = _canonical_tree_sha256(model_state)
+    optimizer_hash = _canonical_tree_sha256(optimizer_state)
+    scheduler_hash = _canonical_tree_sha256(scheduler_state)
+    compatibility = _e6_compatibility_payload(ARGS)
+    compatibility_hash = _canonical_json_sha256(compatibility)
+    current_lrs = [
+        float(group["lr"]) for group in solver.optimizer.param_groups
+    ]
+
+    torch_cpu_rng_state = torch.get_rng_state().cpu().clone()
+    torch_cuda_rng_state = None
+    if device.type == "cuda":
+        torch_cuda_rng_state = torch.cuda.get_rng_state(device).cpu().clone()
+    numpy_rng_state = copy.deepcopy(np.random.get_state())
+    python_rng_state = copy.deepcopy(random.getstate())
+    rng_payload = {
+        "torch_cpu_rng_state": torch_cpu_rng_state,
+        "torch_cuda_rng_state": torch_cuda_rng_state,
+        "numpy_rng_state": numpy_rng_state,
+        "python_rng_state": python_rng_state,
+        "rng_device_type": device.type,
+    }
+    rng_hash = _canonical_tree_sha256(rng_payload)
+    warm_start_id = _canonical_json_sha256(
+        {
+            "protocol": E6_WARM_START_PROTOCOL,
+            "compatibility_sha256": compatibility_hash,
+            "seed": int(SEED),
+            "market_seed": int(MARKET_SEED),
+            "model_sha256": model_hash,
+            "optimizer_sha256": optimizer_hash,
+            "scheduler_sha256": scheduler_hash,
+            "rng_sha256": rng_hash,
+        }
+    )
+
+    path = os.path.abspath(path)
+    payload = {
+        "schema_version": E6_WARMUP_BUNDLE_SCHEMA_VERSION,
+        "kind": E6_WARMUP_BUNDLE_KIND,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "warm_start_protocol": E6_WARM_START_PROTOCOL,
+        "warm_start_source": path,
+        "warm_start_id": warm_start_id,
+        "trainer_source_sha256": TRAINER_SOURCE_SHA256,
+        "compatibility": compatibility,
+        "compatibility_sha256": compatibility_hash,
+        "seed": int(SEED),
+        "market_seed": int(MARKET_SEED),
+        "n_assets": int(N_ASSETS),
+        "m_states": int(M_STATES),
+        "model_state": model_state,
+        "model_state_sha256": model_hash,
+        "optimizer_state": optimizer_state,
+        "optimizer_state_sha256": optimizer_hash,
+        "scheduler_state": scheduler_state,
+        "scheduler_state_sha256": scheduler_hash,
+        "scheduler_resume_contract": (
+            "fresh_scheduler_next_outer; target branch independently chooses "
+            "carried optimizer LR or carry_lr_max reset"
+        ),
+        "outer_count": int(solver._outer_count),
+        "current_lrs": current_lrs,
+        "torch_cpu_rng_state": torch_cpu_rng_state,
+        "torch_cuda_rng_state": torch_cuda_rng_state,
+        "numpy_rng_state": numpy_rng_state,
+        "python_rng_state": python_rng_state,
+        "rng_device_type": device.type,
+        "rng_state_sha256": rng_hash,
+        "warmup_pres_target": 1.0,
+        "warmup_achieved_pres": achieved,
+        "warmup_inner_steps": int(results.get("total_inner_steps", 0)),
+        "warmup_outer_row": copy.deepcopy(rows[0]),
+        "warmup_residual_semantics": (
+            "single_warmup_outer_post_restore_fixed_qres"
+        ),
+    }
+    if int(payload["outer_count"]) != 1:
+        raise RuntimeError(
+            "E6 warm-up optimizer outer counter must equal one, got "
+            f"{payload['outer_count']}"
+        )
+    _torch_save_atomic(payload, path)
+    bundle_hash = _sha256_file(path)
+    return {
+        "e6_warm_start_protocol": E6_WARM_START_PROTOCOL,
+        "e6_warm_start_source": path,
+        "e6_warm_start_id": warm_start_id,
+        "e6_warm_start_model_sha256": model_hash,
+        "e6_warm_start_optimizer_sha256": optimizer_hash,
+        "e6_warm_start_scheduler_sha256": scheduler_hash,
+        "e6_warm_start_rng_sha256": rng_hash,
+        "e6_warm_start_bundle_sha256": bundle_hash,
+        "e6_warm_start_loaded_bundle_sha256": bundle_hash,
+        "e6_warmup_target": 1.0,
+        "e6_warmup_post_restore_pres": achieved,
+        "e6_warmup_optimizer_steps": payload["warmup_inner_steps"],
+        "e6_warmup_bundle_path": path,
+        "e6_warmup_compatibility_sha256": compatibility_hash,
+    }
+
+
+def _move_optimizer_state_to_device(optimizer, target_device):
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(target_device)
+
+
+def _restore_e6_warmup_state(solver, bundle, path):
+    """Restore model, Adam/LR, outer counter, and all training RNG streams."""
+    solver.value_net.load_state_dict(bundle["model_state"])
+    solver.optimizer.load_state_dict(bundle["optimizer_state"])
+    _move_optimizer_state_to_device(solver.optimizer, solver.device)
+    solver._outer_count = int(bundle["outer_count"])
+    stored_lrs = [float(value) for value in bundle.get("current_lrs", [])]
+    restored_lrs = [
+        float(group["lr"]) for group in solver.optimizer.param_groups
+    ]
+    if len(stored_lrs) != len(restored_lrs):
+        raise ValueError("E6 warm-up LR group count does not match optimizer")
+    if any(
+        stored_lr != restored_lr
+        for stored_lr, restored_lr in zip(stored_lrs, restored_lrs)
+    ):
+        raise ValueError(
+            "E6 warm-up restored optimizer LR differs from current_lrs"
+        )
+    # Do not overwrite the LR here: it is already part of, and authenticated
+    # by, the restored optimizer state.  current_lrs is a redundant audit field
+    # whose equality was checked both during bundle preflight and above.
+
+    # carry_plateau intentionally recreates a fresh within-frozen-PDE
+    # scheduler at prepare_optimizer_for_outer().  The saved scheduler state is
+    # audit/hash provenance, not a state to resume across different PDEs.
+    torch.set_rng_state(bundle["torch_cpu_rng_state"].cpu())
+    if device.type == "cuda":
+        cuda_state = bundle.get("torch_cuda_rng_state")
+        if not isinstance(cuda_state, torch.Tensor):
+            raise ValueError("CUDA E6 warm-up bundle is missing CUDA RNG state")
+        torch.cuda.set_rng_state(cuda_state.cpu(), device=device)
+    np.random.set_state(bundle["numpy_rng_state"])
+    random.setstate(bundle["python_rng_state"])
+
+    path = os.path.abspath(path)
+    bundle_hash = _sha256_file(path)
+    return {
+        "e6_warm_start_protocol": str(bundle["warm_start_protocol"]),
+        "e6_warm_start_source": str(bundle["warm_start_source"]),
+        "e6_warm_start_id": str(bundle["warm_start_id"]),
+        "e6_warm_start_model_sha256": str(bundle["model_state_sha256"]),
+        "e6_warm_start_optimizer_sha256": str(
+            bundle["optimizer_state_sha256"]
+        ),
+        "e6_warm_start_scheduler_sha256": str(
+            bundle["scheduler_state_sha256"]
+        ),
+        "e6_warm_start_rng_sha256": str(bundle["rng_state_sha256"]),
+        "e6_warm_start_bundle_sha256": bundle_hash,
+        "e6_warm_start_loaded_bundle_sha256": bundle_hash,
+        "e6_warmup_target": float(bundle["warmup_pres_target"]),
+        "e6_warmup_post_restore_pres": float(bundle["warmup_achieved_pres"]),
+        "e6_warmup_optimizer_steps": int(bundle.get("warmup_inner_steps", 0)),
+        "e6_target_phase_outer_count": int(ARGS.outer_iters),
+        "e6_target_phase_start_algorithm_iter": 2,
+        "first_target_policy_source": E6_WARM_START_POLICY_SOURCE,
+        "e6_warmup_bundle_path": path,
+        "e6_warmup_compatibility_sha256": str(
+            bundle["compatibility_sha256"]
+        ),
+        "e6_warmup_outer_count": int(bundle["outer_count"]),
+        "e6_warmup_excluded_from_outer_history": True,
+        "e6_warmup_excluded_from_pres_max": True,
+    }
 
 
 def plot_pi_convergence_nd(results, save_path=None, show=True):
@@ -3074,6 +4077,29 @@ if __name__ == "__main__":
         theta_clip_abs=theta_clip_abs,
         device=device
     )
+    if E6_LOADED_BUNDLE is not None:
+        E6_RUNTIME_PROVENANCE.update(
+            _restore_e6_warmup_state(
+                solver, E6_LOADED_BUNDLE, ARGS.e6_warm_start
+            )
+        )
+        print(
+            "[E6] restored common warm-up bundle: "
+            f"{ARGS.e6_warm_start} "
+            f"(p_res={E6_RUNTIME_PROVENANCE['e6_warmup_post_restore_pres']:.6e})"
+        )
+    if not ARGS.eval_only:
+        recorder.write_status(
+            "running",
+            e6_role=ARGS.e6_role,
+            e6_phase=ARGS.e6_phase,
+            e6_reset_lr_each_outer=int(ARGS.e6_reset_lr_each_outer),
+            e6_target_outer_start_lr=(
+                float(ARGS.carry_lr_max)
+                if bool(ARGS.e6_reset_lr_each_outer) else None
+            ),
+            **E6_RUNTIME_PROVENANCE,
+        )
 
     # PI-PINN Training
     if ARGS.eval_only:
@@ -3113,6 +4139,9 @@ if __name__ == "__main__":
             diag_margin=parse_eval_margins(ARGS.eval_margin)[0],
             diag_every=ARGS.diag_every,
             timing_mode=ARGS.timing_mode,
+            e6_role=ARGS.e6_role,
+            e6_reset_lr_each_outer=bool(ARGS.e6_reset_lr_each_outer),
+            e6_warm_start_provenance=E6_RUNTIME_PROVENANCE,
             recorder=recorder,
             stopper=stopper,
         )  
@@ -3134,9 +4163,49 @@ if __name__ == "__main__":
             "stopped_early",
             elapsed_sec=elapsed,
             core_train_wall_sec=results.get("core_train_wall_sec"),
+            e6_role=ARGS.e6_role,
+            e6_phase=ARGS.e6_phase,
+            e6_reset_lr_each_outer=int(ARGS.e6_reset_lr_each_outer),
+            e6_target_outer_start_lr=(
+                float(ARGS.carry_lr_max)
+                if bool(ARGS.e6_reset_lr_each_outer) else None
+            ),
+            **E6_RUNTIME_PROVENANCE,
             **results.get("stop_info", {}),
         )
         print(f"Elapsed time: {h:02d}:{m:02d}:{s:05.2f}")
+        sys.exit(0)
+
+    if ARGS.e6_role == "warmup":
+        warmup_provenance = _save_e6_warmup_state(
+            solver, results, ARGS.e6_warmup_bundle
+        )
+        E6_RUNTIME_PROVENANCE.update(warmup_provenance)
+        recorder.mark_success(
+            elapsed_sec=elapsed,
+            outer_iters=1,
+            total_optimizer_steps=results.get("total_inner_steps"),
+            total_inner_steps=results.get("total_inner_steps"),
+            pres_target=1.0,
+            pres_max=results.get("pres_max"),
+            pres_max_semantics=(
+                "single_warmup_outer_post_restore_fixed_qres"
+            ),
+            target_reached=True,
+            target_reached_semantics=(
+                "single_warmup_outer_post_restore_fixed_qres_at_or_below_one"
+            ),
+            final_weight_path=os.path.join(weight_dir, "value_net_final.pt"),
+            train_gpu_peak_mem_bytes=_train_gpu_peak,
+            e6_role="warmup",
+            e6_phase="warmup",
+            e6_reset_lr_each_outer=0,
+            **warmup_provenance,
+        )
+        print(
+            "[E6] common warm-up bundle saved: "
+            f"{warmup_provenance['e6_warmup_bundle_path']}"
+        )
         sys.exit(0)
 
     print("\n" + "="*60)
@@ -3184,6 +4253,65 @@ if __name__ == "__main__":
             recorder.mark_failed_eval(reason=msg)
             sys.exit(1)
     # (Normal runs: the in-memory model already IS the final iterate.)
+    _training_status_fields = {
+        "e6_role": ARGS.e6_role,
+        "e6_phase": ARGS.e6_phase,
+        "e6_reset_lr_each_outer": int(ARGS.e6_reset_lr_each_outer),
+        "e6_target_outer_start_lr": (
+            float(ARGS.carry_lr_max)
+            if bool(ARGS.e6_reset_lr_each_outer) else None
+        ),
+        "e6_fresh_scheduler_each_target_outer": bool(
+            ARGS.e6_role == "target_branch"
+        ),
+        "e6_outer_start_lr_semantics": (
+            "carry_lr_max_each_target_outer_preserve_adam_moments"
+            if bool(ARGS.e6_reset_lr_each_outer)
+            else "standard_schedule"
+        ),
+        **E6_RUNTIME_PROVENANCE,
+    }
+    if not ARGS.eval_only:
+        if ARGS.e6_role == "target_branch":
+            _target_rows = list(results.get("outer_rows", []))
+            _training_status_fields.update(
+                {
+                    "pres_max_semantics": E6_TARGET_RESIDUAL_SEMANTICS,
+                    "target_reached_semantics": E6_TARGET_REACHED_SEMANTICS,
+                    "e6_target_phase_outer_count": len(_target_rows),
+                    "e6_target_phase_start_algorithm_iter": (
+                        int(_target_rows[0]["algorithm_outer_iter"])
+                        if _target_rows else 2
+                    ),
+                    "first_target_policy_source": E6_WARM_START_POLICY_SOURCE,
+                }
+            )
+        else:
+            _training_status_fields.update(
+                {
+                    "pres_max_semantics": "max_outer_post_restore_fixed_qres",
+                    "target_reached_semantics": (
+                        "all_outer_post_restore_fixed_qres_at_or_below_target"
+                    ),
+                }
+            )
+        _training_status_fields.update(
+            {
+                "any_target_reached": bool(results.get("target_reached", False)),
+                "target_reached": bool(
+                    results.get("all_targets_reached", False)
+                ),
+                "any_training_target_crossed": bool(
+                    results.get("training_target_crossed", False)
+                ),
+                "training_target_crossed": bool(
+                    results.get("all_training_targets_crossed", False)
+                ),
+                "training_target_crossed_semantics": (
+                    "all_training_time_fixed_qres_crossings_before_restore"
+                ),
+            }
+        )
 
     if SKIP_EVAL:
         # Evaluation fully skipped (opt-in). No metrics.csv is produced.
@@ -3194,7 +4322,12 @@ if __name__ == "__main__":
             recorder.mark_success(elapsed_sec=elapsed, final_weight_path=final_weight_path,
                                   best_weight_path=best_weight_path, skipped_eval=True,
                                   train_gpu_peak_mem_bytes=_train_gpu_peak,
-                                  timing_mode=bool(ARGS.timing_mode))
+                                  timing_mode=bool(ARGS.timing_mode),
+                                  pres_target=ARGS.pres_target,
+                                  pres_max=results.get("pres_max"),
+                                  total_inner_steps=results.get("total_inner_steps"),
+                                  total_optimizer_steps=results.get("total_inner_steps"),
+                                  **_training_status_fields)
         sys.exit(0)
 
     # Plot PI-PINN convergence (figure only; suppressed under --skip-figures/
@@ -3412,4 +4545,5 @@ if __name__ == "__main__":
                               timing_mode=bool(ARGS.timing_mode),
                               train_gpu_peak_mem_bytes=_train_gpu_peak,
                               eval_gpu_peak_mem_bytes=_eval_gpu_peak,
-                              eval_margins=EVAL_MARGINS)
+                              eval_margins=EVAL_MARGINS,
+                              **_training_status_fields)

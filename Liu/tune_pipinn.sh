@@ -20,7 +20,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${1:-$(pwd)/outputs/tune_liu_$(date +%Y%m%d_%H%M%S)}"
 MAX_PARALLEL_ARG="${2:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-SWEEP_PROFILE="${SWEEP_PROFILE:-main}"  # main | nonaffine | timing
+SWEEP_PROFILE="${SWEEP_PROFILE:-main}"  # main | nonaffine | timing; e6 when sourced
 # Output namespaces must change when the economic market convention changes.
 # Otherwise an older raw-rho _SUCCESS directory can be skipped and silently
 # mixed into a canonical-rho paper aggregate.
@@ -151,12 +151,56 @@ auto_tag() {
     echo "${model}_${MARKET_SCHEMA_TAG}_baseline"
     return
   fi
-  local parts=()
+  local parts=() fingerprint_parts=()
+  local e6_role="" e6_n="" e6_m="" e6_seed="" e6_target="" e6_reset_lr=""
   for kv in "$@"; do
     local k=${kv%%=*}
     local v=${kv#*=}
+    local normalized_key
+    normalized_key="$(normalize_key "$k")"
+    # E6 bundle paths are machine/output-root bookkeeping.  Encoding an
+    # absolute path in the run tag makes the same training cell acquire a
+    # different identity after a directory move and can exceed filesystem
+    # filename limits.  The E6 role and residual target remain ordinary tag
+    # components, so warm-up and target-branch runs stay unambiguous.
+    case "$normalized_key" in
+      e6_warm_start|e6_warmup_bundle) continue ;;
+    esac
+    fingerprint_parts+=("${normalized_key}=${v}")
+    case "$normalized_key" in
+      e6_role) e6_role="$v" ;;
+      n_assets) e6_n="$v" ;;
+      m_states) e6_m="$v" ;;
+      seed) e6_seed="$v" ;;
+      pres_target) e6_target="$v" ;;
+      e6_reset_lr_each_outer) e6_reset_lr="$v" ;;
+    esac
     parts+=("$(sanitize "${k}${v}")")
   done
+  # E6 launch cells intentionally carry many explicit overrides so that the
+  # common-warm-start protocol is self-contained.  A verbatim auto tag can
+  # exceed the 255-byte filename limit.  Keep the scientifically salient
+  # coordinates readable and append a stable configuration digest (excluding
+  # only the relocatable bundle path).  Thus a changed cap/resampling/default
+  # cannot alias an older successful run in the same output root.
+  if [[ -n "$e6_role" && "$e6_role" != "standard" ]]; then
+    local fingerprint digest compact
+    printf -v fingerprint '%s\n' "${fingerprint_parts[@]}"
+    digest="$(printf '%s' "$fingerprint" | sha256sum)"
+    digest="${digest%% *}"
+    compact="${model}_${MARKET_SCHEMA_TAG}_e6_$(sanitize "$e6_role")"
+    [[ -n "$e6_n" ]] && compact+="_n$(sanitize "$e6_n")"
+    [[ -n "$e6_m" ]] && compact+="_m$(sanitize "$e6_m")"
+    [[ -n "$e6_seed" ]] && compact+="_seed$(sanitize "$e6_seed")"
+    [[ -n "$e6_target" ]] && compact+="_pres$(sanitize "$e6_target")"
+    [[ -n "$e6_reset_lr" ]] && compact+="_rlr$(sanitize "$e6_reset_lr")"
+    printf "%s_cfg%s" "$compact" "${digest:0:12}"
+    return
+  fi
+  if (( ${#parts[@]} == 0 )); then
+    echo "${model}_${MARKET_SCHEMA_TAG}_baseline"
+    return
+  fi
   printf "%s_%s_%s" "$model" "$MARKET_SCHEMA_TAG" "$(IFS=_; echo "${parts[*]}")"
 }
 
@@ -510,7 +554,7 @@ declare -A BASE_PINN=(
   # contraction data comes from the per-iteration e_n columns in
   # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1 FD
   # reference runs; it retains every completed outer iterate.
-  [save_iterate_every]=0
+  [save_iterate_every]=1
   # HALF-WIDTH margins: m keeps (1-m) of each axis length. FIRST = PRIMARY:
   # the fixed diagnostic set (e_n, stability margins) and the run-level
   # representative full-dim metric use it, so keep 0.10 first to match the
@@ -616,7 +660,7 @@ declare -A BASE_PIPINN=(
   # contraction data comes from the per-iteration e_n columns in
   # outer_history.csv. Use e3b_checkpoints=1 (PI-PINN) for the M=1 FD
   # reference runs; it retains every completed outer iterate.
-  [save_iterate_every]=0
+  [save_iterate_every]=1
   # HALF-WIDTH margins: FIRST = PRIMARY (diagnostic set + representative
   # full-dim metric); keep 0.10 first for the paper convention. Others are
   # the E9 list, re-evaluated for free; 0.0 = full-window stress test.
@@ -654,6 +698,12 @@ declare -A BASE_PIPINN=(
   [sel_patience]=0
   # 1 = FD-reference checkpoint schedule (every completed outer iterate).
   [e3b_checkpoints]=0
+  # Neutral defaults for the E6 common-warm-start protocol.  The dedicated
+  # tune_pipinn_e6.sh launcher overrides these in two ordered phases.
+  [e6_role]=standard
+  [e6_warm_start]=""
+  [e6_warmup_bundle]=""
+  [e6_reset_lr_each_outer]=0
 )
 
 # run_pinn_single <tag|auto> key=val ...   (one fully-resolved job)
@@ -874,6 +924,21 @@ run_pipinn_single() {
   local sel_patience="${OVR[sel_patience]:-${BASE_PIPINN[sel_patience]}}"
   local carry_lr_min="${OVR[carry_lr_min]:-${BASE_PIPINN[carry_lr_min]}}"
   local carry_lr_max="${OVR[carry_lr_max]:-${BASE_PIPINN[carry_lr_max]}}"
+  local e6_role="${OVR[e6_role]:-${BASE_PIPINN[e6_role]}}"
+  local e6_warm_start="${OVR[e6_warm_start]:-${BASE_PIPINN[e6_warm_start]}}"
+  local e6_warmup_bundle="${OVR[e6_warmup_bundle]:-${BASE_PIPINN[e6_warmup_bundle]}}"
+  local e6_reset_lr_each_outer="${OVR[e6_reset_lr_each_outer]:-${BASE_PIPINN[e6_reset_lr_each_outer]}}"
+  case "$e6_reset_lr_each_outer" in
+    0|1) ;;
+    *)
+      echo "[error] e6_reset_lr_each_outer must be 0 or 1; got: $e6_reset_lr_each_outer" >&2
+      exit 2
+      ;;
+  esac
+  if [[ "$e6_reset_lr_each_outer" == "1" && "$e6_role" != "target_branch" ]]; then
+    echo "[error] e6_reset_lr_each_outer=1 requires e6_role=target_branch" >&2
+    exit 2
+  fi
   local timing_flag=()
   [[ "$timing_mode" == "1" ]] && timing_flag=(--timing-mode)
   local skip_figures_flag=()
@@ -882,11 +947,15 @@ run_pipinn_single() {
   [[ "$skip_eval" == "1" ]] && skip_eval_flag=(--skip-eval)
   local e3b_flag=()
   [[ "$e3b_checkpoints" == "1" ]] && e3b_flag=(--e3b-checkpoints)
+  local e6_warm_start_flag=()
+  [[ -n "$e6_warm_start" ]] && e6_warm_start_flag=(--e6-warm-start "$e6_warm_start")
+  local e6_warmup_bundle_flag=()
+  [[ -n "$e6_warmup_bundle" ]] && e6_warmup_bundle_flag=(--e6-warmup-bundle "$e6_warmup_bundle")
 
   # Stop-flag key uses RESOLVED model-specific values (not BASE-relative
   # diffs): changing BASE defaults over time in the same OUT_ROOT can never
   # alias two different configurations onto one flag.
-  local variant="rho:${MARKET_SCHEMA_TAG};ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};rpm:${risk_premium_mode};eps:${nonaffine_eps};nls:${nonaffine_loading_scale};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};"
+  local variant="rho:${MARKET_SCHEMA_TAG};ls:${lr_schedule};ar:${adam_reset};sp:${scheduler_patience};sf:${scheduler_factor};sml:${scheduler_min_lr};ti:${theta_init_method};tis:${theta_init_scale};tc:${theta_clip_abs};rpm:${risk_premium_mode};eps:${nonaffine_eps};nls:${nonaffine_loading_scale};pr:${pe_resample_every};ib:${inner_best};sel:${sel_points}/${sel_terminal_points}/${sel_every}/${sel_patience};cl:${carry_lr_min}/${carry_lr_max};e6:${e6_role};e6rlr:${e6_reset_lr_each_outer};"
 
   local run_output_root="$OUT_ROOT/pi-pinn/$tag"
   local run_weight_root="$OUT_ROOT/weights/pi-pinn/$tag"
@@ -934,7 +1003,10 @@ run_pipinn_single() {
     --inner-best-restore "$inner_best" --sel-points "$sel_points" --sel-terminal-points "$sel_terminal_points" \
     --sel-every "$sel_every" --sel-patience "$sel_patience" \
     --carry-lr-min "$carry_lr_min" --carry-lr-max "$carry_lr_max" \
+    --e6-role "$e6_role" \
+    --e6-reset-lr-each-outer "$e6_reset_lr_each_outer" \
     --output-root "$run_output_root" --weight-root "$run_weight_root" \
+    "${e6_warm_start_flag[@]}" "${e6_warmup_bundle_flag[@]}" \
     "${timing_flag[@]}" "${skip_figures_flag[@]}" "${skip_eval_flag[@]}" "${e3b_flag[@]}" "${eval_only_flag[@]}"
 }
 
@@ -972,15 +1044,25 @@ run_pipinn() {
 #   the market is pinned by market_seed=12 regardless of the training seed.
 # =============================================================================
 
+tune_pipinn_main() {
 if [[ "$SWEEP_PROFILE" == "main" ]]; then
-  run_pipinn auto m_states=5
-  run_pinn   auto m_states=5
+  # run_pipinn auto m_states=5
+  # run_pinn   auto m_states=5
 
-  run_pipinn auto m_states=3
-  run_pinn   auto m_states=3
+  # run_pipinn auto m_states=3
+  # run_pinn   auto m_states=3
 
-  run_pipinn auto m_states=1 e3b_checkpoints=1
-  run_pinn   auto m_states=1
+  # run_pinn   auto m_states=1
+  # run_pipinn auto m_states=1
+
+    run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.0075
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.125
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.1
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.05
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.02
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.01
+  # run_pipinn auto m_states=1 eval_epochs=50000 pres_target=0.2
+  
 elif [[ "$SWEEP_PROFILE" == "nonaffine" ]]; then
   # Figure 4 profile: N=30 is fixed; choose one or more M values from 1,3,5.
   # Every epsilon uses the SAME market_seed and training-seed set.  eps=0 is
@@ -1152,4 +1234,13 @@ if [[ "$SWEEP_PROFILE" == "timing" && "${AGGREGATE_COMPUTE:-1}" == "1" ]]; then
     fi
     echo "[warn] E8 aggregation failed; run aggregate_compute.py manually"
   fi
+fi
+}
+
+# Dedicated launchers (notably tune_pipinn_e6.sh) source this file to reuse
+# the exact production defaults, tag construction, queue, marker, and worker
+# logic.  Sourcing must expose those functions without enqueueing the ordinary
+# main/non-affine/timing sweep.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  tune_pipinn_main "$@"
 fi

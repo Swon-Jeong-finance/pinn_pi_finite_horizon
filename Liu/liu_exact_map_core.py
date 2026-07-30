@@ -320,7 +320,76 @@ def _linearity_boundary_matrix(grid: FDGrid) -> Array:
     return matrix
 
 
-def _boundary_elimination_diagnostics(grid: FDGrid, boundary: str) -> Dict[str, float]:
+def _crra_robin_boundary_matrix(grid: FDGrid, exponent: float) -> Array:
+    """Boundary block for ``u_y=exponent*u`` and ``u_xx=0``.
+
+    Wealth-edge rows use the second-order one-sided derivative formulas
+
+    ``(3 + 2*h_y*exponent) u_0 = 4 u_1 - u_2`` and
+    ``(3 - 2*h_y*exponent) u_N = 4 u_{N-1} - u_{N-2}``.
+
+    At a corner we apply the same wealth Robin equation to the already
+    eliminated factor-edge values.  Equivalently, the full extension is the
+    tensor product of the one-dimensional Robin and factor-linearity
+    extensions.  This makes both boundary conditions hold at each corner,
+    rather than introducing an unrelated bilinear corner closure.
+    """
+
+    exponent = float(exponent)
+    if not np.isfinite(exponent):
+        raise ValueError("Robin exponent must be finite")
+    ny, nx = grid.ny, grid.nx
+    hy = (grid.y_max - grid.y_min) / (ny - 1)
+    lower_y_pivot = 3.0 + 2.0 * hy * exponent
+    upper_y_pivot = 3.0 - 2.0 * hy * exponent
+    y_edges = [(0, j) for j in range(1, nx - 1)]
+    y_edges += [(ny - 1, j) for j in range(1, nx - 1)]
+    x_edges = [(i, 0) for i in range(1, ny - 1)]
+    x_edges += [(i, nx - 1) for i in range(1, ny - 1)]
+    corners = [(0, 0), (0, nx - 1), (ny - 1, 0), (ny - 1, nx - 1)]
+    boundary = y_edges + x_edges + corners
+    index = {node: position for position, node in enumerate(boundary)}
+    matrix = np.zeros((len(boundary), len(boundary)), dtype=np.float64)
+
+    row = 0
+    for j in range(1, nx - 1):
+        matrix[row, index[(0, j)]] = lower_y_pivot
+        row += 1
+    for j in range(1, nx - 1):
+        matrix[row, index[(ny - 1, j)]] = upper_y_pivot
+        row += 1
+    for i in range(1, ny - 1):
+        matrix[row, index[(i, 0)]] = 2.0
+        row += 1
+    for i in range(1, ny - 1):
+        matrix[row, index[(i, nx - 1)]] = 2.0
+        row += 1
+
+    # At each corner impose the wealth Robin equation along the factor edge.
+    # Its two inward nodes are factor-edge unknowns, so these four rows make
+    # the boundary block triangular and produce the tensor-product extension.
+    for corner, first_inward, second_inward, pivot in (
+        ((0, 0), (1, 0), (2, 0), lower_y_pivot),
+        ((0, nx - 1), (1, nx - 1), (2, nx - 1), lower_y_pivot),
+        ((ny - 1, 0), (ny - 2, 0), (ny - 3, 0), upper_y_pivot),
+        ((ny - 1, nx - 1), (ny - 2, nx - 1), (ny - 3, nx - 1),
+         upper_y_pivot),
+    ):
+        matrix[row, index[corner]] = pivot
+        matrix[row, index[first_inward]] = -4.0
+        matrix[row, index[second_inward]] = 1.0
+        row += 1
+    if row != len(boundary):
+        raise AssertionError("CRRA-Robin boundary-system assembly is incomplete")
+    return matrix
+
+
+def _boundary_elimination_diagnostics(
+    grid: FDGrid,
+    boundary: str,
+    *,
+    robin_exponent: Optional[float] = None,
+) -> Dict[str, float]:
     """Return rank and exact infinity-norm conditioning of the boundary block.
 
     The linearity block has the form ``[[D, 0], [C, I]]`` when edge
@@ -358,6 +427,46 @@ def _boundary_elimination_diagnostics(grid: FDGrid, boundary: str) -> Dict[str, 
                 float(np.max(1.0 / np.abs(edge_pivots))),
                 1.0 + 1.0 / abs(lower_y_pivot) + 1.0 / abs(x_pivot),
                 1.0 + 1.0 / abs(upper_y_pivot) + 1.0 / abs(x_pivot),
+            )
+            condition = float(matrix_norm_inf * inverse_norm_inf)
+    elif normalized == "crra-robin":
+        if robin_exponent is None or not np.isfinite(float(robin_exponent)):
+            raise ValueError("crra-robin diagnostics require a finite robin_exponent")
+        size = 2 * grid.ny + 2 * grid.nx - 4
+        hy = (grid.y_max - grid.y_min) / (grid.ny - 1)
+        exponent = float(robin_exponent)
+        lower_y_pivot = 3.0 + 2.0 * hy * exponent
+        upper_y_pivot = 3.0 - 2.0 * hy * exponent
+        x_pivot = 2.0
+        # The four corner equations use the same wealth pivots.  The block is
+        # triangular, hence its rank is determined exactly by these pivots.
+        pivots = np.concatenate((
+            np.full(grid.nx, lower_y_pivot, dtype=np.float64),
+            np.full(grid.nx, upper_y_pivot, dtype=np.float64),
+            np.full(2 * (grid.ny - 2), x_pivot, dtype=np.float64),
+        ))
+        if not np.all(np.isfinite(pivots)):
+            raise FloatingPointError(
+                "boundary elimination pivots contain non-finite entries"
+            )
+        zero_count = int(np.count_nonzero(pivots == 0.0))
+        rank = int(size - zero_count)
+        if zero_count:
+            condition = float("inf")
+        else:
+            # For the boundary block assembled by
+            # ``_crra_robin_boundary_matrix``, a corner row has coefficients
+            # (d_y, -4, 1).  Its inverse row sum is
+            # (1 + 4/2 + 1/2)/|d_y| = 3.5/|d_y|.
+            matrix_norm_inf = max(
+                2.0,
+                abs(lower_y_pivot) + 5.0,
+                abs(upper_y_pivot) + 5.0,
+            )
+            inverse_norm_inf = max(
+                0.5,
+                3.5 / abs(lower_y_pivot),
+                3.5 / abs(upper_y_pivot),
             )
             condition = float(matrix_norm_inf * inverse_norm_inf)
     elif normalized == "exact-dirichlet":
@@ -441,6 +550,82 @@ def _linearity_extension(grid: FDGrid) -> csr_matrix:
         add(i_edge, j_edge, mapping)
 
     return coo_matrix((data, (rows, cols)), shape=(n_full, n_int)).tocsr()
+
+
+def _crra_robin_extension(grid: FDGrid, exponent: float) -> csr_matrix:
+    """Map interior unknowns using CRRA Robin in wealth and linearity in factor.
+
+    The wealth condition is ``u_y=exponent*u``.  For the Liu CRRA value,
+    ``exponent=1-gamma``.  Factor edges retain the existing second-order
+    ``u_xx=0`` closure.  Corner rows are the tensor product of these two
+    one-dimensional extensions, and therefore satisfy both discrete boundary
+    equations exactly.
+    """
+
+    exponent = float(exponent)
+    if not np.isfinite(exponent):
+        raise ValueError("Robin exponent must be finite")
+    ny, nx = grid.ny, grid.nx
+    n_int, n_full = (ny - 2) * (nx - 2), ny * nx
+    hy = (grid.y_max - grid.y_min) / (ny - 1)
+    lower_denom = 3.0 + 2.0 * hy * exponent
+    upper_denom = 3.0 - 2.0 * hy * exponent
+    if abs(lower_denom) < 1.0e-12 or abs(upper_denom) < 1.0e-12:
+        raise ValueError("log-wealth CRRA-Robin closure is singular")
+
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+
+    def add(full_i: int, full_j: int,
+            mapping: Mapping[Tuple[int, int], float]) -> None:
+        row = full_i * nx + full_j
+        for (ii, jj), value in mapping.items():
+            rows.append(row)
+            cols.append(_interior_index(ii, jj, nx))
+            data.append(float(value))
+
+    def ymap(side: int, j: int) -> Dict[Tuple[int, int], float]:
+        if side == 0:
+            return {(1, j): 4.0 / lower_denom,
+                    (2, j): -1.0 / lower_denom}
+        return {(ny - 2, j): 4.0 / upper_denom,
+                (ny - 3, j): -1.0 / upper_denom}
+
+    def xmap(i: int, side: int) -> Dict[Tuple[int, int], float]:
+        if side == 0:
+            return {(i, 1): 2.5, (i, 2): -2.0, (i, 3): 0.5}
+        return {(i, nx - 2): 2.5, (i, nx - 3): -2.0,
+                (i, nx - 4): 0.5}
+
+    for i in range(1, ny - 1):
+        for j in range(1, nx - 1):
+            add(i, j, {(i, j): 1.0})
+    for j in range(1, nx - 1):
+        add(0, j, ymap(0, j))
+        add(ny - 1, j, ymap(1, j))
+    for i in range(1, ny - 1):
+        add(i, 0, xmap(i, 0))
+        add(i, nx - 1, xmap(i, 1))
+
+    # Tensor-product corner continuation.  Apply the wealth map to factor-edge
+    # values, then substitute each factor-edge value by ``xmap``.  Applying
+    # the maps in the opposite order yields the same coefficients.
+    for i_edge, j_edge, j_side, y_side in (
+        (0, 0, 0, 0),
+        (0, nx - 1, 1, 0),
+        (ny - 1, 0, 0, 1),
+        (ny - 1, nx - 1, 1, 1),
+    ):
+        mapping: Dict[Tuple[int, int], float] = {}
+        for (ii, _j), y_weight in ymap(y_side, 1).items():
+            for key, x_weight in xmap(ii, j_side).items():
+                mapping[key] = mapping.get(key, 0.0) + y_weight * x_weight
+        add(i_edge, j_edge, mapping)
+
+    return coo_matrix(
+        (data, (rows, cols)), shape=(n_full, n_int)
+    ).tocsr()
 
 
 def _dirichlet_extension(grid: FDGrid) -> csr_matrix:
@@ -610,6 +795,12 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
     be *strictly* larger than ``ellipticity_tolerance``.  Thus the default
     tolerance of zero rejects a degenerate frozen policy instead of silently
     solving a different (or merely parabolic) problem.
+
+    ``boundary='crra-robin'`` imposes the homogeneous wealth relation
+    ``u_y=(1-gamma)u`` and retains ``u_xx=0`` on the factor edges.  It does
+    not inject the closed-form solution amplitude.  ``linearity`` retains the
+    legacy ``V_ww=0``/``u_xx=0`` closure, while ``exact-dirichlet`` remains an
+    affine-benchmark sensitivity closure.
     """
 
     if not 0.5 <= float(theta_method) <= 1.0:
@@ -617,8 +808,10 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
     if startup_be_steps < 0:
         raise ValueError("startup_be_steps must be nonnegative")
     boundary = str(boundary).replace("_", "-").lower()
-    if boundary not in {"linearity", "exact-dirichlet"}:
-        raise ValueError("boundary must be linearity or exact-dirichlet")
+    if boundary not in {"linearity", "crra-robin", "exact-dirichlet"}:
+        raise ValueError(
+            "boundary must be linearity, crra-robin, or exact-dirichlet"
+        )
     if boundary == "exact-dirichlet" and exact_boundary_value is None:
         raise ValueError("exact-dirichlet requires exact_boundary_value")
     if not np.isfinite(linear_residual_tolerance) or linear_residual_tolerance <= 0.0:
@@ -630,7 +823,12 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
     y = np.linspace(grid.y_min, grid.y_max, grid.ny, dtype=np.float64)
     x = np.linspace(grid.x_min, grid.x_max, grid.nx, dtype=np.float64)
     dt = float(tau[1] - tau[0])
-    boundary_diag = _boundary_elimination_diagnostics(grid, boundary)
+    robin_exponent = 1.0 - problem.gamma
+    boundary_diag = _boundary_elimination_diagnostics(
+        grid,
+        boundary,
+        robin_exponent=robin_exponent if boundary == "crra-robin" else None,
+    )
     if int(boundary_diag["rank"]) != int(boundary_diag["size"]):
         raise np.linalg.LinAlgError(
             f"{boundary} boundary elimination is rank deficient: "
@@ -643,11 +841,12 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
             f"cond_inf={float(boundary_diag['condition_inf']):.3e}, "
             f"limit={float(boundary_condition_limit):.3e}"
         )
-    extension = (
-        _linearity_extension(grid)
-        if boundary == "linearity"
-        else _dirichlet_extension(grid)
-    )
+    if boundary == "linearity":
+        extension = _linearity_extension(grid)
+    elif boundary == "crra-robin":
+        extension = _crra_robin_extension(grid, robin_exponent)
+    else:
+        extension = _dirichlet_extension(grid)
     n_int = (grid.ny - 2) * (grid.nx - 2)
     ident = eye(n_int, format="csr", dtype=np.float64)
     z = np.broadcast_to(crra_terminal(problem, y[1:-1])[:, None],
@@ -660,7 +859,7 @@ def solve_frozen_policy(problem: LiuProblem, policy: PolicyFn, grid: FDGrid, *,
     )
 
     def bvec(time_value: float) -> Array:
-        if boundary == "linearity":
+        if boundary in {"linearity", "crra-robin"}:
             return np.zeros(grid.ny * grid.nx, dtype=np.float64)
         assert exact_boundary_value is not None
         return _boundary_vector(grid, time_value, y, x, exact_boundary_value)
